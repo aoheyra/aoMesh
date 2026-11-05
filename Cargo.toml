@@ -1,6 +1,26 @@
 [package]
-name = "aoMesh"
+name = "ao_mesh"
 version = "0.1.0"
 edition = "2024"
+# MSRV: edition 2024 requires Rust 1.85+. Bump deliberately, never silently.
+rust-version = "1.85"
+description = "Routing and store-and-forward engine for the aoheyra mesh: sans-IO packet forwarding, flood control, store and sync"
+repository = "https://github.com/aoheyra/aoMesh"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+keywords = ["mesh", "routing", "store-and-forward", "bluetooth"]
+categories = ["network-programming"]
+
+[features]
+# Thin tokio glue around the sans-IO core; grows in MSH-06.
+adapter = []
 
 [dependencies]
+rand_core = "0.9"
+# Siblings are consumed by git (master until v0.1.0 tags exist, then tags).
+# Local overrides: docs/local-development.md — never commit a [patch].
+ao_network = { version = "0.1.0", git = "https://github.com/aoheyra/aoNetwork" }
+ao_idents = { version = "0.1.0", git = "https://github.com/aoheyra/aoIdents" }
+
+[dev-dependencies]
+rand = "0.9"
