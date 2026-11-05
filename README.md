@@ -86,6 +86,11 @@ Lifetimes, TTLs, copy counts and budgets are **defaults with documented reasons*
 
 - `ttl` and `hops` are **hop-mutable** and are *not* covered by the origin signature; everything else is.
 - Header-only parsing allows fast reject without allocating the payload; there is a hard payload cap.
+
+The `packet` module implements the proposed version-1 codec, borrowed header and
+payload views, and caller-buffer encoding. See [the wire format](docs/protocol.md)
+and [the codec ADR](docs/adr/0002-packet-codec.md). Parsing alone does not authenticate
+an origin or verify a signature.
 - `msg_id` derives from the immutable header and the payload hash.
 - Relays verify the origin signature for Broadcast and Presence; Direct packets are verified by the recipient, and by relays only within a CPU budget.
 
