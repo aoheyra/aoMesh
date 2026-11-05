@@ -24,3 +24,4 @@ ao_idents = { version = "0.1.0", git = "https://github.com/aoheyra/aoIdents" }
 
 [dev-dependencies]
 rand = "0.9"
+proptest = { version = "1.8", default-features = false, features = ["std"] }
