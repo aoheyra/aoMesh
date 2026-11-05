@@ -5,7 +5,7 @@ tags exist (MSH-31 / NET-27) the dependency points at `master`; after that
 Cargo.toml pins `tag = "v0.1.0"`.
 
 To work on the siblings together, override them locally — **never commit the
-override** (AGENTS.md §8):
+override** (§8):
 
 1. Clone the siblings side by side:
 
