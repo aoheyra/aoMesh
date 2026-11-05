@@ -1,6 +1,6 @@
-# AGENTS.md
+# Rules
 
-Instructions for AI coding agents and human contributors. Read this fully before changing anything. Where this file and an issue disagree on *process*, this file wins; on *scope*, the issue wins.
+Read this fully before changing anything. Where this file and an issue disagree on *process*, this file wins; on *scope*, the issue wins.
 
 `aoMesh` (package `ao_mesh`) is the **routing and store-and-forward engine** of the aoheyra mesh: packet format, forwarding, flood control, relay budgets, store and sync, receipts, presence, node directory, telemetry and public channels. The core is a **sans-IO engine** (`handle(now, input) -> outputs`, injected RNG, no `tokio` inside). It knows packet classes and opaque payload bytes, never the app schema.
 
@@ -129,7 +129,7 @@ Every change ships with tests that would have failed before it.
 - **Restart:** an engine restored from snapshot does not re-relay already-seen packets (MSH-29).
 - **Fuzzing and resource bounds** (MSH-28): packet decode, engine input stream, sync messages; assert maximum memory and per-input CPU.
 
-**Definition of done:** the "Done when" line is demonstrably met with evidence (test output, simulator numbers with seeds); tests added; `fmt`, `clippy -D warnings`, `test`, `deny`, `doc` pass locally and in CI; ADR/parameter table/protocol doc updated if behaviour or defaults changed; no new `TODO` without an issue ID; the PR lists options considered.
+**Definition of done:** the "Done when" line is demonstrably met with evidence (test output, simulator numbers with seeds); tests added; `fmt`, `clippy -D warnings`, `test`, `deny`, `doc` pass locally and in CI; ADR/parameter table/protocol doc updated if behaviour or defaults changed; no new `TODO` without an issue ID.
 
 ---
 
@@ -153,6 +153,7 @@ If a command cannot run in your environment, say so plainly; do not skip silentl
 
 - **One issue per PR.** Scope creep becomes a new issue.
 - Titles carry the ID: `[MSH-11] Broadcast suppression`. Branches: `msh-11-broadcast-suppression`. Commits reference the ID.
+- **A PR body references its issue** (`For issue #6`) and states what changed, why, how and which tests were introduced - nothing else. No process-file or tooling mentions. Plain traditional Markdown only: no emojis, checkmarks, arrows or other non-ASCII characters, no HTML.
 - Labels: `type:*`, `prio:P0|P1|P2`, `size:S|M|L`. Milestones M0 to M7.
 - Respect `needs` in the backlog. Sibling crates are consumed by git tag; never commit a `[patch]` override. If you need an unreleased sibling change, land it there first and bump the tag.
 - Changing CI, lints, thresholds, `deny.toml` or MSRV is its own reviewed change.

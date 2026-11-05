@@ -145,7 +145,7 @@ Titles carry the ID: `[MSH-11] Broadcast suppression`.
 ## Contributing
 
 1. Read the issue's scope and "Done when" line, and the routing ADR (MSH-02).
-2. Read [`AGENTS.md`](AGENTS.md). It applies to humans and AI agents equally.
+2. Read the [rules](AGENTS.md).
 3. Any routing change that affects delivery or overhead must come with simulator numbers.
 
 Report vulnerabilities privately to the maintainers (contact in `SECURITY.md`), not in a public issue.
