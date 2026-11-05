@@ -1,1 +1,5 @@
 /target
+# Generated file: not committed (library crate; mirrors aoNetwork and aoIdents).
+/Cargo.lock
+# Local sibling overrides (docs/local-development.md) must never be committed.
+/.cargo/

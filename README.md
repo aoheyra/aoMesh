@@ -2,7 +2,7 @@
 
 **The routing and store-and-forward engine of the aoheyra mesh.** A sans-IO Rust crate that decides what happens to a packet: forward it, hold it, suppress it, deliver it, or drop it, across a phone-to-phone mesh where links come and go.
 
-> **Status: pre-alpha, M0 (Foundations).** The repo is currently a `cargo new` skeleton. Everything below is design from the backlog (`MSH-xx`); nothing is implemented until its issue is closed.
+> **Status: pre-alpha, M0 (Foundations).** **MSH-01** (scaffold, engine skeleton, sibling git dependencies, CI) is implemented; everything below is design from the backlog (`MSH-xx`) and lands with its issue.
 
 Cargo package name: `ao_mesh`.
 
@@ -112,6 +112,8 @@ Metrics: delivery ratio, latency, overhead (transmissions per delivery), duplica
 
 ## Development
 
+Requires Rust 1.85+ (edition 2024; the MSRV is pinned as `rust-version` in `Cargo.toml` and enforced by CI).
+
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
@@ -125,7 +127,7 @@ cargo run --release --example sim_report
 
 ### Sibling crates
 
-`ao_network` and `ao_idents` are consumed **by git tag**. For local co-development use a `[patch]` override in your own, uncommitted Cargo config; the exact procedure is documented in `docs/local-development.md` (MSH-01) and in aoheyra's APP-01. `ao_network` with feature `sim` is a `dev-dependency` so the whole mesh can be built and tested before the BLE shim works.
+`ao_network` and `ao_idents` are consumed **by git** (master until the `v0.1.0` tags exist, then tags). For local co-development use a `[patch]` override in your own, uncommitted Cargo config; the exact procedure is documented in `docs/local-development.md` (MSH-01) and in aoheyra's APP-01. `ao_network` with feature `sim` is a `dev-dependency` so the whole mesh can be built and tested before the BLE shim works.
 
 ## Roadmap
 
@@ -152,4 +154,4 @@ Report vulnerabilities privately to the maintainers (contact in `SECURITY.md`), 
 
 ## License
 
-To be decided for all four repos in APP-01. Until then, no licence is granted.
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT licence](LICENSE-MIT) at your option. Decision: APP-01, applied to all four repos.
