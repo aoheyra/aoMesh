@@ -16,5 +16,7 @@
 #![deny(missing_docs)]
 
 pub mod engine;
+pub mod packet;
 
 pub use engine::{MeshEngine, MeshInput, MeshOutput};
+pub use packet::{Header, Packet, PacketClass, PacketError};
