@@ -125,6 +125,8 @@ cargo doc --no-deps --all-features
 cargo run --release --example sim_report
 ```
 
+Tests are `cargo test` only: no Miri or callgrind locally. CI runs fmt, clippy, tests on three operating systems, `cargo doc`, cargo-deny, an MSRV build and miri on every pull request.
+
 ### Sibling crates
 
 `ao_network` and `ao_idents` are consumed **by git** (master until the `v0.1.0` tags exist, then tags). For local co-development use a `[patch]` override in your own, uncommitted Cargo config; the exact procedure is documented in `docs/local-development.md` (MSH-01) and in aoheyra's APP-01. `ao_network` with feature `sim` is a `dev-dependency` so the whole mesh can be built and tested before the BLE shim works.
