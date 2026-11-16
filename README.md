@@ -84,9 +84,10 @@ Lifetimes, TTLs, copy counts and budgets are **defaults with documented reasons*
 
 `Header { ver, class, flags, ttl, hops, msg_id(16), origin(16), dst(16 or none), created_ms, lifetime_s, payload_len }`
 
+- Byte layout, class IDs (1 Direct, 2 Broadcast, 3 Presence, 4 Telemetry), canonical varints and the 2048-byte payload cap: [`docs/protocol.md`](docs/protocol.md), decision record ADR-0002.
 - `ttl` and `hops` are **hop-mutable** and are *not* covered by the origin signature; everything else is.
 - Header-only parsing allows fast reject without allocating the payload; there is a hard payload cap.
-- `msg_id` derives from the immutable header and the payload hash.
+- `msg_id` derives from the immutable header and the payload hash (MSH-04; until then the format carries 16 opaque bytes).
 - Relays verify the origin signature for Broadcast and Presence; Direct packets are verified by the recipient, and by relays only within a CPU budget.
 
 ### MeshHello (MSH-07)
