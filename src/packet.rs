@@ -15,20 +15,25 @@
 //! ..      1..10       payload_len (unsigned LEB128)
 //! ..      1           ttl   (hop-mutable, outside the immutable prefix)
 //! ..      1           hops  (hop-mutable, outside the immutable prefix)
+//! ..      64          signature (Ed25519 over the immutable prefix)
 //! ..      payload_len payload (opaque, at most MAX_PAYLOAD bytes)
 //! ```
 //!
 //! Everything from `ver` up to (excluding) `ttl` is the **immutable prefix**:
-//! one contiguous slice, so the MSH-04 origin signature covers it with a
-//! single range. `ttl` and `hops` sit after the prefix and are deliberately
-//! outside it: a relay decrementing `ttl` must not break verification
-//! (AGENTS section 4).
+//! one contiguous slice, so [`crate::sign`] covers it with a single range.
+//! `ttl` and `hops` sit after the prefix and are deliberately outside it: a
+//! relay decrementing `ttl` must not break verification (AGENTS section 4).
+//! The signature follows the hop fields and covers the prefix only; the
+//! payload is last and opaque, bound to the signature through `msg_id`,
+//! which derives from the payload hash.
 //!
 //! [`Header::decode`] reads only the header, never the payload bytes, and
 //! allocates nothing, so a malformed or oversize packet is rejected before
 //! any payload buffer exists.
 
 use core::fmt;
+
+use ao_idents::Signature;
 
 /// Wire version this codec produces and the only one it accepts.
 ///
@@ -38,16 +43,55 @@ use core::fmt;
 pub const VERSION: u8 = 1;
 
 /// Size of a `msg_id` in bytes.
-///
-/// The value is opaque here; MSH-04 derives it from the immutable header and
-/// the payload hash.
 pub const MSG_ID_LEN: usize = 16;
+
+/// A derived message identifier: 16 bytes of content-addressed identity.
+///
+/// [`crate::sign::derive_msg_id`] computes it from the immutable header and
+/// the payload hash; it is the deduplication key seen-cache lookups use
+/// (MSH-05). The newtype keeps it from being swapped with the equally long
+/// `origin` or `dst` fields by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MessageId([u8; MSG_ID_LEN]);
+
+impl MessageId {
+    /// Wrap raw identifier bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; MSG_ID_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    /// The raw identifier bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; MSG_ID_LEN] {
+        &self.0
+    }
+}
+
+impl From<[u8; MSG_ID_LEN]> for MessageId {
+    fn from(bytes: [u8; MSG_ID_LEN]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl fmt::Display for MessageId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in &self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
 
 /// Size of an origin or destination node ID in bytes.
 ///
 /// The bytes are opaque to this crate (AGENTS section 3: `NodeId` is not
 /// interpreted).
 pub const NODE_ID_LEN: usize = 16;
+
+/// Size of the origin signature on the wire: Ed25519, carried as an
+/// [`ao_idents::Signature`].
+pub const SIGNATURE_LEN: usize = 64;
 
 /// Hard cap on payload bytes per packet.
 ///
@@ -185,8 +229,9 @@ pub struct Header {
     /// The wire flag bit is derived from this field, so "flag set but no
     /// destination" cannot be represented.
     pub dst: Option<[u8; NODE_ID_LEN]>,
-    /// Message ID, opaque until MSH-04 defines its derivation.
-    pub msg_id: [u8; MSG_ID_LEN],
+    /// Message ID; [`crate::sign::derive_msg_id`] derives it from the
+    /// immutable header and the payload hash.
+    pub msg_id: MessageId,
     /// Origin node ID, opaque bytes.
     pub origin: [u8; NODE_ID_LEN],
     /// Sender timestamp in unix milliseconds; relays use relative age, never
@@ -211,6 +256,33 @@ impl Header {
         out
     }
 
+    /// Encodes the immutable prefix into `buf` and returns its length.
+    ///
+    /// This is the exact range the origin signature and the `msg_id`
+    /// derivation cover. The caller supplies the buffer so neither
+    /// operation allocates.
+    pub(crate) fn encode_immutable_into(&self, buf: &mut [u8; MAX_IMMUTABLE_LEN]) -> usize {
+        let mut n = 0;
+        buf[n] = VERSION;
+        n += 1;
+        buf[n] = self.class.to_wire();
+        n += 1;
+        buf[n] = if self.dst.is_some() { HAS_DST } else { 0 };
+        n += 1;
+        buf[n..n + MSG_ID_LEN].copy_from_slice(self.msg_id.as_bytes());
+        n += MSG_ID_LEN;
+        buf[n..n + NODE_ID_LEN].copy_from_slice(&self.origin);
+        n += NODE_ID_LEN;
+        if let Some(dst) = self.dst {
+            buf[n..n + NODE_ID_LEN].copy_from_slice(&dst);
+            n += NODE_ID_LEN;
+        }
+        n += put_uvarint_into(&mut buf[n..], self.created_ms);
+        n += put_uvarint_into(&mut buf[n..], self.lifetime_s);
+        n += put_uvarint_into(&mut buf[n..], self.payload_len);
+        n
+    }
+
     /// Parses the header from the front of `bytes` without reading the
     /// payload and without allocating.
     ///
@@ -230,7 +302,7 @@ impl Header {
             return Err(PacketError::UnknownFlags(flags));
         }
 
-        let msg_id = copy_array(r.take(MSG_ID_LEN)?)?;
+        let msg_id: MessageId = copy_array(r.take(MSG_ID_LEN)?)?.into();
         let origin = copy_array(r.take(NODE_ID_LEN)?)?;
         let dst = if flags & HAS_DST != 0 {
             Some(copy_array(r.take(NODE_ID_LEN)?)?)
@@ -275,17 +347,9 @@ impl Header {
     }
 
     fn encode_into(&self, out: &mut Vec<u8>) {
-        out.push(VERSION);
-        out.push(self.class.to_wire());
-        out.push(if self.dst.is_some() { HAS_DST } else { 0 });
-        out.extend_from_slice(&self.msg_id);
-        out.extend_from_slice(&self.origin);
-        if let Some(dst) = self.dst {
-            out.extend_from_slice(&dst);
-        }
-        put_uvarint(out, self.created_ms);
-        put_uvarint(out, self.lifetime_s);
-        put_uvarint(out, self.payload_len);
+        let mut prefix = [0u8; MAX_IMMUTABLE_LEN];
+        let n = self.encode_immutable_into(&mut prefix);
+        out.extend_from_slice(&prefix[..n]);
         out.push(self.ttl);
         out.push(self.hops);
     }
@@ -302,7 +366,7 @@ impl Header {
 /// let header = Header {
 ///     class: PacketClass::Direct,
 ///     dst: Some([7; 16]),
-///     msg_id: [1; 16],
+///     msg_id: [1; 16].into(),
 ///     origin: [2; 16],
 ///     created_ms: 1_700_000_000_000,
 ///     lifetime_s: 3_600,
@@ -310,7 +374,10 @@ impl Header {
 ///     ttl: 8,
 ///     hops: 0,
 /// };
-/// let bytes = Packet::new(header, b"ping").expect("lengths agree").encode();
+/// let signature = ao_idents::Signature::from_bytes([0; 64]);
+/// let bytes = Packet::new(header, signature, b"ping")
+///     .expect("lengths agree")
+///     .encode();
 /// let packet = Packet::decode(&bytes).expect("round trip");
 /// assert_eq!(packet.payload, b"ping");
 /// assert_eq!(packet.header.ttl, 8);
@@ -319,15 +386,22 @@ impl Header {
 pub struct Packet<'a> {
     /// The decoded header.
     pub header: Header,
+    /// Origin signature over the immutable prefix, under the domain
+    /// `aoheyra/mesh/v1/packet` (MSH-04).
+    pub signature: Signature,
     /// Opaque payload bytes, borrowed from the buffer passed to
     /// [`Packet::decode`].
     pub payload: &'a [u8],
 }
 
 impl<'a> Packet<'a> {
-    /// Pairs a header with its payload, enforcing the cap and the
-    /// length agreement between them.
-    pub fn new(header: Header, payload: &'a [u8]) -> Result<Self, PacketError> {
+    /// Pairs a header with its signature and payload, enforcing the cap and
+    /// the length agreement between header and payload.
+    pub fn new(
+        header: Header,
+        signature: Signature,
+        payload: &'a [u8],
+    ) -> Result<Self, PacketError> {
         if header.payload_len > MAX_PAYLOAD as u64 {
             return Err(PacketError::PayloadTooLarge {
                 len: header.payload_len,
@@ -340,21 +414,34 @@ impl<'a> Packet<'a> {
                 actual: payload.len(),
             });
         }
-        Ok(Self { header, payload })
+        Ok(Self {
+            header,
+            signature,
+            payload,
+        })
     }
 
-    /// Parses a complete packet: header first, then the borrowed payload.
+    /// Parses a complete packet: header first, then the signature, then the
+    /// borrowed payload.
     ///
     /// Rejects truncated input and trailing bytes; never allocates.
     pub fn decode(bytes: &'a [u8]) -> Result<Self, PacketError> {
         let header = Header::decode(bytes)?;
-        let start = header.encoded_len();
-        let end = start
-            .checked_add(header.payload_len as usize)
-            .ok_or(PacketError::Truncated {
-                need: usize::MAX,
+        let sig_at = header.encoded_len();
+        let sig_end = sig_at + SIGNATURE_LEN;
+        if bytes.len() < sig_end {
+            return Err(PacketError::Truncated {
+                need: sig_end,
                 have: bytes.len(),
-            })?;
+            });
+        }
+        let end =
+            sig_end
+                .checked_add(header.payload_len as usize)
+                .ok_or(PacketError::Truncated {
+                    need: usize::MAX,
+                    have: bytes.len(),
+                })?;
         if bytes.len() < end {
             return Err(PacketError::Truncated {
                 need: end,
@@ -368,20 +455,29 @@ impl<'a> Packet<'a> {
         }
         Ok(Self {
             header,
-            payload: &bytes[start..end],
+            signature: Signature::from_bytes(copy_array(&bytes[sig_at..sig_end])?),
+            payload: &bytes[sig_end..end],
         })
     }
 
-    /// Encodes header and payload into one contiguous buffer.
+    /// Encodes header, signature and payload into one contiguous buffer.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.header.encoded_len() + self.payload.len());
+        let mut out =
+            Vec::with_capacity(self.header.encoded_len() + SIGNATURE_LEN + self.payload.len());
         self.header.encode_into(&mut out);
+        out.extend_from_slice(self.signature.as_bytes());
         out.extend_from_slice(self.payload);
         out
     }
 }
 
 const HAS_DST: u8 = 1 << 0;
+/// Byte offset of the `msg_id` field inside the immutable prefix:
+/// `ver` + `class` + `flags`.
+pub(crate) const MSG_ID_OFFSET: usize = 3;
+/// Largest possible immutable prefix: the fixed fields, an optional `dst`,
+/// and the three varints at their 10-byte maximum.
+pub(crate) const MAX_IMMUTABLE_LEN: usize = MSG_ID_OFFSET + MSG_ID_LEN + 2 * NODE_ID_LEN + 3 * 10;
 /// `ver` + `class` + `flags` + `msg_id` + `origin`: the fixed bytes before
 /// the optional `dst`.
 const FIXED_PREFIX: usize = 3 + MSG_ID_LEN + NODE_ID_LEN;
@@ -459,19 +555,27 @@ fn varint_len(value: u64) -> usize {
     len
 }
 
-/// Writes `value` in minimal (canonical) unsigned LEB128 form.
-fn put_uvarint(out: &mut Vec<u8>, mut value: u64) {
+/// Writes `value` in minimal (canonical) unsigned LEB128 form and returns
+/// the number of bytes written (at most 10 for any `u64`).
+///
+/// The caller passes the tail of a [`MAX_IMMUTABLE_LEN`] buffer, which is
+/// sized for three 10-byte varints, so every index below stays in bounds
+/// for every `u64` input.
+fn put_uvarint_into(buf: &mut [u8], mut value: u64) -> usize {
+    let mut i = 0;
     loop {
         let mut byte = (value & 0x7F) as u8;
         value >>= 7;
         if value != 0 {
             byte |= 0x80;
         }
-        out.push(byte);
+        buf[i] = byte;
+        i += 1;
         if value == 0 {
             break;
         }
     }
+    i
 }
 
 fn copy_array<const N: usize>(bytes: &[u8]) -> Result<[u8; N], PacketError> {
@@ -489,7 +593,7 @@ mod tests {
         Header {
             class: PacketClass::Direct,
             dst: Some([9u8; NODE_ID_LEN]),
-            msg_id: [1u8; MSG_ID_LEN],
+            msg_id: [1u8; MSG_ID_LEN].into(),
             origin: [2u8; NODE_ID_LEN],
             created_ms: 1_700_000_000_000,
             lifetime_s: 3_600,
@@ -497,6 +601,10 @@ mod tests {
             ttl: 8,
             hops: 0,
         }
+    }
+
+    fn signature() -> Signature {
+        Signature::from_bytes([0x5A; SIGNATURE_LEN])
     }
 
     #[test]
@@ -638,11 +746,55 @@ mod tests {
     fn packet_round_trip_and_lengths() {
         let mut h = base_header();
         h.payload_len = 5;
-        let packet = Packet::new(h, b"ping!").expect("valid pair");
+        let packet = Packet::new(h, signature(), b"ping!").expect("valid pair");
         let bytes = packet.encode();
         let decoded = Packet::decode(&bytes).expect("round trip");
         assert_eq!(decoded, packet);
         assert_eq!(decoded.payload, b"ping!");
+        assert_eq!(decoded.signature, signature());
+    }
+
+    #[test]
+    fn signature_sits_between_the_hop_fields_and_the_payload() {
+        let mut h = base_header();
+        h.payload_len = 4;
+        let bytes = Packet::new(h, signature(), b"ping")
+            .expect("valid pair")
+            .encode();
+        // The header still ends at `hops`; the signature follows it.
+        let header_len = h.encode().len();
+        assert_eq!(
+            &bytes[header_len..header_len + SIGNATURE_LEN],
+            signature().as_bytes()
+        );
+        assert_eq!(&bytes[header_len + SIGNATURE_LEN..], b"ping");
+        // The header-only view parses without knowing about the signature.
+        assert_eq!(Header::decode(&bytes).expect("header first"), h);
+    }
+
+    #[test]
+    fn missing_signature_is_truncated_not_trailing() {
+        let mut h = base_header();
+        h.payload_len = 0;
+        let full = Packet::new(h, signature(), b"")
+            .expect("valid pair")
+            .encode();
+        let header_only = h.encode();
+        // Header without the signature: rejected at the signature offset.
+        let err = Packet::decode(&header_only).expect_err("no signature");
+        assert_eq!(
+            err,
+            PacketError::Truncated {
+                need: header_only.len() + SIGNATURE_LEN,
+                have: header_only.len(),
+            }
+        );
+        // A partial signature is the same rejection, one byte short of full.
+        let short = &full[..full.len() - 1];
+        assert!(matches!(
+            Packet::decode(short),
+            Err(PacketError::Truncated { .. })
+        ));
     }
 
     #[test]
@@ -650,7 +802,7 @@ mod tests {
         let mut h = base_header();
         h.payload_len = 4;
         assert_eq!(
-            Packet::new(h, b"five!"),
+            Packet::new(h, signature(), b"five!"),
             Err(PacketError::PayloadLengthMismatch {
                 header: 4,
                 actual: 5
@@ -663,7 +815,7 @@ mod tests {
         let mut h = base_header();
         h.payload_len = MAX_PAYLOAD as u64 + 1;
         assert_eq!(
-            Packet::new(h, &[]),
+            Packet::new(h, signature(), &[]),
             Err(PacketError::PayloadTooLarge {
                 len: MAX_PAYLOAD as u64 + 1,
                 max: MAX_PAYLOAD as u64,
@@ -675,7 +827,9 @@ mod tests {
     fn truncated_packet_is_rejected() {
         let mut h = base_header();
         h.payload_len = 4;
-        let bytes = Packet::new(h, b"ping").expect("valid pair").encode();
+        let bytes = Packet::new(h, signature(), b"ping")
+            .expect("valid pair")
+            .encode();
         let err = Packet::decode(&bytes[..bytes.len() - 1]).expect_err("short");
         assert!(matches!(err, PacketError::Truncated { .. }));
         // Header alone still parses: the payload was never required.
@@ -684,8 +838,11 @@ mod tests {
 
     #[test]
     fn trailing_bytes_are_rejected() {
-        let bytes = base_header().encode();
-        let mut with_extra = bytes.clone();
+        let mut h = base_header();
+        h.payload_len = 0;
+        let mut with_extra = Packet::new(h, signature(), b"")
+            .expect("valid pair")
+            .encode();
         with_extra.push(0);
         assert_eq!(
             Packet::decode(&with_extra),

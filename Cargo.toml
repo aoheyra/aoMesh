@@ -21,6 +21,9 @@ rand_core = "0.9"
 # Local overrides: docs/local-development.md — never commit a [patch].
 ao_network = { version = "0.1.0", git = "https://github.com/aoheyra/aoNetwork" }
 ao_idents = { version = "0.1.0", git = "https://github.com/aoheyra/aoIdents" }
+# msg_id derivation (MSH-04); the same primitive aoIdents uses per its
+# ADR-0001, so one hashing algorithm covers the whole org.
+blake3 = "1"
 
 [dev-dependencies]
 rand = "0.9"
