@@ -90,6 +90,14 @@ Lifetimes, TTLs, copy counts and budgets are **defaults with documented reasons*
 - `msg_id` derives from the immutable header and the payload hash (MSH-04): a content address, so one message has exactly one dedup key for MSH-05's seen-cache.
 - Relays verify the origin signature for Broadcast and Presence; Direct packets are verified by the recipient, and by relays only within a CPU budget. Telemetry is not verified by relays.
 
+### Seen-cache (MSH-05)
+
+A bounded dedupe cache for forwarding: `check_and_insert(now, class, msg_id)` answers `Fresh` (forward) or `Duplicate` (drop), keyed by the MSH-04 content address.
+
+- Bounded in **size and time**: at most 4096 recordings (oldest evicted first), each expiring at its class's window from ADR-0001 (Direct 24 h, Broadcast 6 h, Presence 30 min, Telemetry 5 min). A duplicate does not extend the window.
+- No input can grow it past the bound: one million insertions peak at 263,560 bytes, asserted against the documented 512 KiB ceiling by `tests/seen_memory.rs`. Decision record ADR-0003.
+- Capacity and windows are configurable through `SeenConfig`; capacity 0 records nothing, a zero window never deduplicates.
+
 ### MeshHello (MSH-07)
 
 A signed `MeshHello {node_id, card_hash, proto, caps, store digest}` fitting aoNetwork's 256-byte `app_hello` limit. It is verified on `LinkUp`, so the engine exposes a **verified `NodeId`** per neighbour. Invalid or oversize hellos are dropped.

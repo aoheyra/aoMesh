@@ -17,10 +17,12 @@
 
 pub mod engine;
 pub mod packet;
+pub mod seen;
 pub mod sign;
 
 pub use engine::{MeshEngine, MeshInput, MeshOutput};
 pub use packet::{Header, MessageId, Packet, PacketClass, PacketError, SIGNATURE_LEN};
+pub use seen::{Offer, SeenCache, SeenConfig};
 pub use sign::{
     RelayOutcome, VerifyError, derive_msg_id, sign_packet, verify_for_relay, verify_origin,
 };
