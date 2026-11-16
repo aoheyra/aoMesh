@@ -4,6 +4,18 @@
 use ao_mesh::packet::{Header, MAX_PAYLOAD, MSG_ID_LEN, NODE_ID_LEN, Packet, PacketClass};
 use proptest::collection::vec;
 use proptest::prelude::*;
+use proptest::test_runner::{Config, MapFailurePersistence, RngSeed};
+
+fn config() -> Config {
+    let mut config = Config::with_cases(256);
+    config.rng_seed = RngSeed::Fixed(0x4D53_0003);
+    // File persistence calls getcwd, which Miri's isolated runner forbids
+    // (CI runs cargo miri test). In-memory persistence with a fixed seed
+    // keeps every run reproducible; promote a reported minimal failing
+    // input to a regression test when one appears.
+    config.failure_persistence = Some(Box::new(MapFailurePersistence::default()));
+    config
+}
 
 fn arb_class() -> impl Strategy<Value = PacketClass> {
     prop_oneof![
@@ -49,6 +61,8 @@ fn arb_packet() -> impl Strategy<Value = (Header, Vec<u8>)> {
 }
 
 proptest! {
+    #![proptest_config(config())]
+
     #[test]
     fn headers_round_trip(header in arb_any_header()) {
         let bytes = header.encode();
