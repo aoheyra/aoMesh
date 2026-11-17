@@ -7,7 +7,10 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use ao_mesh::packet::{Header, MAX_PAYLOAD, MSG_ID_LEN, NODE_ID_LEN, PacketClass, PacketError};
+use ao_idents::Signature;
+use ao_mesh::packet::{
+    Header, MAX_PAYLOAD, MSG_ID_LEN, NODE_ID_LEN, Packet, PacketClass, PacketError, SIGNATURE_LEN,
+};
 
 struct Counting;
 
@@ -42,7 +45,7 @@ fn header_with_payload_len(payload_len: u64) -> Header {
     Header {
         class: PacketClass::Broadcast,
         dst: None,
-        msg_id: [1u8; MSG_ID_LEN],
+        msg_id: [1u8; MSG_ID_LEN].into(),
         origin: [2u8; NODE_ID_LEN],
         created_ms: 1_700_000_000_000,
         lifetime_s: 3_600,
@@ -63,6 +66,16 @@ fn header_only_parse_and_reject_never_allocate() {
     let oversize = header_with_payload_len(MAX_PAYLOAD as u64 + 1);
     let oversize_bytes = oversize.encode();
 
+    // A complete packet, so the full decode (signature and payload
+    // borrowed in place) is measured too.
+    let packet_bytes = Packet::new(
+        header_with_payload_len(4),
+        Signature::from_bytes([0x5A; SIGNATURE_LEN]),
+        b"ping",
+    )
+    .expect("valid pair")
+    .encode();
+
     // Everything above allocated; the measurement starts here.
     ALLOCS.store(0, Ordering::SeqCst);
 
@@ -72,8 +85,13 @@ fn header_only_parse_and_reject_never_allocate() {
     let rejected = Header::decode(&oversize_bytes).expect_err("oversize is rejected");
     let reject_allocs = ALLOCS.load(Ordering::SeqCst);
 
+    let decoded = Packet::decode(&packet_bytes).expect("full packet parses");
+    let packet_allocs = ALLOCS.load(Ordering::SeqCst);
+
     assert_eq!(parse_allocs, 0, "header-only parse allocated");
     assert_eq!(reject_allocs, 0, "header-only reject allocated");
+    assert_eq!(packet_allocs, 0, "packet decode allocated");
     assert_eq!(parsed.payload_len, MAX_PAYLOAD as u64);
     assert!(matches!(rejected, PacketError::PayloadTooLarge { .. }));
+    assert_eq!(decoded.payload, b"ping");
 }

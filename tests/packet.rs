@@ -1,14 +1,17 @@
-//! Property tests for the packet codec (MSH-03): round-trips, truncation
-//! and never-panic on hostile bytes.
+//! Property tests for the packet codec (MSH-03, MSH-04): round-trips,
+//! truncation and never-panic on hostile bytes.
 
-use ao_mesh::packet::{Header, MAX_PAYLOAD, MSG_ID_LEN, NODE_ID_LEN, Packet, PacketClass};
+use ao_idents::Signature;
+use ao_mesh::packet::{
+    Header, MAX_PAYLOAD, MSG_ID_LEN, NODE_ID_LEN, Packet, PacketClass, SIGNATURE_LEN,
+};
 use proptest::collection::vec;
 use proptest::prelude::*;
 use proptest::test_runner::{Config, MapFailurePersistence, RngSeed};
 
 fn config() -> Config {
     let mut config = Config::with_cases(256);
-    config.rng_seed = RngSeed::Fixed(0x4D53_0003);
+    config.rng_seed = RngSeed::Fixed(0x4D53_0004);
     // File persistence calls getcwd, which Miri's isolated runner forbids
     // (CI runs cargo miri test). In-memory persistence with a fixed seed
     // keeps every run reproducible; promote a reported minimal failing
@@ -26,6 +29,10 @@ fn arb_class() -> impl Strategy<Value = PacketClass> {
     ]
 }
 
+fn arb_signature() -> impl Strategy<Value = Signature> {
+    any::<[u8; SIGNATURE_LEN]>().prop_map(Signature::from_bytes)
+}
+
 fn arb_header(payload_len: u64) -> impl Strategy<Value = Header> {
     (
         arb_class(),
@@ -41,7 +48,7 @@ fn arb_header(payload_len: u64) -> impl Strategy<Value = Header> {
             move |(class, msg_id, origin, dst, created_ms, lifetime_s, ttl, hops)| Header {
                 class,
                 dst,
-                msg_id,
+                msg_id: msg_id.into(),
                 origin,
                 created_ms,
                 lifetime_s,
@@ -56,8 +63,14 @@ fn arb_any_header() -> impl Strategy<Value = Header> {
     (0u64..=MAX_PAYLOAD as u64).prop_flat_map(arb_header)
 }
 
-fn arb_packet() -> impl Strategy<Value = (Header, Vec<u8>)> {
-    (0usize..=MAX_PAYLOAD).prop_flat_map(|len| (arb_header(len as u64), vec(any::<u8>(), len)))
+fn arb_packet() -> impl Strategy<Value = (Header, Signature, Vec<u8>)> {
+    (0usize..=MAX_PAYLOAD, arb_signature()).prop_flat_map(|(len, signature)| {
+        (
+            arb_header(len as u64),
+            Just(signature),
+            vec(any::<u8>(), len),
+        )
+    })
 }
 
 proptest! {
@@ -71,11 +84,13 @@ proptest! {
     }
 
     #[test]
-    fn packets_round_trip((header, payload) in arb_packet()) {
-        let packet = Packet::new(header, &payload).expect("payload_len matches by construction");
+    fn packets_round_trip((header, signature, payload) in arb_packet()) {
+        let packet =
+            Packet::new(header, signature, &payload).expect("payload_len matches by construction");
         let bytes = packet.encode();
         let decoded = Packet::decode(&bytes).expect("an encoded packet always parses");
         prop_assert_eq!(decoded.header, header);
+        prop_assert_eq!(decoded.signature, signature);
         prop_assert_eq!(decoded.payload, payload.as_slice());
     }
 
@@ -86,9 +101,10 @@ proptest! {
     }
 
     #[test]
-    fn truncated_packets_are_rejected((header, payload) in arb_packet()) {
-        let bytes = Packet::new(header, &payload).expect("payload_len matches by construction")
-            .encode();
+    fn truncated_packets_are_rejected((header, signature, payload) in arb_packet()) {
+        let bytes =
+            Packet::new(header, signature, &payload).expect("payload_len matches by construction")
+                .encode();
         for cut in 0..bytes.len() {
             prop_assert!(
                 Packet::decode(&bytes[..cut]).is_err(),
@@ -99,9 +115,10 @@ proptest! {
     }
 
     #[test]
-    fn header_only_view_matches_the_packets_header((header, payload) in arb_packet()) {
-        let bytes = Packet::new(header, &payload).expect("payload_len matches by construction")
-            .encode();
+    fn header_only_view_matches_the_packets_header((header, signature, payload) in arb_packet()) {
+        let bytes =
+            Packet::new(header, signature, &payload).expect("payload_len matches by construction")
+                .encode();
         let view = Header::decode(&bytes).expect("the header parses first");
         prop_assert_eq!(view, header);
     }

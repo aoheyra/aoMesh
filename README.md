@@ -80,15 +80,15 @@ Lifetimes, TTLs, copy counts and budgets are **defaults with documented reasons*
 
 **Engine inputs:** `LinkUp`, `LinkDown`, `Data`, `Tick`, `Submit`. **Outputs:** `Send`, `Broadcast`, `Release`, `Deliver`, `SetHello`, `SetBeacon`.
 
-### Packet header (MSH-03)
+### Packet format (MSH-03, MSH-04)
 
-`Header { ver, class, flags, ttl, hops, msg_id(16), origin(16), dst(16 or none), created_ms, lifetime_s, payload_len }`
+`Header { ver, class, flags, ttl, hops, msg_id(16), origin(16), dst(16 or none), created_ms, lifetime_s, payload_len }`, then a 64-byte Ed25519 origin signature, then the payload.
 
 - Byte layout, class IDs (1 Direct, 2 Broadcast, 3 Presence, 4 Telemetry), canonical varints and the 2048-byte payload cap: [`docs/protocol.md`](docs/protocol.md), decision record ADR-0002.
-- `ttl` and `hops` are **hop-mutable** and are *not* covered by the origin signature; everything else is.
+- `ttl` and `hops` are **hop-mutable** and are *not* covered by the origin signature; everything else is. The signature sits after the hop fields, so verification survives relay hops.
 - Header-only parsing allows fast reject without allocating the payload; there is a hard payload cap.
-- `msg_id` derives from the immutable header and the payload hash (MSH-04; until then the format carries 16 opaque bytes).
-- Relays verify the origin signature for Broadcast and Presence; Direct packets are verified by the recipient, and by relays only within a CPU budget.
+- `msg_id` derives from the immutable header and the payload hash (MSH-04): a content address, so one message has exactly one dedup key for MSH-05's seen-cache.
+- Relays verify the origin signature for Broadcast and Presence; Direct packets are verified by the recipient, and by relays only within a CPU budget. Telemetry is not verified by relays.
 
 ### MeshHello (MSH-07)
 
@@ -158,3 +158,14 @@ Report vulnerabilities privately to the maintainers (contact in `SECURITY.md`), 
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT licence](LICENSE-MIT) at your option. Decision: APP-01, applied to all four repos.
+
+## Message storage (MSH-12)
+
+`store::MessageStore` defines put/get, destination lookup, canonical summaries,
+expiry and explicit eviction. `store::MemoryStore` implements bounded total,
+per-origin and per-class storage with deterministic eviction. Telemetry is not
+stored. Callers verify packet authenticity before insertion; this module keeps
+opaque wire bytes and local metadata, never keys or application data models.
+See [the storage decision](docs/adr/message-store.md) for limits and ordering.
+The app's SQLite backend must run `store::conformance::check` against a fresh
+backend factory. SQLite itself and engine integration are separate tasks.
