@@ -158,3 +158,14 @@ Report vulnerabilities privately to the maintainers (contact in `SECURITY.md`), 
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT licence](LICENSE-MIT) at your option. Decision: APP-01, applied to all four repos.
+
+## Message storage (MSH-12)
+
+`store::MessageStore` defines put/get, destination lookup, canonical summaries,
+expiry and explicit eviction. `store::MemoryStore` implements bounded total,
+per-origin and per-class storage with deterministic eviction. Telemetry is not
+stored. Callers verify packet authenticity before insertion; this module keeps
+opaque wire bytes and local metadata, never keys or application data models.
+See [the storage decision](docs/adr/message-store.md) for limits and ordering.
+The app's SQLite backend must run `store::conformance::check` against a fresh
+backend factory. SQLite itself and engine integration are separate tasks.

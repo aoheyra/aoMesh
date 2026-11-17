@@ -53,3 +53,10 @@ version bump and compatibility note (AGENTS section 4).
 `UnsupportedVersion`, `UnknownClass`, `UnknownFlags`, `NonCanonicalVarint`,
 `VarintOverflow`, `PayloadTooLarge`, `PayloadLengthMismatch`,
 `TrailingBytes`. Each has a test that triggers it.
+
+## Local storage metadata
+
+MSH-12 stores encoded packets unchanged. Local copies_left, priority,
+first_seen, received_at, consumed age, size and ingress node are not wire
+fields. Expiry compares relative age against lifetime, never remote wall time.
+See [MessageStore](adr/message-store.md) for quotas and deterministic eviction.
