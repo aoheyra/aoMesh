@@ -51,7 +51,7 @@ pub const MSG_ID_LEN: usize = 16;
 /// the payload hash; it is the deduplication key seen-cache lookups use
 /// (MSH-05). The newtype keeps it from being swapped with the equally long
 /// `origin` or `dst` fields by accident.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MessageId([u8; MSG_ID_LEN]);
 
 impl MessageId {

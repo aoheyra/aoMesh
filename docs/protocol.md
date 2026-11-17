@@ -88,3 +88,10 @@ version bump and compatibility note (AGENTS section 4).
 Origin verification reports `sign::VerifyError`: `BadSignature` (wrong key,
 tampered prefix or foreign domain) and `MsgIdMismatch` (the header claims a
 derivation the content does not produce). Each has a test that triggers it.
+
+## Local storage metadata
+
+MSH-12 stores encoded packets unchanged. Local copies_left, priority,
+first_seen, received_at, consumed age, size and ingress node are not wire
+fields. Expiry compares relative age against lifetime, never remote wall time.
+See [MessageStore](adr/message-store.md) for quotas and deterministic eviction.
