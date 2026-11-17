@@ -98,3 +98,10 @@ Incoming structural parsing increments counters only. It does not verify an
 origin, authenticate a neighbour, forward, decrypt, replay-check or deliver.
 These producers are tracked by MSH-07/08/09; a valid codec result is never a
 trust decision.
+
+## Local storage metadata
+
+MSH-12 stores encoded packets unchanged. Local copies_left, priority,
+first_seen, received_at, consumed age, size and ingress node are not wire
+fields. Expiry compares relative age against lifetime, never remote wall time.
+See [MessageStore](adr/message-store.md) for quotas and deterministic eviction.

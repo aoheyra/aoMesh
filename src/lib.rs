@@ -22,6 +22,7 @@ pub mod neighbor;
 pub mod packet;
 pub mod seen;
 pub mod sign;
+pub mod store;
 
 #[cfg(feature = "adapter")]
 pub use adapter::{AdapterEvent, NetworkAdapter};
