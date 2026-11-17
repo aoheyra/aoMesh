@@ -299,3 +299,10 @@ receipts purge all 1,341 copies and the slowest purge takes 1,750 ms. Both
 ablations retain their copies (`206` and `1,436`), so the purge is attributable
 to MSH-17. The regression gate `tests/sim_receipts.rs` requires zero remaining
 copies and a purge latency below ten seconds.
+## Lifetime implementation (MSH-18)
+
+`expiry::LifetimePolicy::default()` implements this table's lifetimes unchanged.
+A store may set local ceilings at construction, but never extend the packet's
+sender lifetime. Relative age and local elapsed time determine expiry; remote
+`created_ms` does not. See [lifetime policy](lifetime-expiry.md) for the clock
+contract, examples versus accepted defaults, and validation boundaries.

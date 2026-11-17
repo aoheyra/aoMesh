@@ -412,3 +412,12 @@ MSH-12 stores encoded packets unchanged. Local copies_left, priority,
 first_seen, received_at, consumed age, size and ingress node are not wire
 fields. Expiry compares relative age against lifetime, never remote wall time.
 See [MessageStore](adr/message-store.md) for quotas and deterministic eviction.
+
+## Lifetime ceilings and relative age
+
+MSH-18 computes effective lifetime as the smaller of the sender's lifetime_s
+and the configured class ceiling. Local age at receipt and elapsed monotonic
+time decide expiry; created_ms is never compared with a local clock. Store
+policy does not modify encoded bytes or add a wire age field. Sync callers
+must carry consumed age separately and account for known transfer delay.
+See [lifetime policy](adr/lifetime-expiry.md).
