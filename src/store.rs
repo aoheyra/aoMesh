@@ -2,6 +2,7 @@
 //!
 //! Callers validate authenticity before insertion. This module parses only the
 //! bounded header and never interprets application content or holds keys.
+use crate::expiry::LifetimePolicy;
 use crate::packet::{Header, MAX_PAYLOAD, PacketClass, PacketError};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -102,10 +103,16 @@ impl StoredMessage {
     }
     /// Expiry uses local elapsed time plus consumed age, never remote timestamps.
     pub fn is_expired(&self, now: u64) -> bool {
-        self.metadata
-            .age_ms
-            .saturating_add(now.saturating_sub(self.metadata.received_at))
-            >= self.header.lifetime_s.saturating_mul(1000)
+        self.is_expired_with(&LifetimePolicy::default(), now)
+    }
+    /// Apply a store's local lifetime ceilings without changing signed bytes.
+    pub fn is_expired_with(&self, policy: &LifetimePolicy, now: u64) -> bool {
+        policy.is_expired(
+            &self.header,
+            self.metadata.received_at,
+            self.metadata.age_ms,
+            now,
+        )
     }
 }
 
@@ -162,13 +169,20 @@ pub trait MessageStore {
 #[derive(Debug)]
 pub struct MemoryStore {
     limits: StoreLimits,
+    lifetime_policy: LifetimePolicy,
     entries: BTreeMap<MessageId, StoredMessage>,
 }
 impl MemoryStore {
     /// Start an empty store with explicit quotas (zero disables that scope).
     pub fn new(limits: StoreLimits) -> Self {
+        Self::with_lifetime_policy(limits, LifetimePolicy::default())
+    }
+    /// Start a store with immutable local lifetime ceilings.
+    /// All admission, lookup, summary, expiry and eviction use this policy.
+    pub fn with_lifetime_policy(limits: StoreLimits, lifetime_policy: LifetimePolicy) -> Self {
         Self {
             limits,
+            lifetime_policy,
             entries: BTreeMap::new(),
         }
     }
@@ -185,7 +199,7 @@ impl MessageStore for MemoryStore {
         if entry.metadata.received_at > now {
             return Err(StoreError::InvalidTime);
         }
-        if entry.is_expired(now) {
+        if entry.is_expired_with(&self.lifetime_policy, now) {
             return Err(StoreError::Expired);
         }
         let id = entry.header.msg_id;
@@ -260,19 +274,23 @@ impl MessageStore for MemoryStore {
         Ok(removed)
     }
     fn get(&self, now: u64, id: &MessageId) -> Option<&StoredMessage> {
-        self.entries.get(id).filter(|e| !e.is_expired(now))
+        self.entries
+            .get(id)
+            .filter(|e| !e.is_expired_with(&self.lifetime_policy, now))
     }
     fn by_destination(&self, now: u64, dst: &NodeId) -> Vec<MessageId> {
         self.entries
             .iter()
-            .filter(|(_, e)| e.header.dst.as_ref() == Some(dst) && !e.is_expired(now))
+            .filter(|(_, e)| {
+                e.header.dst.as_ref() == Some(dst) && !e.is_expired_with(&self.lifetime_policy, now)
+            })
             .map(|(id, _)| *id)
             .collect()
     }
     fn summary(&self, now: u64) -> Vec<MessageId> {
         self.entries
             .iter()
-            .filter(|(_, e)| !e.is_expired(now))
+            .filter(|(_, e)| !e.is_expired_with(&self.lifetime_policy, now))
             .map(|(id, _)| *id)
             .collect()
     }
@@ -280,7 +298,7 @@ impl MessageStore for MemoryStore {
         let ids: Vec<_> = self
             .entries
             .iter()
-            .filter(|(_, e)| e.is_expired(now))
+            .filter(|(_, e)| e.is_expired_with(&self.lifetime_policy, now))
             .map(|(id, _)| *id)
             .collect();
         for id in &ids {

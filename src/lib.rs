@@ -16,6 +16,7 @@
 #![deny(missing_docs)]
 
 pub mod engine;
+pub mod expiry;
 pub mod packet;
 
 pub use engine::{MeshEngine, MeshInput, MeshOutput};

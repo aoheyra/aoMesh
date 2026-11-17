@@ -169,3 +169,14 @@ opaque wire bytes and local metadata, never keys or application data models.
 See [the storage decision](docs/adr/message-store.md) for limits and ordering.
 The app's SQLite backend must run `store::conformance::check` against a fresh
 backend factory. SQLite itself and engine integration are separate tasks.
+
+## Lifetime and expiry (MSH-18)
+
+`expiry::LifetimePolicy` provides per-class ceilings using the ADR-0001 defaults.
+`MemoryStore::with_lifetime_policy` applies a custom policy consistently to
+admission, lookup, summaries and cleanup. The effective lifetime never exceeds
+the sender's lifetime and signed wire bytes are unchanged. Age carried from
+previous encounters plus local monotonic elapsed time determines expiry;
+remote timestamps are ignored. `expiry::age_at` carries consumed age between
+encounters with different local epochs. See [the expiry decision](docs/adr/lifetime-expiry.md)
+for the caller contract and restart/sync boundaries.

@@ -34,3 +34,11 @@ Relays see the origin and destination of every packet in MVP, which lets them ra
 ## Sweeping
 
 Each default becomes an engine config field with exactly these values; MSH-27 sweeps TTL, copies and budgets against delivery and overhead thresholds in CI. Changing a default here is a routing change and needs simulator numbers (README, Contributing).
+
+## Lifetime implementation (MSH-18)
+
+`expiry::LifetimePolicy::default()` implements this table's lifetimes unchanged.
+A store may set local ceilings at construction, but never extend the packet's
+sender lifetime. Relative age and local elapsed time determine expiry; remote
+`created_ms` does not. See [lifetime policy](lifetime-expiry.md) for the clock
+contract, examples versus accepted defaults, and validation boundaries.
