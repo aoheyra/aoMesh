@@ -12,7 +12,7 @@ keywords = ["mesh", "routing", "store-and-forward", "bluetooth"]
 categories = ["network-programming"]
 
 [features]
-# Thin tokio glue around the sans-IO core; grows in MSH-06.
+# Runtime-neutral async glue, compatible with a Tokio-owned task.
 adapter = []
 
 [dependencies]
@@ -30,3 +30,7 @@ rand = "0.9"
 # Property tests for the packet codec (MSH-03 round-trips and
 # never-panics); same pin as aoNetwork, MIT/Apache-2.0.
 proptest = { version = "1.8", default-features = false, features = ["std"] }
+
+[[example]]
+name = "mesh_adapter"
+required-features = ["adapter"]
