@@ -31,6 +31,7 @@ pub mod adapter;
 pub mod budget;
 mod deliver;
 pub mod engine;
+pub mod expiry;
 mod forward;
 pub mod hello;
 pub mod neighbor;
