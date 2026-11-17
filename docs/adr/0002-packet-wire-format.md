@@ -8,9 +8,11 @@
 
 The v1 layout with class IDs 1 Direct, 2 Broadcast, 3 Presence, 4 Telemetry,
 flags bit 0 for `dst`, canonical unsigned LEB128 integers, a 2048-byte
-payload cap, and a contiguous immutable prefix that ends just before `ttl`.
-The byte-level reference is `docs/protocol.md`; the `packet` module's
-rustdoc documents the same layout.
+payload cap, a contiguous immutable prefix that ends just before `ttl`, a
+64-byte Ed25519 origin signature between the hop fields and the payload,
+and a `msg_id` derived from the immutable prefix and the payload hash.
+The byte-level reference is `docs/protocol.md`; the `packet` and `sign`
+modules' rustdoc document the same layout.
 
 ## Reasons
 
@@ -39,3 +41,19 @@ would route by fallback. Fail closed and introduce new behaviour through
 messages of 2 KiB per hour"), aoNetwork's default frame is 16 KiB, and the
 cap bounds what a hostile header can make a relay hold before the payload is
 even read. Larger payloads are a future protocol change, not a tunable.
+
+**Signature after the hop fields, payload last.** The signature
+authenticates the header, so it sits with the header: after the mutable
+hop bytes, before the opaque payload. A future payload-level protection
+can then append after the payload without moving the signature. It covers
+the immutable prefix only; the payload is bound through `msg_id`, which
+hashes the payload, so signing the payload twice is not needed.
+
+**`msg_id` as a content address.** The ID derives from the prefix with
+its own field hashed as zeroes (it sits inside the prefix it derives
+from) plus a domain-separated hash of the payload. Every other prefix
+field participates, so different content cannot claim one dedup key, and
+the hop fields do not, so a relay's `ttl` decrement never changes a
+message's identity on its way to the seen-cache (MSH-05). Both domains,
+`aoheyra/mesh/v1/packet` and `aoheyra/mesh/v1/msg-id`, were registered in
+aoIdents ADR-0001 before use, as that registry requires.

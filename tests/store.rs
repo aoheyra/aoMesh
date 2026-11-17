@@ -1,7 +1,12 @@
 use ao_mesh::{
+    MessageId,
     packet::PacketClass,
     store::{conformance::entry, *},
 };
+
+fn id(value: u8) -> MessageId {
+    MessageId::from_bytes([value; 16])
+}
 
 #[test]
 fn memory_backend_conformance() {
@@ -21,17 +26,17 @@ fn eviction_priority_age_and_id_are_deterministic() {
     assert_eq!(
         s.put(20, entry(3, 3, PacketClass::Direct, 2, 1, 20))
             .unwrap(),
-        vec![[2; 16]]
+        vec![id(2)]
     );
     assert_eq!(
         s.put(20, entry(4, 4, PacketClass::Direct, 2, 1, 20))
             .unwrap(),
-        vec![[1; 16]]
+        vec![id(1)]
     );
     assert_eq!(
         s.put(20, entry(5, 5, PacketClass::Direct, 2, 1, 20))
             .unwrap(),
-        vec![[3; 16]]
+        vec![id(3)]
     );
 }
 
@@ -49,7 +54,7 @@ fn relative_expiry_and_rejections_preserve_entries() {
         s.put(99, entry(2, 1, PacketClass::Direct, 6, 1, 100)),
         Err(StoreError::InvalidTime)
     );
-    assert_eq!(s.get(100, &[1; 16]), Some(&original));
+    assert_eq!(s.get(100, &id(1)), Some(&original));
     assert!(matches!(
         StoredMessage::new(&vec![0; MAX_STORED_PACKET + 1], meta),
         Err(StoreError::TooLarge)
@@ -91,7 +96,7 @@ fn stress_caps_and_expiry_before_live_eviction() {
             .len(),
         3
     );
-    assert_eq!(s.summary(10_000), vec![[101; 16]]);
+    assert_eq!(s.summary(10_000), vec![id(101)]);
 }
 
 #[test]
@@ -134,9 +139,9 @@ fn zero_limits_and_simultaneous_scoped_pressure() {
     // The origin and class pressure require two disjoint evictions.
     assert_eq!(
         s.put(0, entry(3, 1, PacketClass::Direct, 6, 1, 0)).unwrap(),
-        vec![[1; 16], [2; 16]]
+        vec![id(1), id(2)]
     );
-    assert_eq!(s.summary(0), vec![[3; 16]]);
+    assert_eq!(s.summary(0), vec![id(3)]);
 }
 
 #[test]

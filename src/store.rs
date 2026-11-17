@@ -2,12 +2,10 @@
 //!
 //! Callers validate authenticity before insertion. This module parses only the
 //! bounded header and never interprets application content or holds keys.
-use crate::packet::{Header, MAX_PAYLOAD, PacketClass, PacketError};
+use crate::packet::{Header, MAX_PAYLOAD, MessageId, PacketClass, PacketError};
 use std::collections::BTreeMap;
 use std::fmt;
 
-/// Opaque message identifier.
-pub type MessageId = [u8; 16];
 /// Opaque node identifier.
 pub type NodeId = [u8; 16];
 /// Maximum stored envelope, including signature material and header.
@@ -309,7 +307,7 @@ pub mod conformance {
         let header = Header {
             class,
             dst: Some([9; 16]),
-            msg_id: [id; 16],
+            msg_id: MessageId::from_bytes([id; 16]),
             origin: [origin; 16],
             created_ms: u64::MAX,
             lifetime_s: 10,
@@ -335,6 +333,7 @@ pub mod conformance {
     /// Verify ordering, duplicate protection, expiry, quotas and eviction.
     /// Panics only on a backend contract violation; this is a test helper.
     pub fn check<S: MessageStore>(mut factory: impl FnMut(StoreLimits) -> S) {
+        let id = |value| MessageId::from_bytes([value; 16]);
         let sample = entry(1, 1, PacketClass::Direct, 6, 1, 0);
         let size = sample.size();
         let limits = StoreLimits {
@@ -345,27 +344,27 @@ pub mod conformance {
         };
         let mut store = factory(limits);
         assert_eq!(store.put(0, sample.clone()), Ok(vec![]));
-        assert_eq!(store.get(0, &[1; 16]), Some(&sample));
+        assert_eq!(store.get(0, &id(1)), Some(&sample));
         assert_eq!(
             store.put(1, entry(1, 1, PacketClass::Direct, 6, 1, 1)),
             Err(StoreError::Duplicate)
         );
-        assert_eq!(store.get(1, &[1; 16]), Some(&sample));
+        assert_eq!(store.get(1, &id(1)), Some(&sample));
         assert_eq!(
             store.put(0, entry(2, 2, PacketClass::Direct, 1, 1, 0)),
             Ok(vec![])
         );
-        assert_eq!(store.summary(0), vec![[1; 16], [2; 16]]);
+        assert_eq!(store.summary(0), vec![id(1), id(2)]);
         assert_eq!(store.by_destination(0, &[9; 16]), store.summary(0));
         assert!(store.by_destination(0, &[8; 16]).is_empty());
         assert_eq!(
             store.put(0, entry(3, 3, PacketClass::Direct, 6, 1, 0)),
-            Ok(vec![[2; 16]])
+            Ok(vec![id(2)])
         );
         assert!(store.summary(10_000).is_empty());
-        assert_eq!(store.expire(10_000), vec![[1; 16], [3; 16]]);
+        assert_eq!(store.expire(10_000), vec![id(1), id(3)]);
         assert_eq!(store.put(10_000, sample), Err(StoreError::Expired));
-        assert!(store.evict(&[1; 16]).is_none());
+        assert!(store.evict(&id(1)).is_none());
 
         let mut store = factory(StoreLimits {
             per_origin_bytes: size,
@@ -381,10 +380,10 @@ pub mod conformance {
         );
         assert_eq!(
             store.put(0, entry(3, 1, PacketClass::Direct, 6, 1, 0)),
-            Ok(vec![[1; 16]])
+            Ok(vec![id(1)])
         );
-        assert!(store.get(0, &[2; 16]).is_some());
-        assert!(store.evict(&[3; 16]).is_some());
+        assert!(store.get(0, &id(2)).is_some());
+        assert!(store.evict(&id(3)).is_some());
         let mut store = factory(StoreLimits {
             per_class_bytes: [size; 4],
             ..limits
@@ -399,9 +398,9 @@ pub mod conformance {
         );
         assert_eq!(
             store.put(0, entry(3, 3, PacketClass::Broadcast, 6, 1, 0)),
-            Ok(vec![[1; 16]])
+            Ok(vec![id(1)])
         );
-        assert!(store.get(0, &[2; 16]).is_some());
+        assert!(store.get(0, &id(2)).is_some());
         let mut store = factory(StoreLimits {
             total_bytes: size - 1,
             ..limits
