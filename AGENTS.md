@@ -155,7 +155,7 @@ If a command cannot run in your environment, say so plainly; do not skip silentl
 
 - **One issue per PR.** Scope creep becomes a new issue.
 - Titles carry the ID: `[MSH-11] Broadcast suppression`. Branches: `msh-11-broadcast-suppression`. Commits reference the ID.
-- **A PR body references its issue** (`For issue #6`) and states what changed, why, how and which tests were introduced - nothing else. No process-file or tooling mentions. Plain traditional Markdown only: no emojis, checkmarks, arrows or other non-ASCII characters, no HTML.
+- **A PR body references its issue** (`Closes #6`) and states what changed, why, how and which tests were introduced - nothing else. No process-file or tooling mentions. Plain traditional Markdown only: no emojis, checkmarks, arrows or other non-ASCII characters, no HTML.
 - Labels: `type:*`, `prio:P0|P1|P2`, `size:S|M|L`. Milestones M0 to M7.
 - Respect `needs` in the backlog. Sibling crates are consumed by git tag; never commit a `[patch]` override. If you need an unreleased sibling change, land it there first and bump the tag.
 - Changing CI, lints, thresholds, `deny.toml` or MSRV is its own reviewed change.
