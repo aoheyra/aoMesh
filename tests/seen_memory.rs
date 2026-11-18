@@ -1,5 +1,8 @@
-//! Memory bound for the seen-cache (MSH-05): a million insertions must
-//! never hold more than `capacity` recordings or the documented bytes.
+//! Memory bound for the seen-cache (MSH-05): a hostile flood must never
+//! hold more than `capacity` recordings or the documented bytes. The full
+//! flood of a million insertions runs in the Tests job; under Miri the
+//! same test runs a reduced flood (see the loop below) so the Miri job
+//! stays inside its time limit.
 //!
 //! A separate test binary: `#[global_allocator]` applies per binary, and
 //! the file holds exactly one test so no other test can pollute the
@@ -56,7 +59,19 @@ fn a_million_insertions_stay_within_both_bounds() {
     // One instant: nothing expires by time, so every insertion exercises
     // the size bound alone, which is the hostile-flood case.
     let now = 1_700_000_000_000u64;
-    for i in 0..1_000_000u64 {
+    // Miri interprets every insertion and instruments every counted
+    // allocation, so a million of them cannot finish inside the Miri
+    // job's time limit. Five times the capacity still fills the cache
+    // and drives four capacities of evictions, and both structures
+    // reserve their bounds at construction, so every assertion below
+    // sees the state a full flood leaves; the Tests job runs this same
+    // test with the full million on every platform.
+    let insertions = if cfg!(miri) {
+        capacity as u64 * 5
+    } else {
+        1_000_000
+    };
+    for i in 0..insertions {
         let msg_id = MessageId::from_bytes((i as u128).to_le_bytes());
         let class = match i % 4 {
             0 => PacketClass::Direct,
