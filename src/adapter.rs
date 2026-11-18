@@ -1,0 +1,147 @@
+//! Runtime-neutral async glue, usable from a Tokio-owned task without I/O in the core.
+//!
+//! The host owns time and wakeups. Race polling against a timer for
+//! `next_deadline`, then poll again with fresh timestamps. No task is spawned
+//! and no clock is read here. Network durations and mesh milliseconds are
+//! explicit separate inputs; no wall-clock/monotonic conversion is guessed.
+
+use crate::{MeshEngine, MeshError, MeshInput, MeshOutput};
+use ao_network::{LinkId, Network, NetworkEvent, SendError, Transport};
+use rand_core::RngCore;
+use std::future::poll_fn;
+use std::task::{Context, Poll};
+use std::time::Duration;
+
+/// Host-visible results of applying engine actions.
+#[derive(Debug)]
+pub enum AdapterEvent {
+    /// An application delivery, once its producer exists in MSH-09.
+    Deliver {
+        /// Packet header.
+        header: crate::Header,
+        /// Opaque payload.
+        payload: Vec<u8>,
+    },
+    /// Network admission failed; SendError retains the original payload.
+    SendFailed {
+        /// The refusing link.
+        link: LinkId,
+        /// Typed cause and original payload.
+        error: SendError,
+    },
+}
+
+/// Engine and facade owned together by one caller task.
+pub struct NetworkAdapter<R: RngCore, T: Transport> {
+    engine: MeshEngine<R>,
+    network: Network<T>,
+}
+impl<R: RngCore, T: Transport> NetworkAdapter<R, T> {
+    /// Takes ownership of already constructed components.
+    pub fn new(engine: MeshEngine<R>, network: Network<T>) -> Self {
+        Self { engine, network }
+    }
+    /// Inspect engine state without a second source of truth.
+    pub fn engine(&self) -> &MeshEngine<R> {
+        &self.engine
+    }
+    /// Inspect the network and its transport.
+    pub fn network(&self) -> &Network<T> {
+        &self.network
+    }
+    /// Earliest network timer; the caller must arrange a wakeup by this time.
+    pub fn next_deadline(&self) -> Option<Duration> {
+        self.network.next_deadline()
+    }
+    /// Feed a host input, applying every resulting command immediately.
+    pub fn handle(
+        &mut self,
+        mesh_now_ms: u64,
+        input: MeshInput<'_>,
+    ) -> Result<Vec<AdapterEvent>, MeshError> {
+        let outputs = self.engine.handle(mesh_now_ms, input)?;
+        Ok(self.apply(outputs))
+    }
+    /// Maps actions to the facade; errors and deliveries are returned, never swallowed.
+    pub fn apply(&mut self, outputs: Vec<MeshOutput>) -> Vec<AdapterEvent> {
+        let mut events = Vec::new();
+        for output in outputs {
+            match output {
+                MeshOutput::Send {
+                    link,
+                    channel,
+                    payload,
+                } => {
+                    if let Err(error) = self.network.send(link, channel, payload) {
+                        events.push(AdapterEvent::SendFailed { link, error });
+                    }
+                }
+                MeshOutput::Broadcast { channel, payload } => {
+                    events.extend(
+                        self.network
+                            .broadcast(channel, &payload)
+                            .into_iter()
+                            .map(|(link, error)| AdapterEvent::SendFailed { link, error }),
+                    );
+                }
+                MeshOutput::Release { link, reason } => self.network.disconnect(link, reason),
+                MeshOutput::SetHello { tag, app_hello } => {
+                    self.network.set_local_hello(tag, app_hello)
+                }
+                MeshOutput::SetBeacon {
+                    hint,
+                    digest,
+                    flags,
+                } => self.network.set_beacon(hint, digest, flags),
+                MeshOutput::Deliver { header, payload } => {
+                    events.push(AdapterEvent::Deliver { header, payload })
+                }
+            }
+        }
+        events
+    }
+    /// Pumps one network event into the engine. Ready with no host events still
+    /// means one input was processed; Pending registers the transport waker.
+    pub fn poll_event(
+        &mut self,
+        cx: &mut Context<'_>,
+        network_now: Duration,
+        mesh_now_ms: u64,
+    ) -> Poll<Result<Vec<AdapterEvent>, MeshError>> {
+        let event = match self.network.poll_event(cx, network_now) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(event) => event,
+        };
+        let input = match &event {
+            NetworkEvent::LinkUp { link, remote_hello } => MeshInput::LinkUp {
+                link: *link,
+                remote_hello: remote_hello.clone(),
+            },
+            NetworkEvent::LinkDown { link, reason } => MeshInput::LinkDown {
+                link: *link,
+                reason: *reason,
+            },
+            NetworkEvent::Data {
+                link,
+                channel,
+                payload,
+            } => MeshInput::Data {
+                link: *link,
+                channel: *channel,
+                payload,
+            },
+            // Future network events are observable progress but have no engine effect yet.
+            _ => return Poll::Ready(Ok(Vec::new())),
+        };
+        Poll::Ready(self.handle(mesh_now_ms, input))
+    }
+    /// Future wrapper for a single polling interval. Timestamps are fixed for
+    /// its lifetime: cancel it at next_deadline and recreate with fresh time.
+    pub async fn next_event(
+        &mut self,
+        network_now: Duration,
+        mesh_now_ms: u64,
+    ) -> Result<Vec<AdapterEvent>, MeshError> {
+        poll_fn(|cx| self.poll_event(cx, network_now, mesh_now_ms)).await
+    }
+}

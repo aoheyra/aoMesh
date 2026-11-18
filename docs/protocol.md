@@ -89,6 +89,16 @@ Origin verification reports `sign::VerifyError`: `BadSignature` (wrong key,
 tampered prefix or foreign domain) and `MsgIdMismatch` (the header claims a
 derivation the content does not produce). Each has a test that triggers it.
 
+## Engine integration (MSH-06)
+
+The wire layout is unchanged. Submit validates the payload/header agreement,
+stamps origin and content-derived ID, signs, then encodes. Selected-link
+submission requires an admitted neighbour; broadcast uses every up link.
+Incoming structural parsing increments counters only. It does not verify an
+origin, authenticate a neighbour, forward, decrypt, replay-check or deliver.
+These producers are tracked by MSH-07/08/09; a valid codec result is never a
+trust decision.
+
 ## Local storage metadata
 
 MSH-12 stores encoded packets unchanged. Local copies_left, priority,

@@ -2,7 +2,7 @@
 
 **The routing and store-and-forward engine of the aoheyra mesh.** A sans-IO Rust crate that decides what happens to a packet: forward it, hold it, suppress it, deliver it, or drop it, across a phone-to-phone mesh where links come and go.
 
-> **Status: pre-alpha, M0 (Foundations).** **MSH-01** (scaffold, engine skeleton, sibling git dependencies, CI) is implemented; everything below is design from the backlog (`MSH-xx`) and lands with its issue.
+> **Status: pre-alpha, through MSH-06.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours and the optional network adapter are implemented. Neighbour authentication (MSH-07), forwarding (MSH-08) and verified local delivery (MSH-09) are not implemented.
 
 Cargo package name: `ao_mesh`.
 
@@ -27,7 +27,7 @@ aoMesh consumes **aoNetwork** (links and frames) and **aoIdents** (signatures, s
 ## What it does
 
 - Defines the **packet format**: header, hop-mutable fields kept apart from the signed immutable part, `MessageId` derived from immutable content.
-- Runs a **sans-IO engine**: `handle(now, input) -> outputs`, injected RNG, no `tokio` inside. The same code runs in the simulator, in fuzzers and on the phone.
+- Runs a **sans-IO engine**: `handle(now, input) -> Result<Vec<MeshOutput>, MeshError>`, injected RNG, no `tokio` inside. The same code runs in the simulator, in fuzzers and on the phone.
 - **Routes per traffic class** (table below), including spray-and-wait for direct messages and counter-based suppression for floods.
 - **Stores and forwards**: `MessageStore` trait with quotas and eviction, store summary and beacon digest, anti-entropy sync when two nodes meet.
 - **Controls abuse mesh-wide**: per-origin and per-class relay budgets, neighbour penalty scores.
@@ -73,12 +73,45 @@ Lifetimes, TTLs, copy counts and budgets are **defaults with documented reasons*
  │  ├─ receipts and immunity                           │
  │  └─ presence · NodeDirectory · route hints · channels│
  └─────────────────────────────────────────────────────┘
-       ▲  thin async adapter (feature `adapter`, tokio)
+       ▲  thin async adapter (feature `adapter`)
        ▼
    aoNetwork  (NetworkEvent in, actions out)      aoIdents (sign, open, replay)
 ```
 
 **Engine inputs:** `LinkUp`, `LinkDown`, `Data`, `Tick`, `Submit`. **Outputs:** `Send`, `Broadcast`, `Release`, `Deliver`, `SetHello`, `SetBeacon`.
+
+### Engine and adapter (MSH-06)
+
+`MeshEngine::new(rng)` uses `MeshConfig::default()` (32 neighbour entries).
+`with_config` accepts an explicit bound; zero refuses all new links. Excess
+links emit `Release`, duplicate link-up events preserve counters, and link-down
+removes the entry. These are bookkeeping limits, not radio topology policy.
+Hellos remain untrusted until MSH-07.
+
+`Submit` borrows an `Identity`, header and opaque payload. The engine retains
+no keys, validates lengths before signing, and emits `Send` to a selected
+admitted link or `Broadcast` to all up links. Telemetry uses the Telemetry
+channel; other packet classes use Message. Packet and signing failures return
+typed `MeshError`s while the caller retains its payload. Incoming Data is
+parsed without copying, counted and discarded; structural validity never
+produces `Deliver` or implies successful authentication.
+
+With feature `adapter`, `NetworkAdapter` owns the facade and engine in one
+caller task. All seven output variants map to commands or host events;
+`SendFailed` returns the link and original payload through `SendError`.
+`poll_event` and its `next_event` future need no runtime dependency and work
+in a Tokio-owned task. The host supplies separate monotonic network durations
+and mesh milliseconds, arranges wakeups by `next_deadline()`, and recreates
+`next_event` with fresh times after a timer wakeup. Tick is explicit; no mesh
+timers are scheduled yet.
+
+```bash
+cargo run --features adapter --example mesh_adapter
+```
+
+This seeded three-node example checks structural reception through the full
+adapter and transport path. It does not demonstrate multihop forwarding,
+end-to-end encryption or application delivery. See the [I/O decision](docs/adr/engine-io-and-adapter.md).
 
 ### Packet format (MSH-03, MSH-04)
 
@@ -89,6 +122,14 @@ Lifetimes, TTLs, copy counts and budgets are **defaults with documented reasons*
 - Header-only parsing allows fast reject without allocating the payload; there is a hard payload cap.
 - `msg_id` derives from the immutable header and the payload hash (MSH-04): a content address, so one message has exactly one dedup key for MSH-05's seen-cache.
 - Relays verify the origin signature for Broadcast and Presence; Direct packets are verified by the recipient, and by relays only within a CPU budget. Telemetry is not verified by relays.
+
+### Seen-cache (MSH-05)
+
+A bounded dedupe cache for forwarding: `check_and_insert(now, class, msg_id)` answers `Fresh` (forward) or `Duplicate` (drop), keyed by the MSH-04 content address.
+
+- Bounded in **size and time**: at most 4096 recordings (oldest evicted first), each expiring at its class's window from ADR-0001 (Direct 24 h, Broadcast 6 h, Presence 30 min, Telemetry 5 min). A duplicate does not extend the window.
+- No input can grow it past the bound: one million insertions peak at 263,560 bytes, asserted against the documented 512 KiB ceiling by `tests/seen_memory.rs`. Decision record ADR-0003.
+- Capacity and windows are configurable through `SeenConfig`; capacity 0 records nothing, a zero window never deduplicates.
 
 ### MeshHello (MSH-07)
 
@@ -109,7 +150,7 @@ Metrics: delivery ratio, latency, overhead (transmissions per delivery), duplica
 | Feature | Meaning |
 |---|---|
 | *(default)* | The sans-IO core only. No `tokio`, no I/O |
-| `adapter` | Thin tokio glue that pumps `NetworkEvent` into the engine and actions out |
+| `adapter` | Runtime-neutral async glue usable by a Tokio-owned task; pumps `NetworkEvent` into the engine and actions out |
 
 ## Development
 
