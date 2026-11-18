@@ -54,16 +54,21 @@ impl<R: RngCore, T: Transport> NetworkAdapter<R, T> {
         self.network.next_deadline()
     }
     /// Feed a host input, applying every resulting command immediately.
+    /// `network_now` is the caller's clock for the network commands the
+    /// input produces, the same timestamp `poll_event` takes.
     pub fn handle(
         &mut self,
+        network_now: Duration,
         mesh_now_ms: u64,
         input: MeshInput<'_>,
     ) -> Result<Vec<AdapterEvent>, MeshError> {
         let outputs = self.engine.handle(mesh_now_ms, input)?;
-        Ok(self.apply(outputs))
+        Ok(self.apply(network_now, outputs))
     }
     /// Maps actions to the facade; errors and deliveries are returned, never swallowed.
-    pub fn apply(&mut self, outputs: Vec<MeshOutput>) -> Vec<AdapterEvent> {
+    /// The adapter reads no clock: `network_now` is passed straight to
+    /// every facade command that needs the time.
+    pub fn apply(&mut self, network_now: Duration, outputs: Vec<MeshOutput>) -> Vec<AdapterEvent> {
         let mut events = Vec::new();
         for output in outputs {
             match output {
@@ -72,19 +77,21 @@ impl<R: RngCore, T: Transport> NetworkAdapter<R, T> {
                     channel,
                     payload,
                 } => {
-                    if let Err(error) = self.network.send(link, channel, payload) {
+                    if let Err(error) = self.network.send(network_now, link, channel, payload) {
                         events.push(AdapterEvent::SendFailed { link, error });
                     }
                 }
                 MeshOutput::Broadcast { channel, payload } => {
                     events.extend(
                         self.network
-                            .broadcast(channel, &payload)
+                            .broadcast(network_now, channel, &payload)
                             .into_iter()
                             .map(|(link, error)| AdapterEvent::SendFailed { link, error }),
                     );
                 }
-                MeshOutput::Release { link, reason } => self.network.disconnect(link, reason),
+                MeshOutput::Release { link, reason } => {
+                    self.network.disconnect(network_now, link, reason)
+                }
                 MeshOutput::SetHello { tag, app_hello } => {
                     self.network.set_local_hello(tag, app_hello)
                 }
@@ -133,7 +140,7 @@ impl<R: RngCore, T: Transport> NetworkAdapter<R, T> {
             // Future network events are observable progress but have no engine effect yet.
             _ => return Poll::Ready(Ok(Vec::new())),
         };
-        Poll::Ready(self.handle(mesh_now_ms, input))
+        Poll::Ready(self.handle(network_now, mesh_now_ms, input))
     }
     /// Future wrapper for a single polling interval. Timestamps are fixed for
     /// its lifetime: cancel it at next_deadline and recreate with fresh time.

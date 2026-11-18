@@ -28,20 +28,23 @@ fn pair() -> (SimWorld, Vec<Adapter>) {
             let mut adapter = NetworkAdapter::new(engine, network);
             assert!(
                 adapter
-                    .apply(vec![
-                        MeshOutput::SetHello {
-                            tag: LocalTag::new([i; 16]),
-                            app_hello: AppHello::new(vec![i; 8]).unwrap()
-                        },
-                        MeshOutput::SetBeacon {
-                            hint: [i; 8],
-                            digest: [0; 4],
-                            flags: BeaconFlags {
-                                accepting: true,
-                                ..BeaconFlags::default()
-                            }
-                        },
-                    ])
+                    .apply(
+                        world.now(),
+                        vec![
+                            MeshOutput::SetHello {
+                                tag: LocalTag::new([i; 16]),
+                                app_hello: AppHello::new(vec![i; 8]).unwrap()
+                            },
+                            MeshOutput::SetBeacon {
+                                hint: [i; 8],
+                                digest: [0; 4],
+                                flags: BeaconFlags {
+                                    accepting: true,
+                                    ..BeaconFlags::default()
+                                }
+                            },
+                        ]
+                    )
                     .is_empty()
             );
             adapter
@@ -96,6 +99,7 @@ fn link_up_data_and_link_down_run_through_the_facade_and_engine() {
     assert!(
         nodes[0]
             .handle(
+                world.now(),
                 2000,
                 MeshInput::Submit {
                     identity: &identity,
@@ -119,11 +123,14 @@ fn link_up_data_and_link_down_run_through_the_facade_and_engine() {
     );
     assert!(
         nodes[0]
-            .apply(vec![MeshOutput::Send {
-                link,
-                channel: Channel::Message,
-                payload: vec![0xff]
-            }])
+            .apply(
+                world.now(),
+                vec![MeshOutput::Send {
+                    link,
+                    channel: Channel::Message,
+                    payload: vec![0xff]
+                }]
+            )
             .is_empty()
     );
     drive(&world, &mut nodes, 100);
@@ -137,18 +144,24 @@ fn link_up_data_and_link_down_run_through_the_facade_and_engine() {
         1
     );
     for (i, n) in nodes.iter_mut().enumerate() {
-        n.apply(vec![MeshOutput::SetBeacon {
-            hint: [(i + 1) as u8; 8],
-            digest: [0; 4],
-            flags: BeaconFlags::default(),
-        }]);
+        n.apply(
+            world.now(),
+            vec![MeshOutput::SetBeacon {
+                hint: [(i + 1) as u8; 8],
+                digest: [0; 4],
+                flags: BeaconFlags::default(),
+            }],
+        );
     }
     assert!(
         nodes[0]
-            .apply(vec![MeshOutput::Release {
-                link,
-                reason: DisconnectReason::Closed
-            }])
+            .apply(
+                world.now(),
+                vec![MeshOutput::Release {
+                    link,
+                    reason: DisconnectReason::Closed
+                }]
+            )
             .is_empty()
     );
     drive(&world, &mut nodes, 100);
@@ -157,7 +170,12 @@ fn link_up_data_and_link_down_run_through_the_facade_and_engine() {
             .iter()
             .all(|n| n.network().links().is_empty() && n.engine().neighbors().is_empty())
     );
-    assert!(nodes[0].handle(5000, MeshInput::Tick).unwrap().is_empty());
+    assert!(
+        nodes[0]
+            .handle(world.now(), 5000, MeshInput::Tick)
+            .unwrap()
+            .is_empty()
+    );
 }
 #[test]
 fn broadcast_is_submitted_and_network_errors_retain_payloads() {
@@ -166,6 +184,7 @@ fn broadcast_is_submitted_and_network_errors_retain_payloads() {
     assert!(
         nodes[0]
             .handle(
+                world.now(),
                 2000,
                 MeshInput::Submit {
                     identity: &identity,
@@ -189,11 +208,14 @@ fn broadcast_is_submitted_and_network_errors_retain_payloads() {
         1
     );
     let unknown = LinkId::new(u64::MAX);
-    let events = nodes[0].apply(vec![MeshOutput::Send {
-        link: unknown,
-        channel: Channel::Bulk,
-        payload: vec![1, 2, 3],
-    }]);
+    let events = nodes[0].apply(
+        world.now(),
+        vec![MeshOutput::Send {
+            link: unknown,
+            channel: Channel::Bulk,
+            payload: vec![1, 2, 3],
+        }],
+    );
     let [AdapterEvent::SendFailed { link, error }] = events.as_slice() else {
         panic!("expected send failure")
     };
@@ -215,20 +237,23 @@ fn rejected_link_is_released_through_the_network_without_retaining_it() {
                 },
             );
             let mut n = NetworkAdapter::new(engine, Network::new(NetworkConfig::default(), radio));
-            n.apply(vec![
-                MeshOutput::SetHello {
-                    tag: LocalTag::new([i as u8; 16]),
-                    app_hello: AppHello::new(Vec::new()).unwrap(),
-                },
-                MeshOutput::SetBeacon {
-                    hint: [i as u8; 8],
-                    digest: [0; 4],
-                    flags: BeaconFlags {
-                        accepting: true,
-                        ..BeaconFlags::default()
+            n.apply(
+                world.now(),
+                vec![
+                    MeshOutput::SetHello {
+                        tag: LocalTag::new([i as u8; 16]),
+                        app_hello: AppHello::new(Vec::new()).unwrap(),
                     },
-                },
-            ]);
+                    MeshOutput::SetBeacon {
+                        hint: [i as u8; 8],
+                        digest: [0; 4],
+                        flags: BeaconFlags {
+                            accepting: true,
+                            ..BeaconFlags::default()
+                        },
+                    },
+                ],
+            );
             n
         })
         .collect();
@@ -240,11 +265,14 @@ fn rejected_link_is_released_through_the_network_without_retaining_it() {
     drive(&world, &mut nodes, 200);
     assert!(nodes[0].engine().neighbors().is_empty());
     for (i, n) in nodes.iter_mut().enumerate() {
-        n.apply(vec![MeshOutput::SetBeacon {
-            hint: [i as u8; 8],
-            digest: [0; 4],
-            flags: BeaconFlags::default(),
-        }]);
+        n.apply(
+            world.now(),
+            vec![MeshOutput::SetBeacon {
+                hint: [i as u8; 8],
+                digest: [0; 4],
+                flags: BeaconFlags::default(),
+            }],
+        );
     }
     drive(&world, &mut nodes, 100);
     assert!(

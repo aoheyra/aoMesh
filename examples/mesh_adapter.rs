@@ -40,20 +40,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             MeshEngine::new(StdRng::seed_from_u64(SEED)),
             Network::new(NetworkConfig::default(), radio),
         );
-        let events = node.apply(vec![
-            MeshOutput::SetHello {
-                tag: LocalTag::new([i; 16]),
-                app_hello: AppHello::new(Vec::new())?,
-            },
-            MeshOutput::SetBeacon {
-                hint: [i; 8],
-                digest: [0; 4],
-                flags: BeaconFlags {
-                    accepting: true,
-                    ..BeaconFlags::default()
+        let events = node.apply(
+            world.now(),
+            vec![
+                MeshOutput::SetHello {
+                    tag: LocalTag::new([i; 16]),
+                    app_hello: AppHello::new(Vec::new())?,
                 },
-            },
-        ]);
+                MeshOutput::SetBeacon {
+                    hint: [i; 8],
+                    digest: [0; 4],
+                    flags: BeaconFlags {
+                        accepting: true,
+                        ..BeaconFlags::default()
+                    },
+                },
+            ],
+        );
         if !events.is_empty() {
             return Err("unexpected setup event".into());
         }
@@ -83,6 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         hops: 0,
     };
     let events = nodes[0].handle(
+        world.now(),
         2000,
         MeshInput::Submit {
             identity: &identity,
