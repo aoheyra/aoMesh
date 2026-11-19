@@ -2,7 +2,7 @@
 //!
 //! A [`MeshHello`] is how a link peer learns who the other end is before
 //! any packet flows. It carries the two public keys verification needs,
-//! so the verified [`NodeId`](ao_idents::NodeId) is derived, never
+//! so the verified [`NodeId`] is derived, never
 //! trusted, and it fits aoNetwork's 256-byte `app_hello` limit with
 //! room to spare (ADR-0004):
 //!
