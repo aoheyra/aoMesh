@@ -38,8 +38,8 @@ use ao_idents::Signature;
 /// Wire version this codec produces and the only one it accepts.
 ///
 /// A different `ver` byte is rejected as [`PacketError::UnsupportedVersion`];
-/// negotiation of future versions happens through `MeshHello.caps` (MSH-07),
-/// never by silently parsing unknown bytes.
+/// negotiation of future versions happens through `MeshHello.proto` and
+/// `caps` (MSH-07), never by silently parsing unknown bytes.
 pub const VERSION: u8 = 1;
 
 /// Size of a `msg_id` in bytes.

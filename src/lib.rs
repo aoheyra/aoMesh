@@ -10,7 +10,9 @@
 //! identity work (that belongs to `ao_idents`).
 //!
 //! MSH-06 adds signed submissions, bounded neighbour bookkeeping and the
-//! optional network adapter. Forwarding and local delivery arrive in MSH-08/09.
+//! optional network adapter. MSH-07 verifies the signed `MeshHello` on
+//! link-up, so every admitted neighbour carries a derived `NodeId`.
+//! Forwarding and local delivery arrive in MSH-08/09.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -18,6 +20,7 @@
 #[cfg(feature = "adapter")]
 pub mod adapter;
 pub mod engine;
+pub mod hello;
 pub mod neighbor;
 pub mod packet;
 pub mod seen;
@@ -27,9 +30,14 @@ pub mod store;
 #[cfg(feature = "adapter")]
 pub use adapter::{AdapterEvent, NetworkAdapter};
 pub use engine::{MeshEngine, MeshError, MeshInput, MeshOutput};
+pub use hello::{HelloError, MeshHello};
 pub use neighbor::{MeshConfig, Neighbor, NeighborTable};
 pub use packet::{Header, MessageId, Packet, PacketClass, PacketError, SIGNATURE_LEN};
 pub use seen::{Offer, SeenCache, SeenConfig};
 pub use sign::{
     RelayOutcome, VerifyError, derive_msg_id, sign_packet, verify_for_relay, verify_origin,
 };
+
+// A signed hello must fit the opaque blob aoNetwork allows (NET-04's
+// MAX_APP_HELLO); this fails at compile time if the layout ever grows.
+const _: () = assert!(hello::HELLO_LEN <= ao_network::MAX_APP_HELLO);

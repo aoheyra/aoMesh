@@ -1,5 +1,7 @@
-//! Bounded per-link bookkeeping; identity verification arrives with MSH-07.
+//! Bounded per-link bookkeeping, including the verified identity from
+//! MSH-07's signed `MeshHello`.
 
+use ao_idents::NodeId;
 use ao_network::{Hello, LinkId};
 use std::collections::BTreeMap;
 
@@ -16,13 +18,18 @@ impl Default for MeshConfig {
     }
 }
 
-/// One transport-ready neighbour. Its Hello is not authenticated yet.
+/// One transport-ready neighbour, with the identity its introduction
+/// proved (MSH-07).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Neighbor {
     /// Local link identifier.
     pub link: LinkId,
     /// Untrusted link introduction, bounded by aoNetwork's AppHello type.
     pub remote_hello: Hello,
+    /// The verified mesh identity, or `None` when the introduction did
+    /// not decode, verify or negotiate: the link still counts traffic,
+    /// but nothing may forward, deliver or budget on its behalf.
+    pub node_id: Option<NodeId>,
     /// Caller-supplied connection time in milliseconds.
     pub connected_at_ms: u64,
     /// Caller-supplied time of the latest received packet, if any.
@@ -65,18 +72,26 @@ impl NeighborTable {
     pub fn iter(&self) -> impl Iterator<Item = &Neighbor> {
         self.entries.values()
     }
-    pub(crate) fn insert(&mut self, now: u64, link: LinkId, hello: Hello) -> bool {
-        if self.entries.contains_key(&link) {
-            return true;
-        }
-        if self.entries.len() >= self.limit {
-            return false;
-        }
+    /// Whether a link id is already tracked.
+    pub(crate) fn contains(&self, link: LinkId) -> bool {
+        self.entries.contains_key(&link)
+    }
+    /// Whether one more entry would fit the bound.
+    pub(crate) fn has_room(&self) -> bool {
+        self.entries.len() < self.limit
+    }
+    /// Records a transport-ready neighbour with the identity the engine
+    /// verified, `None` for a rejected introduction. The caller has
+    /// already checked [`Self::contains`] and [`Self::has_room`].
+    pub(crate) fn insert(&mut self, now: u64, link: LinkId, hello: Hello, node_id: Option<NodeId>) {
+        debug_assert!(self.has_room(), "insert past the neighbour bound");
+        debug_assert!(!self.contains(link), "insert over a live link");
         self.entries.insert(
             link,
             Neighbor {
                 link,
                 remote_hello: hello,
+                node_id,
                 connected_at_ms: now,
                 last_rx_ms: None,
                 received_bytes: 0,
@@ -84,7 +99,6 @@ impl NeighborTable {
                 malformed_packets: 0,
             },
         );
-        true
     }
     pub(crate) fn remove(&mut self, link: LinkId) {
         self.entries.remove(&link);

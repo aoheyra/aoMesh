@@ -1,7 +1,7 @@
 //! Three simulated neighbours exchanging an originated mesh packet.
 //! Counts structural reception only; verified delivery belongs to MSH-09.
 use ao_idents::Identity;
-use ao_mesh::{Header, MeshEngine, MeshInput, MeshOutput, NetworkAdapter, PacketClass};
+use ao_mesh::{Header, MeshEngine, MeshHello, MeshInput, MeshOutput, NetworkAdapter, PacketClass};
 use ao_network::{
     AppHello, BeaconFlags, LocalTag, Network, NetworkConfig, SimConfig, SimNode, SimTransport,
     SimWorld,
@@ -40,12 +40,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             MeshEngine::new(StdRng::seed_from_u64(SEED)),
             Network::new(NetworkConfig::default(), radio),
         );
+        // Public, fixed demonstration identities only; never use these
+        // seeds on a phone. Each node's signed MeshHello proves its id.
+        let identity = Identity::from_seed([i; 32]);
+        let signed = MeshHello::sign(&identity, [0; 8], [0; 4])?;
         let events = node.apply(
             world.now(),
             vec![
                 MeshOutput::SetHello {
                     tag: LocalTag::new([i; 16]),
-                    app_hello: AppHello::new(Vec::new())?,
+                    app_hello: AppHello::new(signed.encode().to_vec())?,
                 },
                 MeshOutput::SetBeacon {
                     hint: [i; 8],
@@ -72,7 +76,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     pump(&world, &mut nodes)?;
-    // Public, fixed demonstration identity only; never use this seed on a phone.
+    // Node one's demonstration identity: the packet origin is the same
+    // identity its MeshHello proved on link-up.
     let identity = Identity::from_seed([1; 32]);
     let header = Header {
         class: PacketClass::Broadcast,
@@ -110,10 +115,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if received != expected {
             return Err("unexpected structural packet count".into());
         }
+        let neighbors = node.engine().neighbors();
+        let verified = neighbors.iter().filter(|n| n.node_id.is_some()).count();
         println!(
-            "node {}: {} neighbours, {} structurally valid packets",
+            "node {}: {} neighbours, {} verified identities, {} structurally valid packets",
             i + 1,
-            node.engine().neighbors().len(),
+            neighbors.len(),
+            verified,
             received
         );
     }

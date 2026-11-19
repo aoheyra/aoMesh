@@ -2,7 +2,7 @@
 
 **The routing and store-and-forward engine of the aoheyra mesh.** A sans-IO Rust crate that decides what happens to a packet: forward it, hold it, suppress it, deliver it, or drop it, across a phone-to-phone mesh where links come and go.
 
-> **Status: pre-alpha, through MSH-06.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours and the optional network adapter are implemented. Neighbour authentication (MSH-07), forwarding (MSH-08) and verified local delivery (MSH-09) are not implemented.
+> **Status: pre-alpha, through MSH-07.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities and the optional network adapter are implemented. Forwarding (MSH-08) and verified local delivery (MSH-09) are not implemented.
 
 Cargo package name: `ao_mesh`.
 
@@ -86,7 +86,8 @@ Lifetimes, TTLs, copy counts and budgets are **defaults with documented reasons*
 `with_config` accepts an explicit bound; zero refuses all new links. Excess
 links emit `Release`, duplicate link-up events preserve counters, and link-down
 removes the entry. These are bookkeeping limits, not radio topology policy.
-Hellos remain untrusted until MSH-07.
+Link-up verifies the peer's signed MeshHello, so each entry carries a verified
+`NodeId` or none (below).
 
 `Submit` borrows an `Identity`, header and opaque payload. The engine retains
 no keys, validates lengths before signing, and emits `Send` to a selected
@@ -133,7 +134,19 @@ A bounded dedupe cache for forwarding: `check_and_insert(now, class, msg_id)` an
 
 ### MeshHello (MSH-07)
 
-A signed `MeshHello {node_id, card_hash, proto, caps, store digest}` fitting aoNetwork's 256-byte `app_hello` limit. It is verified on `LinkUp`, so the engine exposes a **verified `NodeId`** per neighbour. Invalid or oversize hellos are dropped.
+A signed `MeshHello {node_id, card_hash, proto, caps, store_digest, signing_pk, agreement_pk, signature}`:
+161 fixed bytes inside aoNetwork's 256-byte `app_hello` limit. The signature
+covers every other field under `aoheyra/mesh/v1/hello` (aoIdents ADR-0001),
+and verification proves key control before deriving the **verified `NodeId`**
+from the two keys, so the claimed id can never be borrowed.
+
+On `LinkUp` the engine decodes, verifies and negotiates (the lower `proto`,
+never below 1; the `caps` intersection). A valid introduction records the
+`NodeId` in the neighbour table; an invalid, oversize or version-incompatible
+hello is dropped - the entry keeps counting traffic but records no identity,
+and only a full table releases the link. Byte layout and the negotiation
+rule: [`docs/protocol.md`](docs/protocol.md), decision record
+[ADR-0004](docs/adr/0004-mesh-hello.md).
 
 ## Targets and evidence
 
