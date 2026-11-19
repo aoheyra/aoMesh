@@ -7,6 +7,12 @@ change without notice until v0.1.0, and consumers pin by git tag
 
 ## Unreleased
 
+MSH-32 threads the host's monotonic network clock through the adapter:
+`NetworkAdapter::handle` and `apply` take `network_now: Duration` and pass it
+to every facade command that needs time (`send`, `broadcast`, `disconnect`).
+Breaking unreleased API change: those two methods gained the leading
+`network_now` parameter.
+
 MSH-06 adds bounded per-link state, signed Submit commands, typed submission
 errors and the optional NetworkAdapter. No runtime dependency is added.
 
