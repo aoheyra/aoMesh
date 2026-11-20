@@ -2,7 +2,7 @@
 #![cfg(feature = "adapter")]
 use ao_idents::Identity;
 use ao_mesh::{
-    AdapterEvent, Header, MeshConfig, MeshEngine, MeshInput, MeshOutput, NetworkAdapter,
+    AdapterEvent, Header, MeshConfig, MeshEngine, MeshHello, MeshInput, MeshOutput, NetworkAdapter,
     PacketClass,
 };
 use ao_network::{
@@ -26,6 +26,7 @@ fn pair() -> (SimWorld, Vec<Adapter>) {
             let network = Network::new(NetworkConfig::default(), radio);
             let engine = MeshEngine::new(StdRng::seed_from_u64(SEED));
             let mut adapter = NetworkAdapter::new(engine, network);
+            let signed = MeshHello::sign(&Identity::from_seed([i; 32]), [0; 8], [0; 4]).unwrap();
             assert!(
                 adapter
                     .apply(
@@ -33,7 +34,7 @@ fn pair() -> (SimWorld, Vec<Adapter>) {
                         vec![
                             MeshOutput::SetHello {
                                 tag: LocalTag::new([i; 16]),
-                                app_hello: AppHello::new(vec![i; 8]).unwrap()
+                                app_hello: AppHello::new(signed.encode().to_vec()).unwrap()
                             },
                             MeshOutput::SetBeacon {
                                 hint: [i; 8],
@@ -56,8 +57,16 @@ fn pair() -> (SimWorld, Vec<Adapter>) {
         true,
     );
     drive(&world, &mut nodes, 200);
-    for n in &nodes {
+    // Each neighbour recorded the identity its peer's signed hello
+    // proved, verified through the full facade and transport path.
+    let expected = [
+        Identity::from_seed([1; 32]).node_id(),
+        Identity::from_seed([2; 32]).node_id(),
+    ];
+    for (i, n) in nodes.iter().enumerate() {
         assert_eq!(n.engine().neighbors().len(), 1);
+        let neighbor = n.engine().neighbors().iter().next().unwrap();
+        assert_eq!(neighbor.node_id, Some(expected[1 - i]));
     }
     (world, nodes)
 }
@@ -237,12 +246,14 @@ fn rejected_link_is_released_through_the_network_without_retaining_it() {
                 },
             );
             let mut n = NetworkAdapter::new(engine, Network::new(NetworkConfig::default(), radio));
+            let signed =
+                MeshHello::sign(&Identity::from_seed([i as u8; 32]), [0; 8], [0; 4]).unwrap();
             n.apply(
                 world.now(),
                 vec![
                     MeshOutput::SetHello {
                         tag: LocalTag::new([i as u8; 16]),
-                        app_hello: AppHello::new(Vec::new()).unwrap(),
+                        app_hello: AppHello::new(signed.encode().to_vec()).unwrap(),
                     },
                     MeshOutput::SetBeacon {
                         hint: [i as u8; 8],

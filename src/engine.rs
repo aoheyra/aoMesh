@@ -9,7 +9,8 @@ use rand_core::RngCore;
 /// One input. Borrowed payloads and identities remain owned by the caller.
 #[non_exhaustive]
 pub enum MeshInput<'a> {
-    /// A link is transport-ready, but its introduction is not authenticated.
+    /// A link is transport-ready; its signed `MeshHello` introduction
+    /// is verified here before any identity is recorded.
     LinkUp {
         /// The link.
         link: LinkId,
@@ -145,21 +146,35 @@ impl<R: RngCore> MeshEngine<R> {
     }
     /// Processes one input at caller-supplied milliseconds.
     ///
-    /// Data is structurally validated and counted, then discarded. It cannot
-    /// produce Deliver or forwarding before MSH-08/09's security pipeline.
-    /// Submission errors are typed and the caller still owns the input bytes.
+    /// LinkUp decodes, verifies and negotiates the peer's `MeshHello`
+    /// (MSH-07): a verified neighbour records its `NodeId`, a rejected
+    /// introduction still counts traffic but records none, and only a
+    /// full table releases the link. Data is structurally validated and
+    /// counted, then discarded. It cannot produce Deliver or forwarding
+    /// before MSH-08/09's security pipeline. Submission errors are typed
+    /// and the caller still owns the input bytes.
     pub fn handle(&mut self, now: u64, input: MeshInput<'_>) -> Result<Vec<MeshOutput>, MeshError> {
         match input {
             MeshInput::Tick => Ok(Vec::new()),
             MeshInput::LinkUp { link, remote_hello } => {
-                if self.neighbors.insert(now, link, remote_hello) {
-                    Ok(Vec::new())
-                } else {
-                    Ok(vec![MeshOutput::Release {
+                if self.neighbors.contains(link) {
+                    // A repeated LinkUp keeps the existing entry, counters
+                    // and identity; it cannot downgrade or reset them.
+                    return Ok(Vec::new());
+                }
+                if !self.neighbors.has_room() {
+                    return Ok(vec![MeshOutput::Release {
                         link,
                         reason: DisconnectReason::Closed,
-                    }])
+                    }]);
                 }
+                // A failed introduction is dropped, not penalised here:
+                // the entry observes the peer and MSH-10's penalties
+                // decide its fate (ADR-0004).
+                let node_id =
+                    crate::hello::verified_node_id(remote_hello.app_hello.as_bytes()).ok();
+                self.neighbors.insert(now, link, remote_hello, node_id);
+                Ok(Vec::new())
             }
             MeshInput::LinkDown { link, .. } => {
                 self.neighbors.remove(link);

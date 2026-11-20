@@ -71,12 +71,52 @@ exact bytes that were received.
 - A packet must consume its input exactly; trailing bytes are rejected.
 - Unknown versions, classes and flag bits are rejected: fail closed.
 
+## MeshHello (MSH-07)
+
+The signed link introduction lives in the `Hello` frame's opaque
+`app_hello` (aoNetwork, NET-04), not in the packet above. Decision
+record: [ADR-0004](adr/0004-mesh-hello.md). It is fixed-width and
+exactly 161 bytes:
+
+| Offset | Size | Field | Notes |
+|---|---|---|---|
+| 0 | 16 | `node_id` | claimed; must equal the derivation below |
+| 16 | 8 | `card_hash` | identity-card announcement hash, opaque to the mesh |
+| 24 | 1 | `proto` | mesh format version the sender speaks |
+| 25 | 4 | `caps` | feature bits the sender sets, big-endian |
+| 29 | 4 | `store_digest` | store summary digest, opaque to the mesh |
+| 33 | 32 | `signing_pk` | Ed25519 verification key |
+| 65 | 32 | `agreement_pk` | X25519 key; with `signing_pk` it derives `node_id` |
+| 97 | 64 | `signature` | Ed25519 over bytes 0..97, domain `aoheyra/mesh/v1/hello` |
+
+The signature covers the contiguous prefix before it, under the domain
+registered in aoIdents ADR-0001, so a signature made for any other
+registered use never verifies as a hello. Verification is strict
+Ed25519 against `signing_pk`, then `node_id` must reproduce
+`compute_node_id(signing_pk, agreement_pk)`: the identity is derived
+from the keys, never trusted from the bytes. Proof of key control is
+not a real-world identity - cards and directories bind names later,
+and the mesh budgets every neighbour as hostile regardless.
+
+On link-up the engine decodes, verifies and negotiates: common `proto`
+is the lower of the two sides, never below 1, and common `caps` is the
+intersection, both computable from this one hello. An introduction
+that fails any step - truncated, oversize, tampered, foreign domain,
+mismatched id or no common version - is dropped: the neighbour entry
+still counts traffic but records no `node_id`, and nothing may
+forward, deliver or budget on its behalf. Every field is fixed-width,
+so hostile bit patterns decode identically and
+`decode(encode(h)) == h` holds with no normalisation.
+
 ## Versioning
 
-`ver` selects the layout. New versions are negotiated through
-`MeshHello.caps` (MSH-07) with fallback; a node never parses bytes of a
-version it does not know. Changing this layout is a protocol change: ADR,
-version bump and compatibility note (AGENTS section 4).
+`ver` selects the packet layout. Mesh format versions travel in
+`MeshHello.proto` (MSH-07): both ends take the lower `proto` value,
+never below the floor of 1, and intersect `MeshHello.caps`, so a node
+never parses bytes of a version it does not know, and a hello with no
+common version is dropped like an invalid one. Changing this layout or
+the hello's is a protocol change: ADR, version bump and compatibility
+note (AGENTS section 4).
 
 ## Errors
 
@@ -89,15 +129,20 @@ Origin verification reports `sign::VerifyError`: `BadSignature` (wrong key,
 tampered prefix or foreign domain) and `MsgIdMismatch` (the header claims a
 derivation the content does not produce). Each has a test that triggers it.
 
+MeshHello rejections report `hello::HelloError`: `Truncated`,
+`TrailingBytes`, `Verify` (tampered field, foreign domain or weak key, as
+aoIdents reports it), `NodeIdMismatch`, `IncompatibleProto`. Each has a
+test that triggers it.
+
 ## Engine integration (MSH-06)
 
 The wire layout is unchanged. Submit validates the payload/header agreement,
 stamps origin and content-derived ID, signs, then encodes. Selected-link
 submission requires an admitted neighbour; broadcast uses every up link.
-Incoming structural parsing increments counters only. It does not verify an
-origin, authenticate a neighbour, forward, decrypt, replay-check or deliver.
-These producers are tracked by MSH-07/08/09; a valid codec result is never a
-trust decision.
+Incoming structural parsing increments counters only. It does not verify a
+packet origin, forward, decrypt, replay-check or deliver; a valid codec
+result is never a trust decision. Link-up authentication is MSH-07 (above);
+forwarding and delivery arrive with MSH-08/09.
 
 ## Local storage metadata
 

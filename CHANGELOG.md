@@ -7,6 +7,18 @@ change without notice until v0.1.0, and consumers pin by git tag
 
 ## Unreleased
 
+MSH-07 adds the signed MeshHello: the `hello` module builds, encodes,
+verifies and negotiates a 161-byte fixed layout covering `node_id`,
+`card_hash`, `proto`, `caps`, `store_digest` and both public keys under
+`aoheyra/mesh/v1/hello`. Link-up decodes, verifies and negotiates the
+peer's introduction before recording anything: a valid hello yields the
+derived `NodeId` on the neighbour, an invalid, oversize or
+version-incompatible one is dropped without an identity (the entry
+keeps counting traffic; only a full table releases the link).
+Breaking unreleased API change: `Neighbor` gained the public
+`node_id: Option<NodeId>` field, and `NeighborTable::insert` is
+engine-internal with new `contains`/`has_room` admission checks.
+
 MSH-32 threads the host's monotonic network clock through the adapter:
 `NetworkAdapter::handle` and `apply` take `network_now: Duration` and pass it
 to every facade command that needs time (`send`, `broadcast`, `disconnect`).

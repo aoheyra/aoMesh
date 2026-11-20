@@ -1,8 +1,8 @@
 //! Engine dispatch through the public API, including untrusted input bounds.
 use ao_idents::Identity;
 use ao_mesh::{
-    Header, MeshConfig, MeshEngine, MeshError, MeshInput, MeshOutput, Packet, PacketClass,
-    verify_origin,
+    Header, MeshConfig, MeshEngine, MeshError, MeshHello, MeshInput, MeshOutput, Packet,
+    PacketClass, verify_origin,
 };
 use ao_network::{AppHello, Channel, DisconnectReason, Hello, LinkId, LocalTag};
 use rand::{SeedableRng, rngs::StdRng};
@@ -16,13 +16,19 @@ fn engine(limit: usize) -> MeshEngine<StdRng> {
     )
 }
 fn hello() -> Hello {
+    hello_of(&Identity::from_seed([7; 32]))
+}
+/// A link-level Hello carrying a signed MeshHello, as every honest
+/// host now builds it (MSH-07).
+fn hello_of(identity: &Identity) -> Hello {
+    let signed = MeshHello::sign(identity, [0; 8], [0; 4]).unwrap();
     Hello {
         proto_min: 1,
         proto_max: 1,
         caps: 0,
         max_frame: 16384,
         tag: LocalTag::new([1; 16]),
-        app_hello: AppHello::new(vec![1; 8]).unwrap(),
+        app_hello: AppHello::new(signed.encode().to_vec()).unwrap(),
     }
 }
 fn header(class: PacketClass, len: usize) -> Header {
@@ -372,4 +378,76 @@ fn structural_validity_never_means_authenticated_delivery() {
         .is_empty()
     );
     assert_eq!(e.neighbors().get(link).unwrap().received_packets, 1);
+}
+#[test]
+fn link_up_records_the_verified_node_id_from_the_hello() {
+    let mut e = engine(2);
+    let identity = Identity::from_seed([0x77; 32]);
+    let link = LinkId::new(5);
+    assert!(
+        e.handle(
+            10,
+            MeshInput::LinkUp {
+                link,
+                remote_hello: hello_of(&identity)
+            }
+        )
+        .unwrap()
+        .is_empty()
+    );
+    assert_eq!(
+        e.neighbors().get(link).unwrap().node_id,
+        Some(identity.node_id())
+    );
+}
+#[test]
+fn link_up_with_an_invalid_hello_leaves_no_verified_node_id() {
+    let mut e = engine(3);
+    // A pre-MSH-07 garbage blob, and an oversize blob: aoNetwork
+    // allows up to 256 bytes, the v1 layout defines exactly 161.
+    let rejected = [
+        AppHello::new(vec![1; 8]).unwrap(),
+        AppHello::new(vec![0; 200]).unwrap(),
+    ];
+    for (case, app_hello) in rejected.into_iter().enumerate() {
+        let link = LinkId::new(case as u64 + 20);
+        let outputs = e
+            .handle(
+                case as u64,
+                MeshInput::LinkUp {
+                    link,
+                    remote_hello: Hello {
+                        proto_min: 1,
+                        proto_max: 1,
+                        caps: 0,
+                        max_frame: 16384,
+                        tag: LocalTag::new([1; 16]),
+                        app_hello,
+                    },
+                },
+            )
+            .unwrap();
+        // A failed introduction is dropped, not released: the entry
+        // keeps counting what the link delivers (ADR-0004).
+        assert!(outputs.is_empty(), "case {case}: {outputs:?}");
+        let neighbor = e.neighbors().get(link).unwrap();
+        assert_eq!(neighbor.node_id, None, "case {case}");
+        assert_eq!(neighbor.received_packets, 0);
+    }
+    // The reject does not poison later admissions: a valid hello on
+    // another link still records its identity.
+    let identity = Identity::from_seed([0x78; 32]);
+    let link = LinkId::new(99);
+    e.handle(
+        50,
+        MeshInput::LinkUp {
+            link,
+            remote_hello: hello_of(&identity),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        e.neighbors().get(link).unwrap().node_id,
+        Some(identity.node_id())
+    );
 }
