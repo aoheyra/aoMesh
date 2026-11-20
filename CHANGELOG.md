@@ -7,6 +7,20 @@ change without notice until v0.1.0, and consumers pin by git tag
 
 ## Unreleased
 
+MSH-08 adds the baseline forwarding path for Direct. A received packet
+must re-derive its content-bound `msg_id` before any state changes, is
+recorded once in the seen-cache, is delivered when `dst` matches the
+engine's `NodeId`, and otherwise relays to every verified neighbour
+except the sending link with `ttl` decremented (the hop limit: a
+submission with `ttl` N reaches N hops) and `hops` incremented,
+saturating at 255. Submissions are recorded too, so no node re-relays
+its own message; other classes, unverified senders and duplicates are
+counted and dropped (ADR-0004, and MSH-11/19/22 own the other
+classes). Delivery is structural: MSH-09 authenticates it. Tests pin
+delivery without loops on a line, a ring and a seeded random graph.
+Breaking unreleased API change: `MeshEngine::new` and
+`MeshEngine::with_config` take the local `NodeId` after the RNG.
+
 MSH-07 adds the signed MeshHello: the `hello` module builds, encodes,
 verifies and negotiates a 161-byte fixed layout covering `node_id`,
 `card_hash`, `proto`, `caps`, `store_digest` and both public keys under

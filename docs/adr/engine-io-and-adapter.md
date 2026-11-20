@@ -21,7 +21,8 @@ Explicit network Duration and mesh milliseconds avoid guessing their epochs.
 
 Actions are applied synchronously with no internal asynchronous event queue.
 Send failures retain their payload and link; broadcast preserves each failure.
-Deliver is a host event, not a network command. It has no engine producer yet.
+Deliver is a host event, not a network command. MSH-08 gives it an
+engine producer (structural local delivery); MSH-09 authenticates it.
 
 Data parsing is borrowed and header-first. Structural counters are not trust,
 replay protection, forwarding, receipts or delivery. MSH-07/08/09 own those
