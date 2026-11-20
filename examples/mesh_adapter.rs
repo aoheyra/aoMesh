@@ -36,13 +36,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut nodes = Vec::new();
     for i in 1..=3u8 {
         let radio = world.add_node(SimNode::default())?;
+        // Public, fixed demonstration identities only; never use these
+        // seeds on a phone. Each node's signed MeshHello proves its id,
+        // and the same id is what its engine delivers packets for.
+        let identity = Identity::from_seed([i; 32]);
         let mut node = NetworkAdapter::new(
-            MeshEngine::new(StdRng::seed_from_u64(SEED)),
+            MeshEngine::new(StdRng::seed_from_u64(SEED), identity.node_id()),
             Network::new(NetworkConfig::default(), radio),
         );
-        // Public, fixed demonstration identities only; never use these
-        // seeds on a phone. Each node's signed MeshHello proves its id.
-        let identity = Identity::from_seed([i; 32]);
         let signed = MeshHello::sign(&identity, [0; 8], [0; 4])?;
         let events = node.apply(
             world.now(),

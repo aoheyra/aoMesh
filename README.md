@@ -2,7 +2,7 @@
 
 **The routing and store-and-forward engine of the aoheyra mesh.** A sans-IO Rust crate that decides what happens to a packet: forward it, hold it, suppress it, deliver it, or drop it, across a phone-to-phone mesh where links come and go.
 
-> **Status: pre-alpha, through MSH-07.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities and the optional network adapter are implemented. Forwarding (MSH-08) and verified local delivery (MSH-09) are not implemented.
+> **Status: pre-alpha, through MSH-08.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter and baseline Direct forwarding (dedupe, TTL, local delivery, relay to verified neighbours) are implemented. Verified local delivery (MSH-09) is not implemented.
 
 Cargo package name: `ao_mesh`.
 
@@ -82,7 +82,7 @@ Lifetimes, TTLs, copy counts and budgets are **defaults with documented reasons*
 
 ### Engine and adapter (MSH-06)
 
-`MeshEngine::new(rng)` uses `MeshConfig::default()` (32 neighbour entries).
+`MeshEngine::new(rng, local_id)` uses `MeshConfig::default()` (32 neighbour entries).
 `with_config` accepts an explicit bound; zero refuses all new links. Excess
 links emit `Release`, duplicate link-up events preserve counters, and link-down
 removes the entry. These are bookkeeping limits, not radio topology policy.
@@ -94,8 +94,13 @@ no keys, validates lengths before signing, and emits `Send` to a selected
 admitted link or `Broadcast` to all up links. Telemetry uses the Telemetry
 channel; other packet classes use Message. Packet and signing failures return
 typed `MeshError`s while the caller retains its payload. Incoming Data is
-parsed without copying, counted and discarded; structural validity never
-produces `Deliver` or implies successful authentication.
+parsed without copying and counted: a fresh Direct packet whose `dst` is the
+engine's node id is delivered, any other fresh Direct packet relays to
+verified neighbours except the sender with `ttl` decremented, and everything
+else (other classes, unverified senders, repeats, content that no longer
+matches its `msg_id`) is dropped. Structural validity still never implies
+authentication: MSH-09 gates delivery on origin signature, sealed payload
+and replay checks.
 
 With feature `adapter`, `NetworkAdapter` owns the facade and engine in one
 caller task. All seven output variants map to commands or host events;
@@ -122,7 +127,7 @@ end-to-end encryption or application delivery. See the [I/O decision](docs/adr/e
 - `ttl` and `hops` are **hop-mutable** and are *not* covered by the origin signature; everything else is. The signature sits after the hop fields, so verification survives relay hops.
 - Header-only parsing allows fast reject without allocating the payload; there is a hard payload cap.
 - `msg_id` derives from the immutable header and the payload hash (MSH-04): a content address, so one message has exactly one dedup key for MSH-05's seen-cache.
-- Relays verify the origin signature for Broadcast and Presence; Direct packets are verified by the recipient, and by relays only within a CPU budget. Telemetry is not verified by relays.
+- Relays verify the origin signature for Broadcast and Presence; Direct packets are verified by the recipient, and by relays only within a CPU budget. Telemetry is not verified by relays. The verification calls shipped in MSH-04; MSH-08's baseline relay and delivery are structural only, MSH-09 starts the recipient's checks, and relay-side checks follow with MSH-10/MSH-11.
 
 ### Seen-cache (MSH-05)
 
@@ -147,6 +152,21 @@ hello is dropped - the entry keeps counting traffic but records no identity,
 and only a full table releases the link. Byte layout and the negotiation
 rule: [`docs/protocol.md`](docs/protocol.md), decision record
 [ADR-0004](docs/adr/0004-mesh-hello.md).
+
+### Baseline forwarding (MSH-08)
+
+A received Direct packet must re-derive its content-bound `msg_id` before it
+touches any state, is recorded once in the seen-cache, and is delivered when
+`dst` is the engine's `NodeId`. Any other fresh copy relays to every verified
+neighbour except the sending link with `ttl` decremented (TTL is the hop
+limit: a submission with `ttl` N reaches N hops, and the destination delivers
+even on a worn `ttl`) and `hops` incremented, saturating at 255. Submissions
+are recorded too, so a node never re-relays its own message. Other classes,
+unverified senders and duplicates are counted and dropped (MSH-11, MSH-19
+and MSH-22 own the other classes; ADR-0004 forbids acting on an unverified
+link). No origin signature is checked on this path: MSH-09 authenticates
+local delivery. The line, ring and seeded random-graph cases in
+`tests/forwarding.rs` pin delivery and the absence of loops.
 
 ## Targets and evidence
 

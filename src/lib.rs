@@ -12,7 +12,9 @@
 //! MSH-06 adds signed submissions, bounded neighbour bookkeeping and the
 //! optional network adapter. MSH-07 verifies the signed `MeshHello` on
 //! link-up, so every admitted neighbour carries a derived `NodeId`.
-//! Forwarding and local delivery arrive in MSH-08/09.
+//! MSH-08 relays Direct packets to every verified neighbour but the
+//! sender and delivers packets addressed to this node; MSH-09
+//! authenticates that delivery.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -20,6 +22,7 @@
 #[cfg(feature = "adapter")]
 pub mod adapter;
 pub mod engine;
+mod forward;
 pub mod hello;
 pub mod neighbor;
 pub mod packet;

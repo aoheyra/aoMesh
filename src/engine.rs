@@ -1,8 +1,10 @@
 //! Sans-IO command dispatch with borrowed submissions and bounded neighbours.
 
+use crate::forward::{self, Action};
 use crate::neighbor::{MeshConfig, NeighborTable};
+use crate::seen::SeenCache;
 use crate::{Header, Packet, PacketError, sign_packet};
-use ao_idents::{IdentError, Identity, Signature};
+use ao_idents::{IdentError, Identity, NodeId, Signature};
 use ao_network::{AppHello, BeaconFlags, Channel, DisconnectReason, Hello, LinkId, LocalTag};
 use rand_core::RngCore;
 
@@ -33,7 +35,8 @@ pub enum MeshInput<'a> {
         /// The complete encoded mesh packet.
         payload: &'a [u8],
     },
-    /// Time-driven step; no routing timers exist until the forwarding issues.
+    /// Time-driven step; baseline forwarding needs no timers (MSH-11
+    /// adds assessment delays).
     Tick,
     /// Originate a packet. This does not encrypt or deliver its payload.
     Submit {
@@ -48,7 +51,8 @@ pub enum MeshInput<'a> {
     },
 }
 
-/// Actions for the host. Forwarding and delivery producers land in MSH-08/09.
+/// Actions for the host. The MSH-08 baseline emits `Send` relays and
+/// structural `Deliver`s; MSH-09 authenticates delivery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MeshOutput {
@@ -75,7 +79,9 @@ pub enum MeshOutput {
         /// Local closing reason.
         reason: DisconnectReason,
     },
-    /// A future verified local delivery; never emitted by structural parsing.
+    /// A local delivery: a fresh Direct packet whose `dst` is this
+    /// engine's node (MSH-08). The payload is still opaque and the
+    /// origin unverified until MSH-09's checks run.
     Deliver {
         /// Packet header.
         header: Header,
@@ -122,22 +128,33 @@ impl core::fmt::Display for MeshError {
 impl std::error::Error for MeshError {}
 
 /// Deterministic engine state. No I/O, runtime, clock reads or retained keys.
+///
+/// State is bounded by configuration: `max_neighbors` neighbour entries
+/// plus one forwarding dedupe cache at `SeenConfig::default()`'s
+/// documented bounds (ADR-0003).
 pub struct MeshEngine<R: RngCore> {
-    // MSH-08/11 consume this injected RNG for forwarding jitter.
+    // MSH-11's assessment delay consumes this injected RNG; MSH-08
+    // relays immediately, so nothing reads it yet.
     #[allow(dead_code)]
     rng: R,
+    // The node this engine delivers to: `dst` is compared against it.
+    local_id: NodeId,
     neighbors: NeighborTable,
+    seen: SeenCache,
 }
 impl<R: RngCore> MeshEngine<R> {
-    /// Creates an engine with the default 32-entry neighbour limit.
-    pub fn new(rng: R) -> Self {
-        Self::with_config(rng, MeshConfig::default())
+    /// Creates an engine for `local_id` with the default 32-entry
+    /// neighbour limit.
+    pub fn new(rng: R, local_id: NodeId) -> Self {
+        Self::with_config(rng, local_id, MeshConfig::default())
     }
-    /// Creates an engine with an explicit state bound.
-    pub fn with_config(rng: R, config: MeshConfig) -> Self {
+    /// Creates an engine for `local_id` with an explicit neighbour bound.
+    pub fn with_config(rng: R, local_id: NodeId, config: MeshConfig) -> Self {
         Self {
             rng,
+            local_id,
             neighbors: NeighborTable::new(config.max_neighbors),
+            seen: SeenCache::default(),
         }
     }
     /// Read-only bookkeeping, not a list of authenticated identities.
@@ -150,9 +167,12 @@ impl<R: RngCore> MeshEngine<R> {
     /// (MSH-07): a verified neighbour records its `NodeId`, a rejected
     /// introduction still counts traffic but records none, and only a
     /// full table releases the link. Data is structurally validated and
-    /// counted, then discarded. It cannot produce Deliver or forwarding
-    /// before MSH-08/09's security pipeline. Submission errors are typed
-    /// and the caller still owns the input bytes.
+    /// counted, then the MSH-08 rules apply: a fresh Direct packet for
+    /// this node's id is delivered, any other fresh Direct packet
+    /// relays to verified neighbours but the sender with `ttl`
+    /// decremented, and delivery stays unauthenticated until MSH-09's
+    /// checks. Submission errors are typed and the caller still owns
+    /// the input bytes.
     pub fn handle(&mut self, now: u64, input: MeshInput<'_>) -> Result<Vec<MeshOutput>, MeshError> {
         match input {
             MeshInput::Tick => Ok(Vec::new()),
@@ -183,9 +203,42 @@ impl<R: RngCore> MeshEngine<R> {
             MeshInput::Data { link, payload, .. } => {
                 // Packet::decode parses the bounded header before inspecting or
                 // borrowing the payload, and allocates nothing on either path.
-                let valid = Packet::decode(payload).is_ok();
-                self.neighbors.received(now, link, payload.len(), valid);
-                Ok(Vec::new())
+                let packet = Packet::decode(payload);
+                self.neighbors
+                    .received(now, link, payload.len(), packet.is_ok());
+                let packet = match packet {
+                    Ok(packet) => packet,
+                    Err(_) => return Ok(Vec::new()),
+                };
+                // Admission through LinkUp is the gate, and ADR-0004 adds
+                // that an entry whose hello failed verification may not
+                // forward or deliver on that peer's behalf: its counters
+                // observe, nothing more.
+                if !self
+                    .neighbors
+                    .get(link)
+                    .is_some_and(|neighbor| neighbor.node_id.is_some())
+                {
+                    return Ok(Vec::new());
+                }
+                match forward::on_data(self.local_id, &mut self.seen, now, packet) {
+                    Action::Drop => Ok(Vec::new()),
+                    Action::Deliver { header, payload } => {
+                        Ok(vec![MeshOutput::Deliver { header, payload }])
+                    }
+                    Action::Relay { bytes } => Ok(self
+                        .neighbors
+                        .iter()
+                        // Never send a packet back down the link it
+                        // arrived on, and never through an unverified one.
+                        .filter(|neighbor| neighbor.link != link && neighbor.node_id.is_some())
+                        .map(|neighbor| MeshOutput::Send {
+                            link: neighbor.link,
+                            channel: Channel::Message,
+                            payload: bytes.clone(),
+                        })
+                        .collect()),
+                }
             }
             MeshInput::Submit {
                 identity,
@@ -203,6 +256,11 @@ impl<R: RngCore> MeshEngine<R> {
                     .map_err(MeshError::Packet)?;
                 let signature =
                     sign_packet(identity, &mut header, payload).map_err(MeshError::Signing)?;
+                // The origin has already put this message on the air:
+                // recording it like any sighting means a copy that loops
+                // back is dropped instead of re-relayed, so no node ever
+                // transmits the same message twice.
+                let _ = self.seen.check_and_insert(now, header.class, header.msg_id);
                 let channel = match header.class {
                     crate::PacketClass::Telemetry => Channel::Telemetry,
                     _ => Channel::Message,

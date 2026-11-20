@@ -15,7 +15,8 @@ use std::time::Duration;
 /// Host-visible results of applying engine actions.
 #[derive(Debug)]
 pub enum AdapterEvent {
-    /// An application delivery, once its producer exists in MSH-09.
+    /// A local delivery under MSH-08's structural rules; MSH-09's
+    /// authentication gates it before a host may trust the payload.
     Deliver {
         /// Packet header.
         header: crate::Header,

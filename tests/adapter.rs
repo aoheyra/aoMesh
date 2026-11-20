@@ -24,9 +24,10 @@ fn pair() -> (SimWorld, Vec<Adapter>) {
         .map(|i| {
             let radio = world.add_node(SimNode::default()).unwrap();
             let network = Network::new(NetworkConfig::default(), radio);
-            let engine = MeshEngine::new(StdRng::seed_from_u64(SEED));
+            let identity = Identity::from_seed([i; 32]);
+            let engine = MeshEngine::new(StdRng::seed_from_u64(SEED), identity.node_id());
             let mut adapter = NetworkAdapter::new(engine, network);
-            let signed = MeshHello::sign(&Identity::from_seed([i; 32]), [0; 8], [0; 4]).unwrap();
+            let signed = MeshHello::sign(&identity, [0; 8], [0; 4]).unwrap();
             assert!(
                 adapter
                     .apply(
@@ -239,15 +240,16 @@ fn rejected_link_is_released_through_the_network_without_retaining_it() {
         .enumerate()
         .map(|(i, limit)| {
             let radio = world.add_node(SimNode::default()).unwrap();
+            let identity = Identity::from_seed([i as u8; 32]);
             let engine = MeshEngine::with_config(
                 StdRng::seed_from_u64(SEED),
+                identity.node_id(),
                 MeshConfig {
                     max_neighbors: limit,
                 },
             );
             let mut n = NetworkAdapter::new(engine, Network::new(NetworkConfig::default(), radio));
-            let signed =
-                MeshHello::sign(&Identity::from_seed([i as u8; 32]), [0; 8], [0; 4]).unwrap();
+            let signed = MeshHello::sign(&identity, [0; 8], [0; 4]).unwrap();
             n.apply(
                 world.now(),
                 vec![
@@ -297,7 +299,10 @@ fn async_wrapper_is_pending_without_network_events() {
     let world = SimWorld::new(SimConfig::default());
     let radio = world.add_node(SimNode::default()).unwrap();
     let mut n = NetworkAdapter::new(
-        MeshEngine::new(StdRng::seed_from_u64(SEED)),
+        MeshEngine::new(
+            StdRng::seed_from_u64(SEED),
+            Identity::from_seed([1; 32]).node_id(),
+        ),
         Network::new(NetworkConfig::default(), radio),
     );
     let mut cx = Context::from_waker(Waker::noop());

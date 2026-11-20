@@ -34,10 +34,13 @@ signature through `msg_id`, which derives from the payload hash.
 
 The origin signs the immutable prefix under `aoheyra/mesh/v1/packet`,
 using aoIdents' context-separated sign/verify (IDN-04); both domains are
-registered in aoIdents ADR-0001. Relays verify Broadcast and Presence
-always, Direct only while their CPU budget allows, and never Telemetry;
-the recipient always verifies a Direct packet addressed to it
-(`sign::verify_for_relay`, `sign::verify_origin`).
+registered in aoIdents ADR-0001. The policy: relays verify Broadcast and
+Presence always, Direct only while their CPU budget allows, and never
+Telemetry; the recipient always verifies a Direct packet addressed to it
+(`sign::verify_for_relay`, `sign::verify_origin`). MSH-04 ships those
+calls; none of them run yet, because MSH-08's baseline relay and delivery
+are deliberately structural. The recipient's check arrives with MSH-09,
+relay-side checks with the issues that build those paths (MSH-10, MSH-11).
 
 `msg_id` is a content address, in two domain-separated steps under
 `aoheyra/mesh/v1/msg-id`:
@@ -134,15 +137,26 @@ MeshHello rejections report `hello::HelloError`: `Truncated`,
 aoIdents reports it), `NodeIdMismatch`, `IncompatibleProto`. Each has a
 test that triggers it.
 
-## Engine integration (MSH-06)
+## Engine integration (MSH-06, MSH-08)
 
 The wire layout is unchanged. Submit validates the payload/header agreement,
 stamps origin and content-derived ID, signs, then encodes. Selected-link
-submission requires an admitted neighbour; broadcast uses every up link.
-Incoming structural parsing increments counters only. It does not verify a
-packet origin, forward, decrypt, replay-check or deliver; a valid codec
-result is never a trust decision. Link-up authentication is MSH-07 (above);
-forwarding and delivery arrive with MSH-08/09.
+submission requires an admitted neighbour; broadcast uses every up link, and
+every submission is recorded in the seen-cache so its own copy can never
+loop back to be re-relayed.
+
+Incoming bytes are parsed without copying and counted first. A packet from
+an admitted link whose hello was verified then takes the MSH-08 rules: the
+content-derived `msg_id` must re-derive before any state changes, a repeat
+in the seen-cache is dropped, a Direct packet addressed to this node is
+delivered, and otherwise it relays to every verified neighbour except the
+sending link with `ttl` decremented (hop limit: submitted `ttl` N reaches N
+hops, and the destination delivers regardless of a worn `ttl`) and `hops`
+incremented, saturating at 255. Classes other than Direct, senders without a
+verified `node_id` (ADR-0004) and content whose bytes no longer match its
+`msg_id` are counted and dropped. A valid codec result is still never a
+trust decision: this path verifies no origin signature, and MSH-09
+authenticates local delivery. Link-up authentication is MSH-07 (above).
 
 ## Local storage metadata
 

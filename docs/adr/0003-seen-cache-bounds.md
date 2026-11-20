@@ -3,7 +3,7 @@
 - Status: accepted
 - Date: 2026-11-16
 - Related: MSH-05 implements it; ADR-0001 supplies the per-class
-  lifetimes; MSH-06 wires the cache into forwarding; MSH-29 adds the
+  lifetimes; MSH-08 wires the cache into forwarding; MSH-29 adds the
   optional restart snapshot.
 
 ## Decision
@@ -72,8 +72,10 @@ capacity. The size bound does not depend on the sweep at all.
 
 ## Consequences
 
-- `MeshEngine` (MSH-06) calls `check_and_insert` once per forwarded
-  packet and drops `Offer::Duplicate`.
+- `MeshEngine` (MSH-08) calls `check_and_insert` once per received
+  Direct packet whose content matches its claimed `msg_id` (dropping
+  `Offer::Duplicate` before it can deliver or relay), and once per
+  submission so an origin never re-relays its own message.
 - A restart loses the cache, so dedupe resets across restarts; MSH-29's
   optional snapshot is the fix if that shows up in measurements.
 - The byte ceiling is enforced by `tests/seen_memory.rs`; the capacity
