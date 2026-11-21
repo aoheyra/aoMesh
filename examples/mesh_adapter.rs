@@ -15,10 +15,14 @@ fn pump(world: &SimWorld, nodes: &mut [Adapter]) -> Result<(), Box<dyn std::erro
     let mut cx = Context::from_waker(Waker::noop());
     for _ in 0..200 {
         world.advance(Duration::from_millis(10));
-        for node in nodes.iter_mut() {
-            while let Poll::Ready(result) =
-                node.poll_event(&mut cx, world.now(), world.now().as_millis() as u64)
-            {
+        for (i, node) in nodes.iter_mut().enumerate() {
+            let identity = Identity::from_seed([(i + 1) as u8; 32]);
+            while let Poll::Ready(result) = node.poll_event(
+                &mut cx,
+                world.now(),
+                world.now().as_millis() as u64,
+                &identity,
+            ) {
                 if !result?.is_empty() {
                     return Err("unexpected adapter event".into());
                 }
@@ -41,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // and the same id is what its engine delivers packets for.
         let identity = Identity::from_seed([i; 32]);
         let mut node = NetworkAdapter::new(
-            MeshEngine::new(StdRng::seed_from_u64(SEED), identity.node_id()),
+            MeshEngine::new(StdRng::seed_from_u64(SEED)),
             Network::new(NetworkConfig::default(), radio),
         );
         let signed = MeshHello::sign(&identity, [0; 8], [0; 4])?;

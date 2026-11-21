@@ -1,7 +1,7 @@
 //! Bounded per-link bookkeeping, including the verified identity from
 //! MSH-07's signed `MeshHello`.
 
-use ao_idents::NodeId;
+use ao_idents::{NodeId, ReplayConfig};
 use ao_network::{Hello, LinkId};
 use std::collections::BTreeMap;
 
@@ -10,11 +10,28 @@ use std::collections::BTreeMap;
 pub struct MeshConfig {
     /// Maximum neighbour entries; zero refuses every new link.
     pub max_neighbors: usize,
+    /// Replay acceptance at delivery (MSH-09): the per-sender
+    /// message-id window, the timestamp tolerance and the sender cap
+    /// for [`ao_idents::ReplayGuard`].
+    pub replay: ReplayConfig,
 }
 
 impl Default for MeshConfig {
+    /// The documented bounds: 32 neighbours; 1024 message ids per
+    /// sender for 24 h across 64 senders. The tolerance is ADR-0001's
+    /// Direct lifetime, so a message carried for a full day still
+    /// opens at its recipient instead of reading stale; the window
+    /// covers a busy day of one-to-one chat per contact; 64 active
+    /// contacts a day is well beyond the MVP's. The product, 65536
+    /// ids, is aoIdents' entry cap (about 1.5 MiB only if every slot
+    /// holds one, which per-link rate limiting and the 24 h expiry
+    /// keep far out of reach in normal use).
     fn default() -> Self {
-        Self { max_neighbors: 32 }
+        Self {
+            max_neighbors: 32,
+            replay: ReplayConfig::new(1_024, 86_400_000, 64)
+                .expect("the documented defaults are within aoIdents' bounds"),
+        }
     }
 }
 
@@ -40,6 +57,13 @@ pub struct Neighbor {
     pub received_packets: u64,
     /// Structurally invalid packets received.
     pub malformed_packets: u64,
+    /// Invalid packets this link carried: a forged content address, or
+    /// a packet delivered into MSH-09's pipeline that its checks
+    /// refused (an unopenable seal, a sender that is not the claimed
+    /// origin, a bad origin signature or a replay-guard refusal).
+    /// Policy drops (decode failures, class gates, duplicates and worn
+    /// `ttl`) are not this counter's. Saturates on overflow.
+    pub rejected_packets: u64,
 }
 
 /// Deterministically ordered entries, bounded by MeshConfig::max_neighbors.
@@ -97,6 +121,7 @@ impl NeighborTable {
                 received_bytes: 0,
                 received_packets: 0,
                 malformed_packets: 0,
+                rejected_packets: 0,
             },
         );
     }
@@ -112,6 +137,13 @@ impl NeighborTable {
             } else {
                 n.malformed_packets = n.malformed_packets.saturating_add(1);
             }
+        }
+    }
+    /// Counts one MSH-09 pipeline refusal on `link`. Unknown links are
+    /// ignored: a packet from a link the table dropped counts nowhere.
+    pub(crate) fn reject(&mut self, link: LinkId) {
+        if let Some(n) = self.entries.get_mut(&link) {
+            n.rejected_packets = n.rejected_packets.saturating_add(1);
         }
     }
 }

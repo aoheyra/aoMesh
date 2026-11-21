@@ -25,7 +25,7 @@ fn pair() -> (SimWorld, Vec<Adapter>) {
             let radio = world.add_node(SimNode::default()).unwrap();
             let network = Network::new(NetworkConfig::default(), radio);
             let identity = Identity::from_seed([i; 32]);
-            let engine = MeshEngine::new(StdRng::seed_from_u64(SEED), identity.node_id());
+            let engine = MeshEngine::new(StdRng::seed_from_u64(SEED));
             let mut adapter = NetworkAdapter::new(engine, network);
             let signed = MeshHello::sign(&identity, [0; 8], [0; 4]).unwrap();
             assert!(
@@ -75,10 +75,16 @@ fn drive(world: &SimWorld, nodes: &mut [Adapter], steps: usize) {
     let mut cx = Context::from_waker(Waker::noop());
     for _ in 0..steps {
         world.advance(Duration::from_millis(10));
-        for n in nodes.iter_mut() {
-            while let Poll::Ready(result) =
-                n.poll_event(&mut cx, world.now(), world.now().as_millis() as u64)
-            {
+        for (i, n) in nodes.iter_mut().enumerate() {
+            // Each adapter must be pumped with its own identity: MSH-09
+            // opens a delivered seal against the node the packet names.
+            let identity = Identity::from_seed([(i + 1) as u8; 32]);
+            while let Poll::Ready(result) = n.poll_event(
+                &mut cx,
+                world.now(),
+                world.now().as_millis() as u64,
+                &identity,
+            ) {
                 assert!(
                     result.unwrap().is_empty(),
                     "no unverified data may be delivered"
@@ -243,9 +249,9 @@ fn rejected_link_is_released_through_the_network_without_retaining_it() {
             let identity = Identity::from_seed([i as u8; 32]);
             let engine = MeshEngine::with_config(
                 StdRng::seed_from_u64(SEED),
-                identity.node_id(),
                 MeshConfig {
                     max_neighbors: limit,
+                    ..MeshConfig::default()
                 },
             );
             let mut n = NetworkAdapter::new(engine, Network::new(NetworkConfig::default(), radio));
@@ -299,13 +305,11 @@ fn async_wrapper_is_pending_without_network_events() {
     let world = SimWorld::new(SimConfig::default());
     let radio = world.add_node(SimNode::default()).unwrap();
     let mut n = NetworkAdapter::new(
-        MeshEngine::new(
-            StdRng::seed_from_u64(SEED),
-            Identity::from_seed([1; 32]).node_id(),
-        ),
+        MeshEngine::new(StdRng::seed_from_u64(SEED)),
         Network::new(NetworkConfig::default(), radio),
     );
     let mut cx = Context::from_waker(Waker::noop());
-    let mut future = std::pin::pin!(n.next_event(Duration::ZERO, 0));
+    let identity = Identity::from_seed([1; 32]);
+    let mut future = std::pin::pin!(n.next_event(Duration::ZERO, 0, &identity));
     assert!(std::future::Future::poll(future.as_mut(), &mut cx).is_pending());
 }

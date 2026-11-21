@@ -1,10 +1,11 @@
 //! Sans-IO command dispatch with borrowed submissions and bounded neighbours.
 
+use crate::deliver;
 use crate::forward::{self, Action};
 use crate::neighbor::{MeshConfig, NeighborTable};
-use crate::seen::SeenCache;
+use crate::seen::{Offer, SeenCache};
 use crate::{Header, Packet, PacketError, sign_packet};
-use ao_idents::{IdentError, Identity, NodeId, Signature};
+use ao_idents::{IdentError, Identity, ReplayGuard, Signature};
 use ao_network::{AppHello, BeaconFlags, Channel, DisconnectReason, Hello, LinkId, LocalTag};
 use rand_core::RngCore;
 
@@ -34,6 +35,12 @@ pub enum MeshInput<'a> {
         channel: Channel,
         /// The complete encoded mesh packet.
         payload: &'a [u8],
+        /// The local identity, borrowed for this call: MSH-09's
+        /// pipeline opens a Direct packet addressed to this node
+        /// against it. The host must pass the identity its `dst`
+        /// values name; a payload sealed to anyone else never
+        /// delivers, and the engine retains no key.
+        identity: &'a Identity,
     },
     /// Time-driven step; baseline forwarding needs no timers (MSH-11
     /// adds assessment delays).
@@ -51,8 +58,8 @@ pub enum MeshInput<'a> {
     },
 }
 
-/// Actions for the host. The MSH-08 baseline emits `Send` relays and
-/// structural `Deliver`s; MSH-09 authenticates delivery.
+/// Actions for the host. The MSH-08 baseline emits `Send` relays;
+/// MSH-09 authenticates every `Deliver`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MeshOutput {
@@ -79,13 +86,16 @@ pub enum MeshOutput {
         /// Local closing reason.
         reason: DisconnectReason,
     },
-    /// A local delivery: a fresh Direct packet whose `dst` is this
-    /// engine's node (MSH-08). The payload is still opaque and the
-    /// origin unverified until MSH-09's checks run.
+    /// A local delivery authenticated by MSH-09: the payload opened
+    /// against the local identity, the seal's authenticated sender
+    /// matched to `origin`, the origin signature verified and the
+    /// replay guard accepted. `payload` is the opened plaintext;
+    /// `header` is as received, so its `payload_len` counts the sealed
+    /// wire payload, not this plaintext's length.
     Deliver {
-        /// Packet header.
+        /// Packet header, as received.
         header: Header,
-        /// Opaque application payload.
+        /// The opened application payload.
         payload: Vec<u8>,
     },
     /// Replace the introduction used by new links.
@@ -129,32 +139,32 @@ impl std::error::Error for MeshError {}
 
 /// Deterministic engine state. No I/O, runtime, clock reads or retained keys.
 ///
-/// State is bounded by configuration: `max_neighbors` neighbour entries
-/// plus one forwarding dedupe cache at `SeenConfig::default()`'s
-/// documented bounds (ADR-0003).
+/// State is bounded by configuration: `max_neighbors` neighbour entries,
+/// one forwarding dedupe cache at `SeenConfig::default()`'s documented
+/// bounds (ADR-0003), and the replay guard at `MeshConfig::replay`'s
+/// window times senders (65536 message ids at the default, about
+/// 1.5 MiB only if every slot holds one).
 pub struct MeshEngine<R: RngCore> {
     // MSH-11's assessment delay consumes this injected RNG; MSH-08
     // relays immediately, so nothing reads it yet.
     #[allow(dead_code)]
     rng: R,
-    // The node this engine delivers to: `dst` is compared against it.
-    local_id: NodeId,
     neighbors: NeighborTable,
     seen: SeenCache,
+    replay: ReplayGuard,
 }
 impl<R: RngCore> MeshEngine<R> {
-    /// Creates an engine for `local_id` with the default 32-entry
-    /// neighbour limit.
-    pub fn new(rng: R, local_id: NodeId) -> Self {
-        Self::with_config(rng, local_id, MeshConfig::default())
+    /// Creates an engine with the default limits (`MeshConfig::default`).
+    pub fn new(rng: R) -> Self {
+        Self::with_config(rng, MeshConfig::default())
     }
-    /// Creates an engine for `local_id` with an explicit neighbour bound.
-    pub fn with_config(rng: R, local_id: NodeId, config: MeshConfig) -> Self {
+    /// Creates an engine with explicit limits.
+    pub fn with_config(rng: R, config: MeshConfig) -> Self {
         Self {
             rng,
-            local_id,
             neighbors: NeighborTable::new(config.max_neighbors),
             seen: SeenCache::default(),
+            replay: ReplayGuard::new(config.replay),
         }
     }
     /// Read-only bookkeeping, not a list of authenticated identities.
@@ -168,11 +178,15 @@ impl<R: RngCore> MeshEngine<R> {
     /// introduction still counts traffic but records none, and only a
     /// full table releases the link. Data is structurally validated and
     /// counted, then the MSH-08 rules apply: a fresh Direct packet for
-    /// this node's id is delivered, any other fresh Direct packet
-    /// relays to verified neighbours but the sender with `ttl`
-    /// decremented, and delivery stays unauthenticated until MSH-09's
-    /// checks. Submission errors are typed and the caller still owns
-    /// the input bytes.
+    /// `identity.node_id()` is handed to MSH-09's pipeline, which
+    /// opens the seal against `identity`, binds the seal's
+    /// authenticated sender to `origin`, verifies the origin signature
+    /// and runs the replay guard before a `Deliver` is emitted; a
+    /// refusal counts against the link as `rejected_packets` and
+    /// produces nothing. Any other fresh Direct packet relays to
+    /// verified neighbours but the sender with `ttl` decremented.
+    /// Submission errors are typed and the caller still owns the input
+    /// bytes.
     pub fn handle(&mut self, now: u64, input: MeshInput<'_>) -> Result<Vec<MeshOutput>, MeshError> {
         match input {
             MeshInput::Tick => Ok(Vec::new()),
@@ -200,7 +214,12 @@ impl<R: RngCore> MeshEngine<R> {
                 self.neighbors.remove(link);
                 Ok(Vec::new())
             }
-            MeshInput::Data { link, payload, .. } => {
+            MeshInput::Data {
+                link,
+                identity,
+                payload,
+                ..
+            } => {
                 // Packet::decode parses the bounded header before inspecting or
                 // borrowing the payload, and allocates nothing on either path.
                 let packet = Packet::decode(payload);
@@ -221,11 +240,44 @@ impl<R: RngCore> MeshEngine<R> {
                 {
                     return Ok(Vec::new());
                 }
-                match forward::on_data(self.local_id, &mut self.seen, now, packet) {
+                match forward::on_data(identity.node_id(), &mut self.seen, now, packet) {
                     Action::Drop => Ok(Vec::new()),
-                    Action::Deliver { header, payload } => {
-                        Ok(vec![MeshOutput::Deliver { header, payload }])
+                    Action::Reject => {
+                        // A forged content address is attributable to the
+                        // link that carried it, unlike a duplicate or a
+                        // packet whose ttl simply ran out.
+                        self.neighbors.reject(link);
+                        Ok(Vec::new())
                     }
+                    Action::Deliver {
+                        header,
+                        signature,
+                        payload,
+                    } => match deliver::open_delivery(
+                        identity,
+                        &mut self.replay,
+                        now,
+                        &header,
+                        &signature,
+                        &payload,
+                    ) {
+                        Ok(plaintext) => {
+                            // Recording only after acceptance: a forgery
+                            // that fails the pipeline must not consume
+                            // the dedupe key the honest copy needs.
+                            let offer =
+                                self.seen.check_and_insert(now, header.class, header.msg_id);
+                            debug_assert_eq!(offer, Offer::Fresh, "forward peeked fresh");
+                            Ok(vec![MeshOutput::Deliver {
+                                header,
+                                payload: plaintext,
+                            }])
+                        }
+                        Err(_) => {
+                            self.neighbors.reject(link);
+                            Ok(Vec::new())
+                        }
+                    },
                     Action::Relay { bytes } => Ok(self
                         .neighbors
                         .iter()
