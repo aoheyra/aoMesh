@@ -6,7 +6,8 @@ use crate::forward::{self, Action};
 use crate::neighbor::{MeshConfig, NeighborTable};
 use crate::seen::{Offer, SeenCache};
 use crate::suppress::{self, Sighting, SuppressionTable};
-use crate::{Header, Packet, PacketError, sign_packet};
+use crate::sync::{BeaconTracker, StoreSummary};
+use crate::{Header, MessageId, Packet, PacketError, sign_packet};
 use ao_idents::{IdentError, Identity, ReplayGuard, Signature};
 use ao_network::{AppHello, BeaconFlags, Channel, DisconnectReason, Hello, LinkId, LocalTag};
 use rand_core::RngCore;
@@ -44,6 +45,14 @@ pub enum MeshInput<'a> {
         /// values name; a payload sealed to anyone else never
         /// delivers, and the engine retains no key.
         identity: &'a Identity,
+    },
+    /// The host's current live store ids (MSH-13).
+    ///
+    /// The engine never opens or persists the store; it canonicalises the
+    /// ids into a compact summary and debounces the beacon digest.
+    StoreSummary {
+        /// Live message ids from [`crate::store::MessageStore::summary`].
+        ids: &'a [MessageId],
     },
     /// Time-driven step; fires completed MSH-11 assessment timers.
     Tick,
@@ -157,6 +166,7 @@ pub struct MeshEngine<R: RngCore> {
     replay: ReplayGuard,
     budgets: BudgetTracker,
     suppression: SuppressionTable,
+    beacon: BeaconTracker,
 }
 impl<R: RngCore> MeshEngine<R> {
     /// Creates an engine with the default limits (`MeshConfig::default`).
@@ -177,6 +187,7 @@ impl<R: RngCore> MeshEngine<R> {
             replay: ReplayGuard::new(config.replay),
             budgets,
             suppression: SuppressionTable::new(config.suppression),
+            beacon: BeaconTracker::new(config.summary),
         }
     }
     /// Read-only bookkeeping, not a list of authenticated identities.
@@ -186,6 +197,10 @@ impl<R: RngCore> MeshEngine<R> {
     /// Read-only relay budget and penalty state (MSH-10).
     pub fn budgets(&self) -> &BudgetTracker {
         &self.budgets
+    }
+    /// Digest currently advertised in the beacon, if one was published.
+    pub fn published_store_digest(&self) -> Option<[u8; 4]> {
+        self.beacon.published_digest()
     }
     /// Processes one input at caller-supplied milliseconds.
     ///
@@ -206,10 +221,29 @@ impl<R: RngCore> MeshEngine<R> {
     /// threshold; local delivery is never suppressed by a budget.
     /// Broadcast and Presence use MSH-11's seeded assessment delay and
     /// cancel their relay when enough distinct neighbours carried the
-    /// same content address. Submission errors are typed and the caller
-    /// still owns the input bytes.
+    /// same content address. `StoreSummary` canonicalises host-provided
+    /// ids and emits a debounced `SetBeacon` when the digest changes
+    /// (MSH-13). Submission errors are typed and the caller still owns
+    /// the input bytes.
     pub fn handle(&mut self, now: u64, input: MeshInput<'_>) -> Result<Vec<MeshOutput>, MeshError> {
         match input {
+            MeshInput::StoreSummary { ids } => {
+                let digest = StoreSummary::from_ids(ids).digest();
+                Ok(self
+                    .beacon
+                    .observe(now, digest)
+                    .map(|digest| MeshOutput::SetBeacon {
+                        hint: self.config.summary.beacon_hint,
+                        digest,
+                        flags: BeaconFlags {
+                            accepting: true,
+                            relay_willing: true,
+                            low_battery: false,
+                        },
+                    })
+                    .into_iter()
+                    .collect())
+            }
             MeshInput::Tick => Ok(self.drain_due(now)),
             MeshInput::LinkUp { link, remote_hello } => {
                 if self.neighbors.contains(link) {
