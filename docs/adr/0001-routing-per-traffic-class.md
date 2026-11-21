@@ -205,3 +205,33 @@ links before the target node appears. Over a 20-second meeting the two stores
 converge on the same four live ids (3 seeded locally, 1 from the peer) and the
 opportunistic contact is closed. `tests/sync_v1.rs` covers frame bounds, the
 per-contact byte budget, link-drop recovery and the release handshake.
+
+## MSH-15 implementation
+
+MSH-15 replaces the MSH-14 summary vector with Negentropy-style binary range
+reconciliation when both peers set `CAP_SYNC_V2`. A range is a leading prefix
+of the canonical 128-bit id space. Each side hashes its sorted ids in a range
+and sends only summaries for ranges the peer requests; differing ranges split
+until they hold at most 32 ids, at which point the full ids are exchanged.
+The engine then computes the missing prefixes and reuses MSH-14's
+`SyncNeed` / `SyncItems` transfer, byte budget, deadline and two-phase release.
+Caching canonical full ids in `StoreSummary` costs 16 KiB at the 1024-entry
+store bound; no dependency is needed because BLAKE3 is already a dependency.
+
+Two alternatives were considered. An IBLT gives a fixed one- or two-round
+exchange but needs careful table sizing, has probabilistic failure modes and
+would add a new decoder and dependency. A fixed 64-bucket vector is simpler
+but its descriptor cost is constant while the ids sent per differing bucket
+still grow with store size. Adaptive binary ranges have neither problem: only
+differing branches cost bytes, so a 1000-id store with one missing message
+exchanges a handful of summaries rather than 8000 bytes of prefixes. The
+deterministic split also avoids false requests and is easy to test.
+
+A canonicalisation bug found by the large-store harness zeroed the byte that
+held a range's meaningful bit, collapsing both children into one and leaving
+the contact stuck. `range_children_survive_encoding_as_distinct_ranges` now
+reproduces that seed-independent failure. The `sync_v2_report` example with
+seed `0x515f_2026` and stores of 1000 and 1001 messages measures 2,018 bytes
+for v2 against 16,188 bytes for v1, an 87.5% reduction, with both stores
+converging. The published MSH-27 baselines are unchanged because empty stores
+have equal digests and open no sync contact.

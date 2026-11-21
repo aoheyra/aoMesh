@@ -2,7 +2,7 @@
 
 **The routing and store-and-forward engine of the aoheyra mesh.** A sans-IO Rust crate that decides what happens to a packet: forward it, hold it, suppress it, deliver it, or drop it, across a phone-to-phone mesh where links come and go.
 
-> **Status: pre-alpha, through MSH-14.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest and bounded anti-entropy sync on meeting links are implemented.
+> **Status: pre-alpha, through MSH-15.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest, bounded anti-entropy sync and range-based reconciliation on meeting links are implemented.
 
 Cargo package name: `ao_mesh`.
 
@@ -84,8 +84,8 @@ Lifetimes, TTLs, copy counts and budgets are **defaults with documented reasons*
 
 `MeshEngine::new(rng)` uses `MeshConfig::default()`: 32 neighbour entries, the
 MSH-09 replay guard (1024 ids per sender, 24 h tolerance, 64 senders), the
-budget fields below, the MSH-11 suppression fields and the MSH-13 summary
-fields below. `with_config`
+budget fields below, the MSH-11 suppression fields, the MSH-13 summary
+fields and the MSH-14/15 sync fields below. `with_config`
 accepts explicit bounds; zero neighbours
 refuses all new links. Excess links emit `Release`, duplicate link-up events
 preserve counters, and link-down removes the entry. These are bookkeeping
@@ -462,3 +462,28 @@ negotiated fallback. `tests/sync_convergence.rs` drives the
 real adapter over aoNetwork `SimWorld` with seed `0x5147_2026`: after a 20-second
 contact the two stores converge on the same four ids and the opportunistic link
 is released.
+
+## Range-based reconciliation (MSH-15)
+
+A link whose MeshHello negotiates `CAP_SYNC_V2` uses Negentropy-style binary
+range reconciliation instead of the MSH-14 summary vector. Both sides hash the
+full ids in each range of the canonical 128-bit id space. Equal summaries end
+the branch; differing summaries split into two child ranges until a leaf is
+small enough to exchange as full ids. The engine then computes the same
+`SyncNeed` / `SyncItems` transfer as MSH-14, so the host still owns the store
+and v1 remains the fallback for peers without the new capability bit.
+
+| Setting | Default | Why |
+|---|---|---|
+| Range leaf size | 32 ids | 512 bytes of ids per leaf frame, well inside the frame budget |
+| Maximum range depth | 128 bits | A fully split range has at most one id |
+| Range entries per frame | 8 | Bounds response frames without many tiny sends |
+
+`SyncFrameV2` reuses the sync magic and five-byte header with version `2` and
+tags for Root, Ranges, Request, Ids and Ready. Once both sides send Ready, the
+contact switches to MSH-14 `Item` and `Done` frames, so the existing per-contact
+byte budget, timeout and release rules still apply. `tests/sync_v2.rs` covers
+convergence, codec bounds and the v1-only fallback. The simulator report
+`cargo run --release --all-features --example sync_v2_report` uses seed
+`0x515f_2026` with stores of 1000 and 1001 messages: v2 exchanges 2,018 bytes
+against v1's 16,188 bytes, with both stores converging.

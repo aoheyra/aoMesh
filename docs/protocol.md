@@ -306,6 +306,31 @@ opportunistic links and leaves stable links alone. A 20-second deadline
 releases a stalled contact once, and a link drop removes the session so a
 later meeting starts from a fresh digest.
 
+## Range-based reconciliation (MSH-15)
+
+`MeshHello` sets `CAP_SYNC_V2` in addition to `CAP_SYNC_V1`. The engine prefers
+v2 when both peers advertise it; a peer with only bit 0 gets the MSH-14 summary
+exchange, and a peer with neither gets no sync frames. The hello layout does
+not change. Version-2 frames reuse magic `0x53` and the five-byte header, with
+version `2` and tags `1` Root, `2` Ranges, `3` Request, `4` Ids and `5` Ready.
+
+A range key is a 16-byte prefix plus one bit-count from 0 to 128; trailing bits
+are zero so every range has one encoding. A `RangeSummary` adds a four-byte
+count and a 16-byte BLAKE3 digest of the sorted full ids in that range. Both
+sides send Root on link-up. When summaries differ and the range holds more
+than 32 ids, each side sends Request for its two children and answers peer
+Requests with Ranges. At 32 ids or fewer, each side sends every full id in the
+leaf through Ids. Counts, entry lists and frame bytes are bounded by config and
+the decoder rejects non-canonical keys and ids outside their range.
+
+After both sides have exchanged every leaf, each sends Ready. The first peer
+to see both Ready flags inserts an ordinary MSH-14 session with the missing
+prefixes in each direction, emits `SyncNeed` if it owes any packets, and from
+then on uses the version-1 `Item` and `Done` frames. The existing 256 KiB
+per-contact budget, 20-second deadline and two-phase release therefore still
+apply. A stalled v2 contact is released once; a link drop removes the session
+so the next meeting starts from a fresh digest.
+
 ## Simulation evidence (MSH-27)
 
 No wire format changes. Feature `sim` drives the codec and engine over aoNetwork's

@@ -26,6 +26,9 @@ pub const BEACON_DIGEST_LEN: usize = 4;
 /// One compact, canonical view of a store's live messages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreSummary {
+    /// Canonical full ids are cached so MSH-15 can hash id ranges without
+    /// reading the host store. Bounded by the store's own 1024-entry cap.
+    full_ids: Vec<[u8; MSG_ID_LEN]>,
     short_ids: Vec<[u8; SHORT_ID_BYTES]>,
     digest: [u8; BEACON_DIGEST_LEN],
 }
@@ -61,13 +64,23 @@ impl StoreSummary {
         let mut digest = [0u8; BEACON_DIGEST_LEN];
         digest.copy_from_slice(&hash.as_bytes()[..BEACON_DIGEST_LEN]);
 
-        Self { short_ids, digest }
+        Self {
+            full_ids: full,
+            short_ids,
+            digest,
+        }
     }
 
     /// Reads the live summary of `store` at `now`.
     #[must_use]
     pub fn from_store<S: MessageStore>(store: &S, now: u64) -> Self {
         Self::from_ids(&store.summary(now))
+    }
+
+    /// Sorted full ids, one per live message (MSH-15 range hashing).
+    #[must_use]
+    pub(crate) fn full_ids(&self) -> &[[u8; MSG_ID_LEN]] {
+        &self.full_ids
     }
 
     /// Sorted short ids, one per live message.
@@ -339,6 +352,322 @@ pub(crate) enum SyncError {
     TrailingBytes,
 }
 
+/// Version of the MSH-15 range-reconciliation frames.
+pub const SYNC_V2_VERSION: u8 = 2;
+const TAG_V2_ROOT: u8 = 1;
+const TAG_V2_RANGES: u8 = 2;
+const TAG_V2_REQUEST: u8 = 3;
+const TAG_V2_IDS: u8 = 4;
+const TAG_V2_READY: u8 = 5;
+const RANGE_KEY_LEN: usize = MSG_ID_LEN + 1;
+const RANGE_SUMMARY_LEN: usize = RANGE_KEY_LEN + 4 + 16;
+const MAX_V2_RANGE_ENTRIES: usize = 16;
+const MAX_V2_IDS: usize = 64;
+
+/// A binary range of the canonical 128-bit message-id space (MSH-15).
+///
+/// `bits` is the number of leading id bits fixed by `prefix`; trailing bits
+/// are always zero so a range has one wire representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RangeKey {
+    /// Fixed leading id bits, zero-padded.
+    pub prefix: [u8; MSG_ID_LEN],
+    /// Number of leading bits that are meaningful.
+    pub bits: u8,
+}
+
+impl RangeKey {
+    /// The range containing every id.
+    #[must_use]
+    pub fn root() -> Self {
+        Self {
+            prefix: [0; MSG_ID_LEN],
+            bits: 0,
+        }
+    }
+
+    /// Selects one half at the next id bit.
+    #[must_use]
+    pub fn child(self, bit: u8) -> Self {
+        let mut prefix = self.prefix;
+        if self.bits < 128 {
+            let byte = usize::from(self.bits / 8);
+            let mask = 1 << (7 - (self.bits % 8));
+            if bit & 1 == 0 {
+                prefix[byte] &= !mask;
+            } else {
+                prefix[byte] |= mask;
+            }
+        }
+        Self {
+            prefix,
+            bits: self.bits.saturating_add(1).min(128),
+        }
+    }
+
+    /// Whether `id` lies in this range.
+    #[must_use]
+    pub fn contains(self, id: &[u8; MSG_ID_LEN]) -> bool {
+        let whole = usize::from(self.bits / 8);
+        if id[..whole] != self.prefix[..whole] {
+            return false;
+        }
+        let rest = usize::from(self.bits % 8);
+        rest == 0 || id[whole] >> (8 - rest) == self.prefix[whole] >> (8 - rest)
+    }
+
+    /// Clears bits outside the range so decoding can reject aliases.
+    fn canonicalised(mut self) -> Option<Self> {
+        if self.bits > 128 {
+            return None;
+        }
+        let whole = usize::from(self.bits / 8);
+        let rest = usize::from(self.bits % 8);
+        if whole < MSG_ID_LEN {
+            self.prefix[whole + 1..].fill(0);
+        }
+        if rest != 0 {
+            let mask = 0xff << (8 - rest);
+            self.prefix[whole] &= mask;
+        }
+        Some(self)
+    }
+}
+
+/// Count and hash of the ids one peer holds in a range (MSH-15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RangeSummary {
+    /// The range being summarised.
+    pub key: RangeKey,
+    /// Number of local ids in the range.
+    pub count: u32,
+    /// BLAKE3 digest of the sorted ids in the range.
+    pub hash: [u8; 16],
+}
+
+/// One bounded MSH-15 reconciliation frame.
+///
+/// These frames only compare set membership. Once both sides know which
+/// packets differ, the existing MSH-14 `Item` and `Done` frames carry the
+/// transfer, so peers implementing only v1 remain fully compatible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncFrameV2 {
+    /// The sender's root summary; both sides send one on link-up.
+    Root(RangeSummary),
+    /// Summaries requested by the peer.
+    Ranges(Vec<RangeSummary>),
+    /// Child ranges whose summaries the peer must supply.
+    Request(Vec<RangeKey>),
+    /// All local ids the sender holds in one leaf range.
+    Ids {
+        /// The leaf range.
+        range: RangeKey,
+        /// Sorted full ids, at most the configured leaf size.
+        ids: Vec<[u8; MSG_ID_LEN]>,
+    },
+    /// Reconciliation is complete; both sides may start the item transfer.
+    Ready,
+}
+
+impl SyncFrameV2 {
+    /// Encodes the frame, or `None` if it exceeds the wire length field.
+    #[must_use]
+    pub fn encode(&self) -> Option<Vec<u8>> {
+        let (tag, body) = match self {
+            Self::Root(summary) => (TAG_V2_ROOT, encode_summary(summary).to_vec()),
+            Self::Ranges(summaries) => {
+                let mut body = Vec::with_capacity(2 + summaries.len() * RANGE_SUMMARY_LEN);
+                body.extend_from_slice(&(summaries.len() as u16).to_be_bytes());
+                for summary in summaries {
+                    body.extend_from_slice(&encode_summary(summary));
+                }
+                (TAG_V2_RANGES, body)
+            }
+            Self::Request(keys) => {
+                let mut body = Vec::with_capacity(2 + keys.len() * RANGE_KEY_LEN);
+                body.extend_from_slice(&(keys.len() as u16).to_be_bytes());
+                for key in keys {
+                    body.extend_from_slice(&encode_key(*key));
+                }
+                (TAG_V2_REQUEST, body)
+            }
+            Self::Ids { range, ids } => {
+                let mut body = Vec::with_capacity(RANGE_KEY_LEN + 2 + ids.len() * MSG_ID_LEN);
+                body.extend_from_slice(&encode_key(*range));
+                body.extend_from_slice(&(ids.len() as u16).to_be_bytes());
+                for id in ids {
+                    body.extend_from_slice(id);
+                }
+                (TAG_V2_IDS, body)
+            }
+            Self::Ready => (TAG_V2_READY, Vec::new()),
+        };
+        let len = u16::try_from(body.len()).ok()?;
+        let mut out = Vec::with_capacity(FRAME_HEADER_LEN + body.len());
+        out.extend_from_slice(&[SYNC_MAGIC, SYNC_V2_VERSION, tag]);
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(&body);
+        Some(out)
+    }
+
+    /// Parses a v2 frame. `None` means it is not a sync frame.
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Option<Self>, SyncV2Error> {
+        if bytes.first() != Some(&SYNC_MAGIC) {
+            return Ok(None);
+        }
+        if bytes.len() < FRAME_HEADER_LEN {
+            return Err(SyncV2Error::Truncated);
+        }
+        if bytes[1] != SYNC_V2_VERSION {
+            return Err(SyncV2Error::UnsupportedVersion);
+        }
+        let len = u16::from_be_bytes([bytes[3], bytes[4]]) as usize;
+        let body = bytes
+            .get(FRAME_HEADER_LEN..FRAME_HEADER_LEN.saturating_add(len))
+            .ok_or(SyncV2Error::Truncated)?;
+        if bytes.len() != FRAME_HEADER_LEN.saturating_add(len) {
+            return Err(SyncV2Error::TrailingBytes);
+        }
+        match bytes[2] {
+            TAG_V2_ROOT => {
+                let summary = take_summary(body, 0)?;
+                if body.len() != RANGE_SUMMARY_LEN {
+                    return Err(SyncV2Error::BadLength);
+                }
+                Ok(Some(Self::Root(summary)))
+            }
+            TAG_V2_RANGES => {
+                let count = take_count(body, 0)?;
+                if count > MAX_V2_RANGE_ENTRIES || body.len() != 2 + count * RANGE_SUMMARY_LEN {
+                    return Err(SyncV2Error::TooManyEntries);
+                }
+                let summaries = (0..count)
+                    .map(|i| take_summary(body, 2 + i * RANGE_SUMMARY_LEN))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Some(Self::Ranges(summaries)))
+            }
+            TAG_V2_REQUEST => {
+                let count = take_count(body, 0)?;
+                if count > MAX_V2_RANGE_ENTRIES || body.len() != 2 + count * RANGE_KEY_LEN {
+                    return Err(SyncV2Error::TooManyEntries);
+                }
+                let keys = (0..count)
+                    .map(|i| take_key(body, 2 + i * RANGE_KEY_LEN))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Some(Self::Request(keys)))
+            }
+            TAG_V2_IDS => {
+                if body.len() < RANGE_KEY_LEN + 2 {
+                    return Err(SyncV2Error::Truncated);
+                }
+                let range = take_key(body, 0)?;
+                let count = take_count(body, RANGE_KEY_LEN)?;
+                if count > MAX_V2_IDS || body.len() != RANGE_KEY_LEN + 2 + count * MSG_ID_LEN {
+                    return Err(SyncV2Error::TooManyEntries);
+                }
+                let mut ids = Vec::with_capacity(count);
+                for i in 0..count {
+                    let start = RANGE_KEY_LEN + 2 + i * MSG_ID_LEN;
+                    let id: [u8; MSG_ID_LEN] = body[start..start + MSG_ID_LEN]
+                        .try_into()
+                        .map_err(|_| SyncV2Error::BadLength)?;
+                    if !range.contains(&id) {
+                        return Err(SyncV2Error::BadRange);
+                    }
+                    ids.push(id);
+                }
+                Ok(Some(Self::Ids { range, ids }))
+            }
+            TAG_V2_READY => {
+                if !body.is_empty() {
+                    return Err(SyncV2Error::BadLength);
+                }
+                Ok(Some(Self::Ready))
+            }
+            _ => Err(SyncV2Error::BadTag),
+        }
+    }
+}
+
+fn encode_key(key: RangeKey) -> [u8; RANGE_KEY_LEN] {
+    let mut out = [0u8; RANGE_KEY_LEN];
+    out[..MSG_ID_LEN].copy_from_slice(&key.prefix);
+    out[MSG_ID_LEN] = key.bits;
+    out
+}
+
+fn take_key(body: &[u8], at: usize) -> Result<RangeKey, SyncV2Error> {
+    let raw: [u8; RANGE_KEY_LEN] = body
+        .get(at..at + RANGE_KEY_LEN)
+        .ok_or(SyncV2Error::Truncated)?
+        .try_into()
+        .map_err(|_| SyncV2Error::BadLength)?;
+    let mut prefix = [0u8; MSG_ID_LEN];
+    prefix.copy_from_slice(&raw[..MSG_ID_LEN]);
+    RangeKey {
+        prefix,
+        bits: raw[MSG_ID_LEN],
+    }
+    .canonicalised()
+    .ok_or(SyncV2Error::BadRange)
+}
+
+fn encode_summary(summary: &RangeSummary) -> [u8; RANGE_SUMMARY_LEN] {
+    let mut out = [0u8; RANGE_SUMMARY_LEN];
+    out[..RANGE_KEY_LEN].copy_from_slice(&encode_key(summary.key));
+    out[RANGE_KEY_LEN..RANGE_KEY_LEN + 4].copy_from_slice(&summary.count.to_be_bytes());
+    out[RANGE_KEY_LEN + 4..].copy_from_slice(&summary.hash);
+    out
+}
+
+fn take_summary(body: &[u8], at: usize) -> Result<RangeSummary, SyncV2Error> {
+    let raw: [u8; RANGE_SUMMARY_LEN] = body
+        .get(at..at + RANGE_SUMMARY_LEN)
+        .ok_or(SyncV2Error::Truncated)?
+        .try_into()
+        .map_err(|_| SyncV2Error::BadLength)?;
+    let mut hash = [0u8; 16];
+    hash.copy_from_slice(&raw[RANGE_KEY_LEN + 4..]);
+    Ok(RangeSummary {
+        key: take_key(body, at)?,
+        count: u32::from_be_bytes([
+            raw[RANGE_KEY_LEN],
+            raw[RANGE_KEY_LEN + 1],
+            raw[RANGE_KEY_LEN + 2],
+            raw[RANGE_KEY_LEN + 3],
+        ]),
+        hash,
+    })
+}
+
+fn take_count(body: &[u8], at: usize) -> Result<usize, SyncV2Error> {
+    let bytes: [u8; 2] = body
+        .get(at..at + 2)
+        .ok_or(SyncV2Error::Truncated)?
+        .try_into()
+        .map_err(|_| SyncV2Error::BadLength)?;
+    Ok(u16::from_be_bytes(bytes) as usize)
+}
+
+/// Typed rejection of a claimed MSH-15 frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncV2Error {
+    /// The magic matched but the fixed header was incomplete.
+    Truncated,
+    /// The sender speaks another sync version.
+    UnsupportedVersion,
+    /// Unknown frame tag.
+    BadTag,
+    /// A count exceeded the decoder's hard bound or disagreed with the body.
+    TooManyEntries,
+    /// A field had the wrong length for its tag.
+    BadLength,
+    /// A range key was non-canonical or an id lay outside its range.
+    BadRange,
+    /// The frame had bytes after its declared length.
+    TrailingBytes,
+}
+
 /// Byte and time bounds for one anti-entropy contact.
 ///
 /// Defaults are in ADR-0001: 256 KiB per contact, 15 KiB per frame so the
@@ -354,6 +683,12 @@ pub struct SyncConfig {
     pub max_frame_bytes: usize,
     /// Contact deadline in caller-supplied milliseconds.
     pub timeout_ms: u64,
+    /// Largest range exchanged as full ids in MSH-15 reconciliation.
+    pub range_leaf_ids: usize,
+    /// Never split a range beyond this many id bits.
+    pub range_max_depth: u8,
+    /// Upper bound on range keys or summaries in one MSH-15 frame.
+    pub range_frame_entries: usize,
 }
 
 impl Default for SyncConfig {
@@ -363,6 +698,9 @@ impl Default for SyncConfig {
             max_bytes_per_contact: 256 * 1024,
             max_frame_bytes: 15 * 1024,
             timeout_ms: 20_000,
+            range_leaf_ids: 32,
+            range_max_depth: 128,
+            range_frame_entries: 8,
         }
     }
 }
@@ -418,6 +756,63 @@ impl SyncSession {
     }
 }
 
+/// One MSH-15 reconciliation, replaced by an ordinary MSH-14 item session
+/// once both sides have exchanged the ids in every differing leaf range.
+#[derive(Debug)]
+struct V2Session {
+    deadline_ms: u64,
+    /// Snapshot of the local store taken when the contact opened.
+    ids: Vec<[u8; MSG_ID_LEN]>,
+    /// Ranges still waiting for the peer's summary.
+    outstanding: BTreeSet<RangeKey>,
+    /// Summaries already received, so duplicates and loops are ignored.
+    received_summaries: BTreeSet<RangeKey>,
+    /// Differing ranges narrow enough to exchange as full ids.
+    leafs: BTreeSet<RangeKey>,
+    /// Leaf ranges for which our ids have been sent.
+    leaf_sent: BTreeSet<RangeKey>,
+    /// Peer ids keyed by leaf range.
+    leaf_ids: BTreeMap<RangeKey, Vec<[u8; MSG_ID_LEN]>>,
+    /// Prefixes we owe the peer after reconciliation.
+    target: BTreeSet<[u8; SHORT_ID_BYTES]>,
+    /// Prefixes we expect from the peer after reconciliation.
+    incoming: BTreeSet<[u8; SHORT_ID_BYTES]>,
+    ready_sent: bool,
+    peer_ready: bool,
+    released: bool,
+    bytes_sent: usize,
+    bytes_received: usize,
+}
+
+impl V2Session {
+    fn new(now: u64, timeout_ms: u64, ids: Vec<[u8; MSG_ID_LEN]>) -> Self {
+        Self {
+            deadline_ms: now.saturating_add(timeout_ms),
+            ids,
+            outstanding: BTreeSet::new(),
+            received_summaries: BTreeSet::new(),
+            leafs: BTreeSet::new(),
+            leaf_sent: BTreeSet::new(),
+            leaf_ids: BTreeMap::new(),
+            target: BTreeSet::new(),
+            incoming: BTreeSet::new(),
+            ready_sent: false,
+            peer_ready: false,
+            released: false,
+            bytes_sent: 0,
+            bytes_received: 0,
+        }
+    }
+
+    fn reconciliation_done(&self) -> bool {
+        self.outstanding.is_empty()
+            && self
+                .leafs
+                .iter()
+                .all(|key| self.leaf_sent.contains(key) && self.leaf_ids.contains_key(key))
+    }
+}
+
 /// Engine-to-host consequences of one sync action, kept separate from
 /// network sends so the host can service store reads and writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -428,6 +823,13 @@ pub(crate) enum SyncAction {
         link: LinkId,
         /// Bounded frame.
         frame: SyncFrame,
+    },
+    /// Queue one MSH-15 reconciliation frame on the Bulk channel.
+    SendV2 {
+        /// Destination link.
+        link: LinkId,
+        /// Bounded frame.
+        frame: SyncFrameV2,
     },
     /// Ask the host for encoded packets matching these short ids.
     Need {
@@ -456,6 +858,7 @@ pub struct SyncTracker {
     config: SyncConfig,
     local: StoreSummary,
     sessions: BTreeMap<LinkId, SyncSession>,
+    v2_sessions: BTreeMap<LinkId, V2Session>,
 }
 
 impl SyncTracker {
@@ -467,12 +870,16 @@ impl SyncTracker {
             max_frame_bytes: config
                 .max_frame_bytes
                 .min(usize::from(u16::MAX) - FRAME_HEADER_LEN),
+            range_leaf_ids: config.range_leaf_ids.clamp(1, 64),
+            range_max_depth: config.range_max_depth.clamp(1, 128),
+            range_frame_entries: config.range_frame_entries.clamp(1, 16),
             ..config
         };
         Self {
             config,
             local: StoreSummary::from_ids(&[]),
             sessions: BTreeMap::new(),
+            v2_sessions: BTreeMap::new(),
         }
     }
 
@@ -508,6 +915,211 @@ impl SyncTracker {
             link,
             frame: SyncFrame::Digest(self.local_digest()),
         }]
+    }
+
+    /// Opens an MSH-15 contact when both peers advertise the v2 capability.
+    pub(crate) fn start_v2(
+        &mut self,
+        now: u64,
+        link: LinkId,
+        remote_digest: [u8; BEACON_DIGEST_LEN],
+    ) -> Vec<SyncAction> {
+        if !self.config.enabled
+            || self.sessions.contains_key(&link)
+            || self.v2_sessions.contains_key(&link)
+        {
+            return Vec::new();
+        }
+        if remote_digest == self.local_digest() {
+            return Vec::new();
+        }
+        let root = RangeKey::root();
+        let frame = SyncFrameV2::Root(range_summary(self.local.full_ids(), root));
+        let Some(wire) = frame.encode() else {
+            return Vec::new();
+        };
+        if wire.len() > self.config.max_frame_bytes {
+            return Vec::new();
+        }
+        let mut session =
+            V2Session::new(now, self.config.timeout_ms, self.local.full_ids().to_vec());
+        session.outstanding.insert(root);
+        session.bytes_sent = wire.len();
+        self.v2_sessions.insert(link, session);
+        vec![SyncAction::SendV2 { link, frame }]
+    }
+
+    /// Applies one MSH-15 frame from a verified neighbour.
+    pub(crate) fn on_v2_frame(
+        &mut self,
+        now: u64,
+        link: LinkId,
+        frame: SyncFrameV2,
+        wire_len: usize,
+    ) -> Vec<SyncAction> {
+        if !self.config.enabled {
+            return Vec::new();
+        }
+        let Some(mut session) = self.v2_sessions.remove(&link) else {
+            return Vec::new();
+        };
+        if now >= session.deadline_ms {
+            return vec![SyncAction::Release { link }];
+        }
+        if session.bytes_received.saturating_add(wire_len) > self.config.max_bytes_per_contact {
+            return vec![SyncAction::Release { link }];
+        }
+        session.bytes_received = session.bytes_received.saturating_add(wire_len);
+
+        let mut actions = Vec::new();
+        match frame {
+            SyncFrameV2::Root(summary) => {
+                self.apply_v2_summary(link, &mut session, summary, &mut actions);
+            }
+            SyncFrameV2::Ranges(summaries) => {
+                for summary in summaries.into_iter().take(self.config.range_frame_entries) {
+                    self.apply_v2_summary(link, &mut session, summary, &mut actions);
+                }
+            }
+            SyncFrameV2::Request(keys) => {
+                let summaries: Vec<RangeSummary> = keys
+                    .into_iter()
+                    .take(self.config.range_frame_entries)
+                    .map(|key| range_summary(&session.ids, key))
+                    .collect();
+                if !summaries.is_empty() {
+                    actions.extend(self.v2_send(
+                        link,
+                        &mut session,
+                        SyncFrameV2::Ranges(summaries),
+                    ));
+                }
+            }
+            SyncFrameV2::Ids { range, ids } => self.apply_v2_ids(&mut session, range, ids),
+            SyncFrameV2::Ready => session.peer_ready = true,
+        }
+
+        if session.reconciliation_done() && !session.ready_sent {
+            session.ready_sent = true;
+            actions.extend(self.v2_send(link, &mut session, SyncFrameV2::Ready));
+        }
+        if session.ready_sent && session.peer_ready {
+            let mut next = SyncSession::new(now, self.config.timeout_ms);
+            next.target = session.target.clone();
+            next.incoming = session.incoming.clone();
+            self.sessions.insert(link, next);
+            let prefixes: Vec<[u8; SHORT_ID_BYTES]> = session.target.iter().copied().collect();
+            if prefixes.is_empty() {
+                if session.incoming.is_empty() {
+                    actions.extend(self.send_done(link));
+                }
+            } else {
+                actions.push(SyncAction::Need { link, prefixes });
+            }
+        } else {
+            self.v2_sessions.insert(link, session);
+        }
+        actions
+    }
+
+    fn v2_send(
+        &self,
+        link: LinkId,
+        session: &mut V2Session,
+        frame: SyncFrameV2,
+    ) -> Vec<SyncAction> {
+        let Some(wire) = frame.encode() else {
+            return vec![SyncAction::Release { link }];
+        };
+        if wire.len() > self.config.max_frame_bytes
+            || session.bytes_sent.saturating_add(wire.len()) > self.config.max_bytes_per_contact
+        {
+            session.released = true;
+            session.deadline_ms = u64::MAX;
+            return vec![SyncAction::Release { link }];
+        }
+        session.bytes_sent = session.bytes_sent.saturating_add(wire.len());
+        vec![SyncAction::SendV2 { link, frame }]
+    }
+
+    fn apply_v2_summary(
+        &self,
+        link: LinkId,
+        session: &mut V2Session,
+        summary: RangeSummary,
+        actions: &mut Vec<SyncAction>,
+    ) {
+        let key = summary.key;
+        if session.received_summaries.contains(&key) || !session.outstanding.contains(&key) {
+            return;
+        }
+        session.received_summaries.insert(key);
+        let local = range_summary(&session.ids, key);
+        if local == summary {
+            session.outstanding.remove(&key);
+            return;
+        }
+        session.outstanding.remove(&key);
+        let leaf = local.count as usize <= self.config.range_leaf_ids
+            || summary.count as usize <= self.config.range_leaf_ids
+            || key.bits >= self.config.range_max_depth;
+        if leaf {
+            let ids: Vec<[u8; MSG_ID_LEN]> = session
+                .ids
+                .iter()
+                .copied()
+                .filter(|id| key.contains(id))
+                .collect();
+            let sent = self.v2_send(link, session, SyncFrameV2::Ids { range: key, ids });
+            if sent
+                .iter()
+                .any(|action| matches!(action, SyncAction::SendV2 { .. }))
+            {
+                session.leafs.insert(key);
+                session.leaf_sent.insert(key);
+            }
+            actions.extend(sent);
+        } else {
+            let children = [key.child(0), key.child(1)];
+            for child in children {
+                session.outstanding.insert(child);
+            }
+            actions.extend(self.v2_send(link, session, SyncFrameV2::Request(children.to_vec())));
+        }
+    }
+
+    fn apply_v2_ids(
+        &self,
+        session: &mut V2Session,
+        range: RangeKey,
+        mut ids: Vec<[u8; MSG_ID_LEN]>,
+    ) {
+        // The peer may send its ids before this side has processed the same
+        // child summary, so an outstanding range is just as legitimate as a
+        // leaf we already chose.
+        if !(session.leafs.contains(&range) || session.outstanding.contains(&range))
+            || session.leaf_ids.contains_key(&range)
+            || ids.len() > self.config.range_leaf_ids
+        {
+            return;
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.iter().any(|id| !range.contains(id)) {
+            return;
+        }
+        for id in &ids {
+            if session.ids.binary_search(id).is_err() {
+                session.incoming.insert(short_of(id));
+            }
+        }
+        for local in session.ids.iter().copied().filter(|id| range.contains(id)) {
+            if ids.binary_search(&local).is_err() {
+                session.target.insert(short_of(&local));
+            }
+        }
+        session.leafs.insert(range);
+        session.leaf_ids.insert(range, ids);
     }
 
     /// Applies one frame from a verified neighbour.
@@ -668,10 +1280,17 @@ impl SyncTracker {
             .iter()
             .filter(|(_, session)| now >= session.deadline_ms)
             .map(|(link, _)| *link)
+            .chain(
+                self.v2_sessions
+                    .iter()
+                    .filter(|(_, session)| now >= session.deadline_ms && !session.released)
+                    .map(|(link, _)| *link),
+            )
             .collect();
         due.into_iter()
             .map(|link| {
                 self.sessions.remove(&link);
+                self.v2_sessions.remove(&link);
                 SyncAction::Release { link }
             })
             .collect()
@@ -680,6 +1299,7 @@ impl SyncTracker {
     /// Forgets a closed link; the host store keeps whatever arrived.
     pub(crate) fn link_down(&mut self, link: LinkId) {
         self.sessions.remove(&link);
+        self.v2_sessions.remove(&link);
     }
 
     fn send_done(&mut self, link: LinkId) -> Vec<SyncAction> {
@@ -713,6 +1333,32 @@ impl SyncTracker {
         actions.extend(self.release(link));
         actions
     }
+}
+
+/// BLAKE3 over a domain separator, canonical range key, count and sorted ids.
+fn range_summary(ids: &[[u8; MSG_ID_LEN]], key: RangeKey) -> RangeSummary {
+    let local: Vec<[u8; MSG_ID_LEN]> = ids.iter().copied().filter(|id| key.contains(id)).collect();
+    let mut hasher = Hasher::new();
+    hasher.update(b"aoheyra/mesh/range-v1");
+    hasher.update(&encode_key(key));
+    hasher.update(&(local.len() as u64).to_le_bytes());
+    for id in &local {
+        hasher.update(id);
+    }
+    let digest = hasher.finalize();
+    let mut hash = [0u8; 16];
+    hash.copy_from_slice(&digest.as_bytes()[..16]);
+    RangeSummary {
+        key,
+        count: local.len() as u32,
+        hash,
+    }
+}
+
+fn short_of(id: &[u8; MSG_ID_LEN]) -> [u8; SHORT_ID_BYTES] {
+    let mut short = [0u8; SHORT_ID_BYTES];
+    short.copy_from_slice(&id[..SHORT_ID_BYTES]);
+    short
 }
 
 /// Checks the only parts of an incoming item the engine can verify without
@@ -949,5 +1595,84 @@ mod tests {
             .filter(|action| matches!(action, SyncAction::Send { .. }))
             .count();
         assert_eq!(sent, 1, "the byte bound stops the second item");
+    }
+
+    #[test]
+    fn range_children_survive_encoding_as_distinct_ranges() {
+        let root = RangeKey::root();
+        let zero = root.child(0);
+        let one = root.child(1);
+        assert_ne!(zero, one);
+        assert_eq!(zero.prefix[0], 0);
+        assert_eq!(one.prefix[0], 0x80);
+        for key in [zero, one] {
+            let wire = SyncFrameV2::Request(vec![key]).encode().expect("encodes");
+            let Some(SyncFrameV2::Request(decoded)) = SyncFrameV2::decode(&wire).expect("decodes")
+            else {
+                panic!("a request frame must decode as a request");
+            };
+            assert_eq!(decoded, vec![key]);
+        }
+    }
+
+    #[test]
+    fn sync_v2_frames_round_trip_and_reject_bad_wires() {
+        let key = RangeKey::root().child(1).child(0);
+        let mut id = [0u8; MSG_ID_LEN];
+        id[0] = 0x80;
+        let summary = RangeSummary {
+            key,
+            count: 1,
+            hash: [7; 16],
+        };
+        let frames = [
+            SyncFrameV2::Root(summary),
+            SyncFrameV2::Ranges(vec![summary]),
+            SyncFrameV2::Request(vec![key]),
+            SyncFrameV2::Ids {
+                range: key,
+                ids: vec![id],
+            },
+            SyncFrameV2::Ready,
+        ];
+        for frame in frames {
+            let wire = frame.encode().expect("encodes");
+            assert_eq!(SyncFrameV2::decode(&wire).expect("decodes"), Some(frame));
+        }
+
+        assert_eq!(
+            SyncFrameV2::decode(&[SYNC_MAGIC, SYNC_VERSION, 1, 0, 0]),
+            Err(SyncV2Error::UnsupportedVersion)
+        );
+        assert_eq!(
+            SyncFrameV2::decode(&[SYNC_MAGIC, SYNC_V2_VERSION, 99, 0, 0]),
+            Err(SyncV2Error::BadTag)
+        );
+
+        let mut trailing = SyncFrameV2::Ready.encode().expect("encodes");
+        trailing.push(0);
+        assert_eq!(
+            SyncFrameV2::decode(&trailing),
+            Err(SyncV2Error::TrailingBytes)
+        );
+
+        let out_of_range = SyncFrameV2::Ids {
+            range: RangeKey::root().child(1),
+            ids: vec![[0; MSG_ID_LEN]],
+        }
+        .encode()
+        .expect("encodes");
+        assert_eq!(
+            SyncFrameV2::decode(&out_of_range),
+            Err(SyncV2Error::BadRange)
+        );
+
+        let too_many = SyncFrameV2::Ranges(vec![summary; MAX_V2_RANGE_ENTRIES + 1])
+            .encode()
+            .expect("encodes");
+        assert_eq!(
+            SyncFrameV2::decode(&too_many),
+            Err(SyncV2Error::TooManyEntries)
+        );
     }
 }

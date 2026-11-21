@@ -21,14 +21,16 @@
 //! and `tests/sim_baseline.rs` enforces the published numbers. Per-origin
 //! delivery counts are kept off the CSV for the MSH-10 flood test.
 
+use crate::store::{MemoryStore, MessageStore, StoreMetadata, StoredMessage};
 use crate::{
-    Header, MeshConfig, MeshEngine, MeshHello, MeshInput, MeshOutput, MessageId, NetworkAdapter,
-    PacketClass, SuppressionConfig, derive_msg_id, sign_packet,
+    CAP_SYNC_V1, CAPS, Header, MeshConfig, MeshEngine, MeshHello, MeshInput, MeshOutput, MessageId,
+    NetworkAdapter, Packet, PacketClass, SHORT_ID_BYTES, SYNC_MAGIC, SYNC_V2_VERSION, StoreSummary,
+    SuppressionConfig, SyncOffer, derive_msg_id, sign_packet,
 };
 use ao_idents::{Identity, SealedMessage};
 use ao_network::{
-    AppHello, BeaconFlags, LinkId, LinkInfo, LocalTag, Network, NetworkConfig, NetworkEvent,
-    SimConfig as WorldConfig, SimNode, SimTransport, SimWorld,
+    AppHello, BeaconFlags, Channel, Hello, LinkId, LinkInfo, LocalTag, Network, NetworkConfig,
+    NetworkEvent, SimConfig as WorldConfig, SimNode, SimTransport, SimWorld,
 };
 use rand::{SeedableRng as SeedableRng09, rngs::StdRng as EngineRng};
 use rand08::{SeedableRng as SeedableRng08, rngs::StdRng as SealRng};
@@ -1103,6 +1105,359 @@ fn seal_delivery<R: rand08::RngCore + rand08::CryptoRng>(
     Ok((header, payload))
 }
 
+/// Measured cost of one MSH-14 or MSH-15 contact.
+///
+/// Bytes are counted on the Bulk frames both engines emit, so the report is
+/// the wire cost a radio would carry. Item packets are separated from the
+/// control frames that discover them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncComparison {
+    /// Negotiated sync protocol: `v1` or `v2`.
+    pub mode: &'static str,
+    /// Reproduction seed.
+    pub seed: u64,
+    /// Ids in the local store.
+    pub local_ids: usize,
+    /// Ids in the remote store.
+    pub remote_ids: usize,
+    /// Ids present in exactly one store.
+    pub difference: usize,
+    /// Bytes of summary, request and range frames.
+    pub control_bytes: usize,
+    /// Bytes of packet items sent to reconcile the stores.
+    pub item_bytes: usize,
+    /// Control plus item bytes in both directions.
+    pub total_bytes: usize,
+    /// Number of MSH-14 control frames.
+    pub v1_frames: usize,
+    /// Number of MSH-15 control frames.
+    pub v2_frames: usize,
+    /// Whether both stores ended with the same summary.
+    pub converged: bool,
+}
+
+impl SyncComparison {
+    /// CSV column names, in the same order as [`Self::csv_row`].
+    pub fn csv_header() -> &'static str {
+        "mode,seed,local_ids,remote_ids,difference,control_bytes,item_bytes,total_bytes,v1_frames,v2_frames,converged"
+    }
+
+    /// One CSV line for this measured contact.
+    pub fn csv_row(&self) -> String {
+        format!(
+            "{},{},{},{},{},{},{},{},{},{},{}",
+            self.mode,
+            self.seed,
+            self.local_ids,
+            self.remote_ids,
+            self.difference,
+            self.control_bytes,
+            self.item_bytes,
+            self.total_bytes,
+            self.v1_frames,
+            self.v2_frames,
+            self.converged,
+        )
+    }
+}
+
+const BENCH_LINK_A: LinkId = LinkId::new(91);
+const BENCH_LINK_B: LinkId = LinkId::new(92);
+/// MSH-14 `SyncFrame::Item` tag; item frames share the sync magic byte.
+const BENCH_TAG_ITEM: u8 = 3;
+
+fn bench_hello(identity: &Identity, digest: [u8; 4], caps: u32) -> Hello {
+    let signed = MeshHello::sign_with_caps(identity, [0; 8], digest, caps)
+        .expect("benchmark identity signs");
+    Hello {
+        proto_min: 1,
+        proto_max: 1,
+        caps: 0,
+        max_frame: 16_384,
+        tag: LocalTag::new([1; 16]),
+        app_hello: AppHello::new(signed.encode().to_vec()).expect("hello fits"),
+    }
+}
+
+fn bench_wire(owner: &Identity, tag: u32) -> Vec<u8> {
+    let payload = format!("sync-comparison-{tag}").into_bytes();
+    let mut header = Header {
+        class: PacketClass::Broadcast,
+        dst: None,
+        msg_id: [0; 16].into(),
+        origin: [0; 16],
+        created_ms: 0,
+        lifetime_s: 3_600,
+        payload_len: payload.len() as u64,
+        ttl: 6,
+        hops: 0,
+    };
+    let signature = sign_packet(owner, &mut header, &payload).expect("benchmark packet signs");
+    Packet::new(header, signature, &payload)
+        .expect("benchmark packet fields agree")
+        .encode()
+}
+
+fn bench_put(store: &mut MemoryStore, now: u64, bytes: &[u8]) {
+    let metadata = StoreMetadata {
+        copies_left: 1,
+        first_seen: now,
+        received_at: now,
+        priority: 0,
+        received_from: None,
+        age_ms: 0,
+    };
+    let message = StoredMessage::new(bytes, metadata).expect("bounded benchmark item");
+    store.put(now, message).expect("store has room");
+}
+
+#[derive(Default)]
+struct BenchService {
+    frames: Vec<Vec<u8>>,
+    items: Vec<Vec<u8>>,
+    releases: usize,
+    control_bytes: usize,
+    item_bytes: usize,
+    v1_frames: usize,
+    v2_frames: usize,
+}
+
+fn bench_service(
+    engine: &mut MeshEngine<EngineRng>,
+    store: &MemoryStore,
+    now: u64,
+    outputs: Vec<MeshOutput>,
+) -> BenchService {
+    let mut result = BenchService::default();
+    for output in outputs {
+        match output {
+            MeshOutput::Send {
+                channel: Channel::Bulk,
+                payload,
+                ..
+            } => {
+                if payload.first() == Some(&SYNC_MAGIC)
+                    && payload.get(1) != Some(&SYNC_V2_VERSION)
+                    && payload.get(2) == Some(&BENCH_TAG_ITEM)
+                {
+                    result.item_bytes += payload.len();
+                } else if payload.first() == Some(&SYNC_MAGIC) {
+                    result.control_bytes += payload.len();
+                    if payload.get(1) == Some(&SYNC_V2_VERSION) {
+                        result.v2_frames += 1;
+                    } else {
+                        result.v1_frames += 1;
+                    }
+                } else {
+                    result.item_bytes += payload.len();
+                }
+                result.frames.push(payload);
+            }
+            MeshOutput::SyncItem { wire, .. } => result.items.push(wire),
+            MeshOutput::ReleaseOpportunistic { .. } => result.releases += 1,
+            MeshOutput::SyncNeed { link, prefixes } => {
+                let ids = store.summary(now);
+                let offers: Vec<SyncOffer<'_>> = prefixes
+                    .iter()
+                    .filter_map(|prefix| {
+                        let id = ids
+                            .iter()
+                            .find(|id| id.as_bytes()[..SHORT_ID_BYTES] == prefix[..])?;
+                        Some(SyncOffer {
+                            prefix: *prefix,
+                            wire: store.get(now, id)?.wire(),
+                        })
+                    })
+                    .collect();
+                let extra = engine
+                    .handle(
+                        now,
+                        MeshInput::SyncItems {
+                            link,
+                            items: &offers,
+                        },
+                    )
+                    .expect("host offers are valid");
+                let nested = bench_service(engine, store, now, extra);
+                result.frames.extend(nested.frames);
+                result.items.extend(nested.items);
+                result.releases += nested.releases;
+                result.control_bytes += nested.control_bytes;
+                result.item_bytes += nested.item_bytes;
+                result.v1_frames += nested.v1_frames;
+                result.v2_frames += nested.v2_frames;
+            }
+            _ => {}
+        }
+    }
+    result
+}
+
+/// Runs one deterministic contact with either negotiated protocol.
+///
+/// Both runs use identical stores, identities and wires; only the advertised
+/// capability bit changes, so the byte difference is the protocol's cost.
+#[must_use]
+pub fn run_sync_comparison(
+    mode: &'static str,
+    seed: u64,
+    local_ids: usize,
+    remote_ids: usize,
+) -> SyncComparison {
+    let caps = if mode == "v2" { CAPS } else { CAP_SYNC_V1 };
+    let mut owner_seed = [0u8; 32];
+    owner_seed.copy_from_slice(blake3::hash(&seed.to_be_bytes()).as_bytes());
+    let owner = Identity::from_seed(owner_seed);
+    let mut peer_seed = [0u8; 32];
+    peer_seed.copy_from_slice(blake3::hash(&(seed ^ 0x515f_2026).to_be_bytes()).as_bytes());
+    let peer = Identity::from_seed(peer_seed);
+
+    let mut a_store = MemoryStore::new(Default::default());
+    let mut b_store = MemoryStore::new(Default::default());
+    let wires: Vec<Vec<u8>> = (0..local_ids.max(remote_ids))
+        .map(|tag| bench_wire(&owner, tag as u32))
+        .collect();
+    for wire in &wires[..local_ids] {
+        bench_put(&mut a_store, 0, wire);
+    }
+    for wire in &wires[..remote_ids] {
+        bench_put(&mut b_store, 0, wire);
+    }
+    let a_ids = a_store.summary(0);
+    let b_ids = b_store.summary(0);
+
+    let config = MeshConfig {
+        max_neighbors: 4,
+        ..MeshConfig::default()
+    };
+    let mut a = MeshEngine::with_config(EngineRng::seed_from_u64(seed), config);
+    let mut b = MeshEngine::with_config(EngineRng::seed_from_u64(seed ^ 1), config);
+    a.handle(0, MeshInput::StoreSummary { ids: &a_ids })
+        .expect("local summary");
+    b.handle(0, MeshInput::StoreSummary { ids: &b_ids })
+        .expect("remote summary");
+
+    let mut report = SyncComparison {
+        mode,
+        seed,
+        local_ids,
+        remote_ids,
+        difference: local_ids.max(remote_ids) - local_ids.min(remote_ids),
+        control_bytes: 0,
+        item_bytes: 0,
+        total_bytes: 0,
+        v1_frames: 0,
+        v2_frames: 0,
+        converged: false,
+    };
+
+    let mut a_frames = Vec::new();
+    let mut b_frames = Vec::new();
+    let mut a_releases = 0;
+    let mut b_releases = 0;
+
+    let out = a
+        .handle(
+            0,
+            MeshInput::LinkUp {
+                link: BENCH_LINK_A,
+                remote_hello: bench_hello(
+                    &peer,
+                    StoreSummary::from_store(&b_store, 0).digest(),
+                    caps,
+                ),
+            },
+        )
+        .expect("link up");
+    let serviced = bench_service(&mut a, &a_store, 0, out);
+    a_frames.extend(serviced.frames);
+    a_releases += serviced.releases;
+    report.control_bytes += serviced.control_bytes;
+    report.item_bytes += serviced.item_bytes;
+    report.v1_frames += serviced.v1_frames;
+    report.v2_frames += serviced.v2_frames;
+
+    let out = b
+        .handle(
+            0,
+            MeshInput::LinkUp {
+                link: BENCH_LINK_B,
+                remote_hello: bench_hello(
+                    &owner,
+                    StoreSummary::from_store(&a_store, 0).digest(),
+                    caps,
+                ),
+            },
+        )
+        .expect("link up");
+    let serviced = bench_service(&mut b, &b_store, 0, out);
+    b_frames.extend(serviced.frames);
+    b_releases += serviced.releases;
+    report.control_bytes += serviced.control_bytes;
+    report.item_bytes += serviced.item_bytes;
+    report.v1_frames += serviced.v1_frames;
+    report.v2_frames += serviced.v2_frames;
+
+    for round in 0..256u64 {
+        let outgoing = std::mem::take(&mut a_frames);
+        for payload in outgoing {
+            let now = round + 1;
+            let outputs = b
+                .handle(
+                    now,
+                    MeshInput::Data {
+                        link: BENCH_LINK_B,
+                        channel: Channel::Bulk,
+                        identity: &peer,
+                        payload: &payload,
+                    },
+                )
+                .expect("sync frame");
+            let serviced = bench_service(&mut b, &b_store, now, outputs);
+            b_frames.extend(serviced.frames);
+            for item in serviced.items {
+                bench_put(&mut b_store, now, &item);
+            }
+            b_releases += serviced.releases;
+            report.control_bytes += serviced.control_bytes;
+            report.item_bytes += serviced.item_bytes;
+            report.v1_frames += serviced.v1_frames;
+            report.v2_frames += serviced.v2_frames;
+        }
+        let outgoing = std::mem::take(&mut b_frames);
+        for payload in outgoing {
+            let now = round + 1;
+            let outputs = a
+                .handle(
+                    now,
+                    MeshInput::Data {
+                        link: BENCH_LINK_A,
+                        channel: Channel::Bulk,
+                        identity: &owner,
+                        payload: &payload,
+                    },
+                )
+                .expect("sync frame");
+            let serviced = bench_service(&mut a, &a_store, now, outputs);
+            a_frames.extend(serviced.frames);
+            for item in serviced.items {
+                bench_put(&mut a_store, now, &item);
+            }
+            a_releases += serviced.releases;
+            report.control_bytes += serviced.control_bytes;
+            report.item_bytes += serviced.item_bytes;
+            report.v1_frames += serviced.v1_frames;
+            report.v2_frames += serviced.v2_frames;
+        }
+        if a_frames.is_empty() && b_frames.is_empty() && a_releases > 0 && b_releases > 0 {
+            break;
+        }
+    }
+    report.converged = a_store.summary(0) == b_store.summary(0);
+    report.total_bytes = report.control_bytes + report.item_bytes;
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1141,6 +1496,23 @@ mod tests {
         assert_eq!(
             row,
             "test,1,2,3,2,0,8,6,0,1024,12,20,0.6667,4.0000,0.0000,100,1"
+        );
+    }
+
+    #[test]
+    fn v2_contact_cost_drops_for_large_stores() {
+        const SEED: u64 = 0x515f_2026;
+        let v1 = run_sync_comparison("v1", SEED, 1_000, 1_001);
+        let v2 = run_sync_comparison("v2", SEED, 1_000, 1_001);
+        assert!(v1.converged, "v1 must converge");
+        assert!(v2.converged, "v2 must converge");
+        assert_eq!(v1.difference, 1);
+        assert_eq!(v2.difference, 1);
+        assert!(
+            v2.total_bytes * 2 < v1.total_bytes,
+            "v2 must use less than half the bytes of v1: {} vs {}",
+            v2.total_bytes,
+            v1.total_bytes
         );
     }
 }
