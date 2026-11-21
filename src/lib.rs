@@ -21,7 +21,9 @@
 //! releases abusive links. MSH-11 suppresses Broadcast and Presence
 //! floods with seeded assessment delays and neighbour copy counters.
 //! MSH-13 canonicalises store ids into a compact summary and publishes a
-//! debounced four-byte digest through aoNetwork's beacon.
+//! debounced four-byte digest through aoNetwork's beacon. MSH-20 keeps a
+//! bounded, ephemeral node directory from typed presence observations; its
+//! coalesced changes are UI events and never wire bytes.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -30,6 +32,7 @@
 pub mod adapter;
 pub mod budget;
 mod deliver;
+pub mod directory;
 pub mod engine;
 pub mod expiry;
 mod forward;
@@ -50,6 +53,10 @@ pub mod sync;
 #[cfg(feature = "adapter")]
 pub use adapter::{AdapterEvent, NetworkAdapter};
 pub use budget::{BudgetConfig, BudgetOutcome, BudgetTracker, ClassRate};
+pub use directory::{
+    DirectoryChange, DirectoryConfig, DirectoryEntry, DirectoryError, DirectoryStats,
+    NodeDirectory, NodeObservation,
+};
 pub use engine::{MeshEngine, MeshError, MeshInput, MeshOutput};
 pub use hello::{
     CAP_PRESENCE_V1, CAP_RECEIPT_V1, CAP_SPRAY_V1, CAP_SYNC_V1, CAP_SYNC_V2, CAPS, HelloError,

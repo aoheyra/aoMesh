@@ -456,6 +456,32 @@ Immune ids are never relayed, re-stored or served from sync. This is distinct
 from aoIdents' recipient-side replay guard and from the engine's forwarding
 dedupe cache.
 
+## NodeDirectory (MSH-20)
+
+There is no new wire format. MSH-19's presence announcements will be verified
+elsewhere and handed to the engine as a typed `NodeObservation`: node id,
+card hash, caps, per-origin `seq`, estimated hop distance, via-node,
+observation time and opaque bounded location bytes. The directory does not
+fetch cards or interpret location. It is an ephemeral local view, not a
+persisted store, and it emits no packets.
+
+Each entry keeps the last observation time, local receipt time, expiry
+instant, hop distance, via-node, caps, `seq`, card hash and optional location.
+The default bounds are 256 entries, 30 minutes of relative freshness, 64
+opaque location bytes and 64 pending UI events (ADR-0001). A full directory
+evicts the least-recently-seen entry; expiry starts at local receipt time, and
+a high-water-mark clock makes a backwards `now` inert. A peer-supplied
+observation time is clamped to that clock for ordering only and cannot change
+the expiry instant.
+
+An observation with a lower `seq` than the stored entry is ignored. A repeat
+at the same or a newer `seq` refreshes local freshness and LRU position, but
+emits an `Updated` event only when a visible field changes. Queries by id,
+hop-distance range and recency are deterministic, bounded and read-only.
+Changes reach the host as `MeshOutput::DirectoryChanged` /
+`AdapterEvent::DirectoryChanged` with at most one coalesced event per node;
+the UI queries the directory for details instead of receiving payloads.
+
 ## Simulation evidence (MSH-27)
 
 No wire format changes. Feature `sim` drives the codec and engine over aoNetwork's

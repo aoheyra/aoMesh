@@ -2,6 +2,7 @@
 
 use crate::budget::{BudgetOutcome, BudgetTracker};
 use crate::deliver;
+use crate::directory::{DirectoryChange, DirectoryError, NodeDirectory, NodeObservation};
 use crate::forward::{self, Action};
 use crate::neighbor::{MeshConfig, NeighborTable};
 use crate::presence::{self, PresenceError, PresenceTracker};
@@ -13,7 +14,7 @@ use crate::sync::{
     SyncTracker,
 };
 use crate::{Header, MessageId, Packet, PacketError, sign_packet};
-use ao_idents::{IdentError, Identity, ReplayGuard, Signature};
+use ao_idents::{IdentError, Identity, NodeId, ReplayGuard, Signature};
 use ao_network::{AppHello, BeaconFlags, Channel, DisconnectReason, Hello, LinkId, LocalTag};
 use rand_core::RngCore;
 use std::collections::BTreeSet;
@@ -84,6 +85,14 @@ pub enum MeshInput<'a> {
         /// The host's complete known-hash set, bounded by
         /// [`crate::PresenceConfig::max_known_cards`].
         hashes: &'a [[u8; 8]],
+    },
+    /// Record one typed presence fact in the node directory (MSH-20).
+    ///
+    /// Verified MSH-19 announcements feed this narrow seam; the engine does
+    /// not parse presence packets or fetch identity cards.
+    ObserveNode {
+        /// The opaque observation to record.
+        observation: NodeObservation<'a>,
     },
     /// Originate a packet. This does not encrypt or deliver its payload.
     Submit {
@@ -210,6 +219,12 @@ pub enum MeshOutput {
         /// Opaque card hash to resolve.
         card_hash: [u8; 8],
     },
+    /// Coalesced directory changes for the UI (MSH-20). The entries carry
+    /// only ids and kinds; the UI queries the directory for details.
+    DirectoryChanged {
+        /// Bounded, ordered change stream from this input.
+        changes: Vec<DirectoryChange>,
+    },
 }
 
 /// Submission failure; no packet is emitted on error.
@@ -225,6 +240,8 @@ pub enum MeshError {
     Receipt(ReceiptError),
     /// Presence configuration or local announcement signing failed.
     Presence(PresenceError),
+    /// A directory observation violated its configured bounds.
+    Directory(DirectoryError),
 }
 impl core::fmt::Display for MeshError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -234,6 +251,7 @@ impl core::fmt::Display for MeshError {
             Self::UnknownLink(link) => write!(f, "unknown submission link: {link:?}"),
             Self::Receipt(error) => write!(f, "receipt failed: {error}"),
             Self::Presence(error) => write!(f, "presence failed: {error}"),
+            Self::Directory(error) => write!(f, "directory observation failed: {error}"),
         }
     }
 }
@@ -246,7 +264,9 @@ impl std::error::Error for MeshError {}
 /// bounds (ADR-0003), and the replay guard at `MeshConfig::replay`'s
 /// window times senders (65536 message ids at the default, about
 /// 1.5 MiB only if every slot holds one), and at most
-/// `MeshConfig::suppression.max_entries` pending floods (MSH-11).
+/// `MeshConfig::suppression.max_entries` pending floods (MSH-11), and
+/// `MeshConfig::directory.capacity` nodes plus
+/// `MeshConfig::directory.max_change_events` UI events (MSH-20).
 pub struct MeshEngine<R: RngCore> {
     rng: R,
     config: MeshConfig,
@@ -260,6 +280,7 @@ pub struct MeshEngine<R: RngCore> {
     spray: crate::spray::SprayTracker,
     receipt: crate::receipt::ReceiptTracker,
     presence: PresenceTracker,
+    directory: NodeDirectory,
 }
 impl<R: RngCore> MeshEngine<R> {
     /// Creates an engine with the default limits (`MeshConfig::default`).
@@ -285,6 +306,7 @@ impl<R: RngCore> MeshEngine<R> {
             spray: crate::spray::SprayTracker::new(config.spray),
             receipt: crate::receipt::ReceiptTracker::new(config.receipt),
             presence: PresenceTracker::new(config.presence),
+            directory: NodeDirectory::new(config.directory),
         }
     }
     /// Read-only bookkeeping, not a list of authenticated identities.
@@ -302,6 +324,11 @@ impl<R: RngCore> MeshEngine<R> {
     /// Read-only anti-entropy state (MSH-14).
     pub fn sync(&self) -> &SyncTracker {
         &self.sync
+    }
+    /// Read-only mesh-wide node directory (MSH-20). Queries take the local
+    /// time explicitly and never mutate this state.
+    pub fn directory(&self) -> &NodeDirectory {
+        &self.directory
     }
     /// Remaining MSH-16 copies for one id, or one when spray is inactive.
     ///
@@ -344,6 +371,12 @@ impl<R: RngCore> MeshEngine<R> {
     /// the input bytes.
     pub fn handle(&mut self, now: u64, input: MeshInput<'_>) -> Result<Vec<MeshOutput>, MeshError> {
         match input {
+            MeshInput::ObserveNode { observation } => {
+                self.directory
+                    .observe(now, observation)
+                    .map_err(MeshError::Directory)?;
+                Ok(self.take_directory_changes())
+            }
             MeshInput::StoreSummary { ids } => {
                 let digest = StoreSummary::from_ids(ids).digest();
                 self.sync.set_local(ids);
@@ -378,6 +411,11 @@ impl<R: RngCore> MeshEngine<R> {
                 let actions = self.sync.expire(now);
                 outputs.extend(self.apply_sync_actions(now, actions));
                 outputs.extend(self.presence_tick(now, identity, card_hash)?);
+                // Directory staleness is local and relative: a Tick reclaims
+                // entries even when no new announcement arrives, and the UI
+                // learns about each removal at the scheduled instant.
+                self.directory.expire(now);
+                outputs.extend(self.take_directory_changes());
                 Ok(outputs)
             }
             MeshInput::KnownCards { hashes } => {
@@ -1025,14 +1063,36 @@ impl<R: RngCore> MeshEngine<R> {
                 return Ok(outputs);
             }
         };
-        if let Some(card_hash) = self
+        let (card_fetch, accepted) = self
             .presence
-            .observe(now, packet.header.origin, announcement)
-        {
+            .observe(now, packet.header.origin, announcement);
+        if let Some(card_hash) = card_fetch {
             outputs.push(MeshOutput::CardFetch {
                 node_id: packet.header.origin,
                 card_hash,
             });
+        }
+        if accepted {
+            let via = self
+                .neighbors
+                .get(link)
+                .and_then(|neighbor| neighbor.node_id);
+            if let Some(via) = via {
+                let observation = NodeObservation {
+                    node: NodeId::from_bytes(packet.header.origin),
+                    card_hash: announcement.card_hash,
+                    caps: announcement.caps,
+                    seq: announcement.seq,
+                    hops: packet.header.hops,
+                    via,
+                    observed_at_ms: now,
+                    location: &[],
+                };
+                self.directory
+                    .observe(now, observation)
+                    .map_err(MeshError::Directory)?;
+                outputs.extend(self.take_directory_changes());
+            }
         }
         if outcome != BudgetOutcome::Admitted || self.seen.is_duplicate(now, &packet.header.msg_id)
         {
@@ -1146,6 +1206,16 @@ impl<R: RngCore> MeshEngine<R> {
             }
         }
         outputs
+    }
+
+    /// Emits one bounded output for queued directory changes, if any.
+    fn take_directory_changes(&mut self) -> Vec<MeshOutput> {
+        let changes = self.directory.drain_changes();
+        if changes.is_empty() {
+            Vec::new()
+        } else {
+            vec![MeshOutput::DirectoryChanged { changes }]
+        }
     }
 
     /// Translates sync state changes into host actions and Bulk sends.

@@ -3,6 +3,7 @@
 **The routing and store-and-forward engine of the aoheyra mesh.** A sans-IO Rust crate that decides what happens to a packet: forward it, hold it, suppress it, deliver it, or drop it, across a phone-to-phone mesh where links come and go.
 
 > **Status: pre-alpha, through MSH-19.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest, bounded anti-entropy sync, range-based reconciliation on meeting links, binary spray-and-wait for Direct traffic, signed delivery receipts with bounded store purging, and bounded presence announcements with trickle timing are implemented.
+> **Status: pre-alpha, through MSH-20.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest, bounded anti-entropy sync, range-based reconciliation on meeting links, binary spray-and-wait for Direct traffic, signed delivery receipts with bounded store purging, and a bounded ephemeral NodeDirectory with coalesced UI events are implemented.
 
 Cargo package name: `ao_mesh`.
 
@@ -32,7 +33,7 @@ aoMesh consumes **aoNetwork** (links and frames) and **aoIdents** (signatures, s
 - **Stores and forwards**: `MessageStore` trait with quotas and eviction, store summary and beacon digest, anti-entropy sync when two nodes meet.
 - **Controls abuse mesh-wide**: per-origin and per-class relay budgets, neighbour penalty scores.
 - Handles **delivery receipts and immunity** so copies are purged after delivery.
-- Maintains **presence**, a mesh-wide **NodeDirectory**, reverse-path route hints and public channels.
+- Maintains a bounded mesh-wide **NodeDirectory** from typed presence observations, with LRU eviction, relative-time expiry and coalesced UI changes; reverse-path route hints and public channels follow in later issues.
 - Ships a **simulator harness** with mobility models and metrics, so every routing parameter can be swept and every claim measured.
 
 ## What it deliberately does not do
@@ -79,6 +80,7 @@ Lifetimes, TTLs, copy counts and budgets are **defaults with documented reasons*
 ```
 
 **Engine inputs:** `LinkUp`, `LinkDown`, `Data`, `Tick`, `Submit`, `KnownCards`, `StoreSummary`, `SyncItems`. **Outputs:** `Send`, `Broadcast`, `Release`, `Deliver`, `SetHello`, `SetBeacon`, `SyncNeed`, `SyncItem`, `ReleaseOpportunistic`, `Purge`, `Delivered`, `CardFetch`.
+**Engine inputs:** `LinkUp`, `LinkDown`, `Data`, `Tick`, `Submit`, `StoreSummary`, `SyncItems`, `ObserveNode`. **Outputs:** `Send`, `Broadcast`, `Release`, `Deliver`, `SetHello`, `SetBeacon`, `SyncNeed`, `SyncItem`, `ReleaseOpportunistic`, `Purge`, `Delivered`, `DirectoryChanged`.
 
 ### Engine and adapter (MSH-06)
 
@@ -670,6 +672,58 @@ cargo test --release --all-features --test sim_receipts
 
 `tests/receipts.rs` covers the two-node pipeline; `tests/sim_receipts.rs` locks
 the fixed-seed numbers and requires zero delivered copies at every node.
+## NodeDirectory (MSH-20)
+
+`directory::NodeDirectory` is a bounded, ephemeral, mesh-wide view of known
+nodes. A typed `NodeObservation` carries an opaque `NodeId`, a card hash,
+capability bits, an announcement sequence, an estimated hop distance, the
+via-neighbour, an observation time and opaque bounded location bytes. The mesh
+never fetches a card, opens a payload or interprets an app schema; location is
+stored as bytes until the telemetry work defines its meaning. Verified MSH-19
+announcements feed the directory automatically with the origin, card hash,
+capabilities, sequence, hop count and ingress neighbour from the signed packet.
+`MeshInput::ObserveNode` remains available for host-supplied facts; no packet or
+hello wire format changes here.
+
+| Setting | Default | Why |
+|---|---|---|
+| Directory entries | 256 | Covers the mesh visible over several contacts in about 80 KiB |
+| Stale after | 30 min | ADR-0001's Presence lifetime: a missed trickle refresh cannot make a node linger |
+| Location bytes | 64 | Bounds hostile location claims while leaving telemetry schema open |
+| UI events | 64 | Bounds the coalesced change stream handed to the app |
+
+Capacity evicts the least-recently-seen node, with sequence and `NodeId` as
+deterministic tie-breaks. Expiry is relative to the local receipt time: a
+high-water-mark clock means a backwards `now` neither extends nor shortens a
+lifetime, and a peer's observation time is clamped for display ordering only.
+`Tick` reclaims stale entries and emits their removals on schedule; queries
+also treat a stale entry as absent without mutating state. `get`, `nearby`
+(hop-distance range, nearest first) and `recent` are deterministic and bounded
+by an explicit result limit.
+
+UI updates arrive as `MeshOutput::DirectoryChanged` /
+`AdapterEvent::DirectoryChanged`, each holding only node ids and kinds. One
+pending event per node is coalesced (`Added` plus `Removed` disappears;
+`Removed` plus `Added` becomes `Updated`), so an announcement flood cannot
+grow the event stream past the configured bound. Oversized locations return
+the typed `DirectoryError::LocationTooLong` through `MeshError::Directory`.
+
+The fixed simulator scenario injects bounded observations with alternating
+future and past observation-time skew. It isolates the ceiling and expiry
+schedule without adding announcement traffic or changing any routing metric:
+
+| Scenario | Seed | Capacity | Peak entries | Expirations | Evictions | Last removal | Live at end |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `directory-line-6` | 1297304021 | 4 | 4 | 24 | 24 | 4,000 ms | 0 |
+
+```bash
+cargo run --all-features --example directory_report
+cargo test --all-features --test sim_directory
+```
+
+`tests/directory.rs` covers the engine seam and typed errors;
+`tests/sim_directory.rs` locks the fixed-seed numbers.
+
 ## Lifetime and expiry (MSH-18)
 
 `expiry::LifetimePolicy` provides per-class ceilings using the ADR-0001 defaults.

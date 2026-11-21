@@ -6,6 +6,7 @@ use ao_network::{Hello, LinkId};
 use std::collections::BTreeMap;
 
 use crate::budget::BudgetConfig;
+use crate::directory::DirectoryConfig;
 use crate::presence::PresenceConfig;
 use crate::receipt::ReceiptConfig;
 use crate::spray::SprayConfig;
@@ -35,6 +36,9 @@ pub struct MeshConfig {
     pub receipt: ReceiptConfig,
     /// Bounded presence announcements and trickle timing (MSH-19).
     pub presence: PresenceConfig,
+    /// Bounded mesh-wide directory capacity, staleness and event limits
+    /// (MSH-20).
+    pub directory: DirectoryConfig,
 }
 
 impl Default for MeshConfig {
@@ -49,7 +53,8 @@ impl Default for MeshConfig {
     /// keep far out of reach in normal use). The budget defaults are
     /// ADR-0001's class rates (MSH-10), suppression defaults are its
     /// per-class TTLs plus the measured 50-node sweep (MSH-11), and the
-    /// store beacon waits 200 ms after a change (MSH-13).
+    /// store beacon waits 200 ms after a change (MSH-13), and the directory
+    /// holds 256 nodes for 30 minutes with a 64-event UI queue (MSH-20).
     fn default() -> Self {
         Self {
             max_neighbors: 32,
@@ -62,6 +67,7 @@ impl Default for MeshConfig {
             spray: SprayConfig::default(),
             receipt: ReceiptConfig::default(),
             presence: PresenceConfig::default(),
+            directory: DirectoryConfig::default(),
         }
     }
 }

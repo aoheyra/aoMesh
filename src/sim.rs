@@ -21,13 +21,14 @@
 //! and `tests/sim_baseline.rs` enforces the published numbers. Per-origin
 //! delivery counts are kept off the CSV for the MSH-10 flood test.
 
+use crate::directory::{DirectoryConfig, NodeObservation};
 use crate::presence::{ANNOUNCE_LEN, ANNOUNCE_MAGIC};
 use crate::store::{MemoryStore, MessageStore, StoreLimits, StoreMetadata, StoredMessage};
 use crate::{
-    CAP_PRESENCE_V1, CAP_RECEIPT_V1, CAP_SYNC_V1, CAPS, Header, MeshConfig, MeshEngine, MeshHello,
-    MeshInput, MeshOutput, MessageId, NetworkAdapter, Packet, PacketClass, PresenceConfig,
-    SHORT_ID_BYTES, SYNC_MAGIC, SYNC_V2_VERSION, StoreSummary, SuppressionConfig, SyncOffer,
-    derive_msg_id, sign_packet,
+    CAP_PRESENCE_V1, CAP_RECEIPT_V1, CAP_SYNC_V1, CAPS, DirectoryChange, Header, MeshConfig,
+    MeshEngine, MeshHello, MeshInput, MeshOutput, MessageId, NetworkAdapter, Packet, PacketClass,
+    PresenceConfig, SHORT_ID_BYTES, SYNC_MAGIC, SYNC_V2_VERSION, StoreSummary, SuppressionConfig,
+    SyncOffer, derive_msg_id, sign_packet,
 };
 use ao_idents::{Identity, SealedMessage};
 use ao_network::{
@@ -147,6 +148,24 @@ pub enum Traffic {
     Presence,
 }
 
+/// Host-side directory observation schedule for one scenario (MSH-20).
+///
+/// The harness injects the same bounded facts that verified MSH-19
+/// announcements produce, with presence traffic off, so the test isolates
+/// directory capacity and expiry. It never changes routing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryPlan {
+    /// Directory bounds and staleness under test.
+    pub config: DirectoryConfig,
+    /// Local milliseconds between announcement rounds.
+    pub every_ms: u64,
+    /// Number of rounds; each node announces one other node per round.
+    pub announcements: usize,
+    /// Magnitude of the alternating observation-time skew. Even-index nodes
+    /// report this far in the future, odd-index nodes that far in the past.
+    pub observed_skew_ms: u64,
+}
+
 /// One reproducible experiment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Scenario {
@@ -197,6 +216,8 @@ pub struct Scenario {
     pub presence: bool,
     /// Presence trickle parameters under test.
     pub presence_config: PresenceConfig,
+    /// Optional directory observation schedule (MSH-20).
+    pub directory: Option<DirectoryPlan>,
 }
 
 /// Everything one run measured. Ratios are fractions, not percentages.
@@ -306,6 +327,26 @@ pub struct Metrics {
     pub steady_announcement_sends: u64,
     /// Announcement wire bytes in the last 60 seconds of the run.
     pub steady_announcement_bytes: u64,
+    /// Peak entries held by any node's directory (MSH-20).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub directory_peak_entries: usize,
+    /// Relative-time expirations summed over all nodes (MSH-20).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub directory_expirations: u64,
+    /// Capacity evictions summed over all nodes (MSH-20).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub directory_evictions: u64,
+    /// Last local millisecond at which any directory entry was removed
+    /// (MSH-20). Not part of the MSH-27 CSV report.
+    pub directory_last_removal_ms: u64,
+    /// Entries still live at the end of the run (MSH-20). The scenario's
+    /// staleness must have reclaimed every entry by then.
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub directory_live_entries: usize,
 }
 
 impl Metrics {
@@ -368,6 +409,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             suppression: SuppressionConfig::default(),
             presence: false,
             presence_config: PresenceConfig::default(),
+            directory: None,
         },
         Scenario {
             name: "waypoint-50",
@@ -389,6 +431,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             suppression: SuppressionConfig::default(),
             presence: false,
             presence_config: PresenceConfig::default(),
+            directory: None,
         },
         Scenario {
             name: "community-100",
@@ -410,6 +453,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             suppression: SuppressionConfig::default(),
             presence: false,
             presence_config: PresenceConfig::default(),
+            directory: None,
         },
         Scenario {
             name: "scripted-200",
@@ -429,6 +473,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             suppression: SuppressionConfig::default(),
             presence: false,
             presence_config: PresenceConfig::default(),
+            directory: None,
         },
     ]
 }
@@ -463,6 +508,7 @@ pub fn flood_scenarios() -> Vec<Scenario> {
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
+        directory: None,
     }]
 }
 
@@ -496,6 +542,7 @@ pub fn suppression_scenarios() -> Vec<Scenario> {
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
+        directory: None,
     }]
 }
 
@@ -523,6 +570,7 @@ pub fn spray_scenarios() -> Vec<Scenario> {
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
+        directory: None,
     };
     let scripted = Scenario {
         name: "spray-relay-scripted-200",
@@ -542,6 +590,7 @@ pub fn spray_scenarios() -> Vec<Scenario> {
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
+        directory: None,
     };
     vec![
         line.clone(),
@@ -585,6 +634,7 @@ pub fn receipt_scenarios() -> Vec<Scenario> {
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
+        directory: None,
     };
     let scripted = Scenario {
         name: "receipt-relay-scripted-200",
@@ -604,6 +654,7 @@ pub fn receipt_scenarios() -> Vec<Scenario> {
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
+        directory: None,
     };
     vec![
         line.clone(),
@@ -657,6 +708,47 @@ pub fn presence_scenarios() -> Vec<Scenario> {
             steady_interval_ms: 60_000,
             ..PresenceConfig::default()
         },
+        directory: None,
+    }]
+}
+
+/// MSH-20's fixed directory case: a small static line whose nodes announce
+/// each other on a seeded schedule with alternating observation-time skew.
+///
+/// The four-entry ceiling and two-second relative lifetime are far smaller
+/// than the defaults so the run exercises both capacity eviction and
+/// scheduled expiry. Presence traffic stays off; the host injects the typed
+/// observations that verified MSH-19 announcements produce at runtime.
+pub fn directory_scenarios() -> Vec<Scenario> {
+    vec![Scenario {
+        name: "directory-line-6",
+        seed: 1_297_304_021,
+        nodes: 6,
+        topology: Topology::Line,
+        mobility: Mobility::Static,
+        settle: Duration::from_millis(100),
+        run: Duration::from_secs(6),
+        messages: 1,
+        payload_len: 32,
+        traffic: Traffic::Balanced,
+        enforce_budgets: true,
+        enforce_suppression: true,
+        spray: false,
+        receipts: false,
+        suppression: SuppressionConfig::default(),
+        presence: false,
+        presence_config: PresenceConfig::default(),
+        directory: Some(DirectoryPlan {
+            config: DirectoryConfig {
+                capacity: 4,
+                stale_after_ms: 2_000,
+                max_location_bytes: 8,
+                max_change_events: 8,
+            },
+            every_ms: 250,
+            announcements: 8,
+            observed_skew_ms: 5_000,
+        }),
     }]
 }
 
@@ -743,6 +835,10 @@ pub struct Simulation {
     announcement_bytes: u64,
     steady_announcement_sends: u64,
     steady_announcement_bytes: u64,
+    directory_last_ms: u64,
+    directory_announcements: usize,
+    directory_peak_entries: usize,
+    directory_last_removal_ms: u64,
 }
 
 impl Simulation {
@@ -793,6 +889,9 @@ impl Simulation {
                 enabled: scenario.presence,
                 ..scenario.presence_config
             };
+            if let Some(plan) = &scenario.directory {
+                engine_config.directory = plan.config;
+            }
             engine_config.suppression = SuppressionConfig {
                 enabled: scenario.enforce_suppression,
                 ..scenario.suppression
@@ -976,6 +1075,10 @@ impl Simulation {
             announcement_bytes: 0,
             steady_announcement_sends: 0,
             steady_announcement_bytes: 0,
+            directory_last_ms: 0,
+            directory_announcements: 0,
+            directory_peak_entries: 0,
+            directory_last_removal_ms: 0,
         };
         sim.apply_ranges();
         sim
@@ -1323,6 +1426,88 @@ impl Simulation {
                 }
             }
             self.sample_queues();
+            self.directory_tick(now_ms);
+        }
+    }
+
+    /// Injects one seeded directory observation round when due, then ticks
+    /// every engine so relative-time expiry happens even without traffic.
+    fn directory_tick(&mut self, now_ms: u64) {
+        let Some(plan) = self.scenario.directory.clone() else {
+            return;
+        };
+        if !self.run_started {
+            return;
+        }
+        let n = self.nodes.len();
+        if self.directory_announcements < plan.announcements
+            && now_ms.saturating_sub(self.directory_last_ms) >= plan.every_ms
+        {
+            self.directory_last_ms = now_ms;
+            let round = self.directory_announcements;
+            for i in 0..n {
+                let target = (i + 1 + round) % n;
+                let card_hash = self.nodes[target].card_hash;
+                let location = [i as u8, target as u8, round as u8, (round >> 8) as u8];
+                // Half the nodes report a future timestamp and half a past
+                // one; the directory clamps both and never uses either for
+                // expiry.
+                let observed_at_ms = if i % 2 == 0 {
+                    now_ms.saturating_add(plan.observed_skew_ms)
+                } else {
+                    now_ms.saturating_sub(plan.observed_skew_ms)
+                };
+                let observation = NodeObservation {
+                    node: self.identities[target].node_id(),
+                    card_hash,
+                    caps: 1 << ((i + round) % 4),
+                    seq: round as u64 + 1,
+                    hops: ((i + round) % 4 + 1) as u8,
+                    via: self.identities[(i + 1) % n].node_id(),
+                    observed_at_ms,
+                    location: &location,
+                };
+                let outputs = self.nodes[i]
+                    .adapter
+                    .engine_mut()
+                    .handle(now_ms, MeshInput::ObserveNode { observation })
+                    .expect("host observations are bounded");
+                self.note_directory_changes(&outputs, now_ms);
+            }
+            self.directory_announcements = self.directory_announcements.saturating_add(1);
+        }
+
+        for i in 0..n {
+            let card_hash = self.nodes[i].card_hash;
+            let outputs = self.nodes[i]
+                .adapter
+                .engine_mut()
+                .handle(
+                    now_ms,
+                    MeshInput::Tick {
+                        identity: &self.identities[i],
+                        card_hash,
+                    },
+                )
+                .expect("tick is valid");
+            self.note_directory_changes(&outputs, now_ms);
+        }
+        for node in &self.nodes {
+            self.directory_peak_entries = self
+                .directory_peak_entries
+                .max(node.adapter.engine().directory().len());
+        }
+    }
+
+    fn note_directory_changes(&mut self, outputs: &[MeshOutput], now_ms: u64) {
+        for output in outputs {
+            if let MeshOutput::DirectoryChanged { changes } = output {
+                for change in changes {
+                    if matches!(change, DirectoryChange::Removed { .. }) {
+                        self.directory_last_removal_ms = self.directory_last_removal_ms.max(now_ms);
+                    }
+                }
+            }
         }
     }
 
@@ -1675,6 +1860,28 @@ impl Simulation {
                 })
                 .sum(),
             max_purge_latency_ms: self.purge_latencies.iter().copied().max().unwrap_or(0),
+            directory_peak_entries: self.directory_peak_entries,
+            directory_expirations: self
+                .nodes
+                .iter()
+                .map(|node| node.adapter.engine().directory().stats().expirations)
+                .sum(),
+            directory_evictions: self
+                .nodes
+                .iter()
+                .map(|node| node.adapter.engine().directory().stats().evictions)
+                .sum(),
+            directory_last_removal_ms: self.directory_last_removal_ms,
+            directory_live_entries: self
+                .nodes
+                .iter()
+                .map(|node| {
+                    node.adapter
+                        .engine()
+                        .directory()
+                        .live_len(self.world.now().as_millis() as u64)
+                })
+                .sum(),
             unique_receptions_by_node: self
                 .received_ids
                 .iter()
@@ -2155,6 +2362,11 @@ mod tests {
             announcement_bytes: 1_800,
             steady_announcement_sends: 4,
             steady_announcement_bytes: 600,
+            directory_peak_entries: 0,
+            directory_expirations: 0,
+            directory_evictions: 0,
+            directory_last_removal_ms: 0,
+            directory_live_entries: 0,
         };
         let row = m.csv_row();
         assert_eq!(row.lines().count(), 1);

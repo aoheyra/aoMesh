@@ -29,6 +29,18 @@ Breaking unreleased API change: `MeshInput::Tick` now takes a borrowed
 `AdapterEvent::CardFetch`); `poll_event` and `next_event` signatures are
 unchanged. `MeshConfig` gains a `presence: PresenceConfig` field and
 `MeshEngine::presence()` exposes read-only learned state.
+MSH-20 adds a bounded, ephemeral `NodeDirectory` fed by a typed presence
+observation seam. Entries carry the last seen time, local expiry, hop
+distance, via-node, caps, sequence, card hash and opaque bounded location
+bytes. Capacity evicts least-recently-seen nodes, relative-time expiry ignores
+backwards and skewed clocks, and queries by id, vicinity and recency are
+bounded and deterministic. UI changes arrive as coalesced
+`DirectoryChanged` events with one pending entry per node. The engine remains
+sans-IO and no wire format changes. Verified MSH-19 announcements now feed the
+directory with their origin, card hash, caps, sequence, hop count and
+ingress neighbour. The fixed seed `1297304021` scenario peaks at
+the four-entry cap, expires all 24 timed-out entries and ends with zero live
+entries.
 
 MSH-17 adds signed delivery receipts and bounded store immunity. An
 authenticated delivery emits a cap-gated receipt envelope carrying a signed
