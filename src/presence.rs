@@ -826,36 +826,18 @@ mod tests {
         t.set_caps(LinkId::new(1), CAP_PRESENCE_V1);
         // A new identity waits only the quick delay, then backs off.
         assert_eq!(t.on_tick(0, [1; 8], CAPS), None);
-        assert_eq!(
-            t.on_tick(10, [1; 8], CAPS),
-            Some(local_ann(1, 1, CAPS))
-        );
+        assert_eq!(t.on_tick(10, [1; 8], CAPS), Some(local_ann(1, 1, CAPS)));
         assert_eq!(t.on_tick(50, [1; 8], CAPS), None);
-        assert_eq!(
-            t.on_tick(110, [1; 8], CAPS),
-            Some(local_ann(2, 1, CAPS))
-        );
+        assert_eq!(t.on_tick(110, [1; 8], CAPS), Some(local_ann(2, 1, CAPS)));
         assert_eq!(t.on_tick(200, [1; 8], CAPS), None);
-        assert_eq!(
-            t.on_tick(310, [1; 8], CAPS),
-            Some(local_ann(3, 1, CAPS))
-        );
+        assert_eq!(t.on_tick(310, [1; 8], CAPS), Some(local_ann(3, 1, CAPS)));
         assert_eq!(t.on_tick(500, [1; 8], CAPS), None);
-        assert_eq!(
-            t.on_tick(710, [1; 8], CAPS),
-            Some(local_ann(4, 1, CAPS))
-        );
-        assert_eq!(
-            t.on_tick(1_110, [1; 8], CAPS),
-            Some(local_ann(5, 1, CAPS))
-        );
+        assert_eq!(t.on_tick(710, [1; 8], CAPS), Some(local_ann(4, 1, CAPS)));
+        assert_eq!(t.on_tick(1_110, [1; 8], CAPS), Some(local_ann(5, 1, CAPS)));
         // A card change is quick too and resets the interval.
         assert_eq!(t.on_tick(1_111, [2; 8], CAPS), None);
         // The sequence keeps increasing so the changed card wins latest-wins.
-        assert_eq!(
-            t.on_tick(1_121, [2; 8], CAPS),
-            Some(local_ann(6, 2, CAPS))
-        );
+        assert_eq!(t.on_tick(1_121, [2; 8], CAPS), Some(local_ann(6, 2, CAPS)));
         assert_eq!(t.on_tick(1_150, [2; 8], CAPS), None);
     }
 
@@ -867,10 +849,7 @@ mod tests {
         assert_eq!(t.on_tick(0, [1; 8], CAPS), None);
         t.set_caps(LinkId::new(2), CAP_PRESENCE_V1);
         assert_eq!(t.on_tick(0, [1; 8], CAPS), None);
-        assert_eq!(
-            t.on_tick(1_000, [1; 8], CAPS),
-            Some(local_ann(1, 1, CAPS))
-        );
+        assert_eq!(t.on_tick(1_000, [1; 8], CAPS), Some(local_ann(1, 1, CAPS)));
         t.link_down(LinkId::new(2));
         assert!(!t.has_capable_links());
     }

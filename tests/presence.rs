@@ -80,6 +80,18 @@ fn facts(seq: u64, card_hash: [u8; 8]) -> Announcement {
     }
 }
 
+fn signed_facts(identity: &Identity, seq: u64, card_hash: [u8; 8]) -> Announcement {
+    let public = identity.public();
+    Announcement {
+        card_hash,
+        caps: CAP_PRESENCE_V1,
+        seq,
+        signing_pk: *public.signing_pk(),
+        agreement_pk: *public.agreement_pk(),
+        binding: *public.agreement_binding().as_bytes(),
+    }
+}
+
 fn wire(identity: &Identity, now: u64, facts: Announcement) -> Vec<u8> {
     encode_announcement(now, identity, facts, 3, 1_800)
         .expect("fixed identity signs")
@@ -140,7 +152,7 @@ proptest! {
 #[test]
 fn signed_announcement_verifies_end_to_end_after_hop_mutable_changes() {
     let origin = remote_identity();
-    let body = facts(7, [0xA5; 8]);
+    let body = signed_facts(&origin, 7, [0xA5; 8]);
     let (id, bytes) = encode_announcement(1_000, &origin, body, 3, 1_800).expect("signs");
     let mut packet = Packet::decode(&bytes).expect("decodes");
     assert_eq!(packet.header.class, PacketClass::Presence);
