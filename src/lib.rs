@@ -53,6 +53,7 @@ pub mod spray;
 pub mod store;
 pub mod suppress;
 pub mod sync;
+pub mod telemetry;
 
 #[cfg(feature = "adapter")]
 pub use adapter::{AdapterEvent, NetworkAdapter};
@@ -83,6 +84,11 @@ pub use suppress::SuppressionConfig;
 pub use sync::{
     BeaconTracker, RangeKey, RangeSummary, SHORT_ID_BYTES, SYNC_MAGIC, SYNC_V2_VERSION,
     SYNC_VERSION, StoreSummary, SummaryConfig, SyncConfig, SyncFrame, SyncFrameV2, SyncOffer,
+};
+pub use telemetry::{
+    CoalesceKey, DEFAULT_EXPIRY_MS, DEFAULT_HOP_LIMIT, DEFAULT_MAX_ENTRIES, DEFAULT_RATE_LIMIT_MS,
+    TELEMETRY_PREFIX_LEN, TELEMETRY_VERSION, TelemetryAdvisory, TelemetryConfig, TelemetryError,
+    TelemetryFrame, TelemetryKind, TelemetryTracker, coalesce_key,
 };
 
 // A signed hello must fit the opaque blob aoNetwork allows (NET-04's

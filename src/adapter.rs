@@ -5,9 +5,10 @@
 //! and no clock is read here. Network durations and mesh milliseconds are
 //! explicit separate inputs; no wall-clock/monotonic conversion is guessed.
 
+use crate::telemetry::TelemetryAdvisory;
 use crate::{MeshEngine, MeshError, MeshInput, MeshOutput};
 use ao_idents::Identity;
-use ao_network::{LinkId, Network, NetworkEvent, SendError, Transport};
+use ao_network::{LinkId, Network, NetworkEvent, SendError, SendOpts, Transport};
 use rand_core::RngCore;
 use std::future::poll_fn;
 use std::task::{Context, Poll};
@@ -69,6 +70,15 @@ pub enum AdapterEvent {
         /// Bounded, ordered change stream.
         changes: Vec<crate::directory::DirectoryChange>,
     },
+    /// A Telemetry update was accepted under this latest-wins advisory.
+    /// The adapter has already handed its key and deadline to aoNetwork's
+    /// send queue; the event is for host diagnostics, not another queue.
+    TelemetryAccepted {
+        /// Link that received the update.
+        link: LinkId,
+        /// Policy values mirrored into `SendOpts`.
+        advisory: TelemetryAdvisory,
+    },
     /// A peer's item is ready for the store owner to validate and insert.
     SyncItem {
         /// Full content address parsed from the packet.
@@ -124,6 +134,16 @@ impl<R: RngCore, T: Transport> NetworkAdapter<R, T> {
         let outputs = self.engine.handle(mesh_now_ms, input)?;
         Ok(self.apply(network_now, outputs))
     }
+    /// Translates mesh milliseconds into aoNetwork's absolute monotonic
+    /// deadline. A clock overflow leaves the frame undated rather than
+    /// inventing a deadline in the past.
+    fn telemetry_opts(now: Duration, advisory: TelemetryAdvisory) -> SendOpts {
+        SendOpts {
+            coalesce_key: Some(*advisory.coalesce_key.as_bytes()),
+            expires_at: now.checked_add(Duration::from_millis(advisory.expires_in_ms)),
+        }
+    }
+
     /// Maps actions to the facade; errors and deliveries are returned, never swallowed.
     /// The adapter reads no clock: `network_now` is passed straight to
     /// every facade command that needs the time.
@@ -147,6 +167,48 @@ impl<R: RngCore, T: Transport> NetworkAdapter<R, T> {
                             .into_iter()
                             .map(|(link, error)| AdapterEvent::SendFailed { link, error }),
                     );
+                }
+                MeshOutput::TelemetrySend {
+                    link,
+                    channel,
+                    payload,
+                    advisory,
+                } => {
+                    let opts = Self::telemetry_opts(network_now, advisory);
+                    if let Err(error) =
+                        self.network
+                            .send_opts(network_now, link, channel, payload, opts)
+                    {
+                        events.push(AdapterEvent::SendFailed { link, error });
+                    } else {
+                        events.push(AdapterEvent::TelemetryAccepted { link, advisory });
+                    }
+                }
+                MeshOutput::TelemetryBroadcast {
+                    channel,
+                    payload,
+                    advisory,
+                } => {
+                    let opts = Self::telemetry_opts(network_now, advisory);
+                    let links: Vec<LinkId> = self
+                        .network
+                        .links()
+                        .into_iter()
+                        .map(|info| info.link)
+                        .collect();
+                    for link in links {
+                        if let Err(error) = self.network.send_opts(
+                            network_now,
+                            link,
+                            channel,
+                            payload.clone(),
+                            opts,
+                        ) {
+                            events.push(AdapterEvent::SendFailed { link, error });
+                        } else {
+                            events.push(AdapterEvent::TelemetryAccepted { link, advisory });
+                        }
+                    }
                 }
                 MeshOutput::Release { link, reason } => {
                     self.network.disconnect(network_now, link, reason)

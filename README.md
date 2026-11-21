@@ -78,7 +78,7 @@ Lifetimes, TTLs, copy counts and budgets are **defaults with documented reasons*
    aoNetwork  (NetworkEvent in, actions out)      aoIdents (sign, open, replay)
 ```
 
-**Engine inputs:** `LinkUp`, `LinkDown`, `Data`, `Tick`, `Submit`, `KnownCards`, `ObserveNode`, `StoreSummary`, `SyncItems`. **Outputs:** `Send`, `Broadcast`, `Release`, `Deliver`, `SetHello`, `SetBeacon`, `SyncNeed`, `SyncItem`, `ReleaseOpportunistic`, `Purge`, `Delivered`, `CardFetch`, `DirectoryChanged`.
+**Engine inputs:** `LinkUp`, `LinkDown`, `Data`, `Tick`, `Submit`, `SubmitTelemetry`, `KnownCards`, `ObserveNode`, `StoreSummary`, `SyncItems`. **Outputs:** `Send`, `Broadcast`, `TelemetrySend`, `TelemetryBroadcast`, `Release`, `Deliver`, `SetHello`, `SetBeacon`, `SyncNeed`, `SyncItem`, `ReleaseOpportunistic`, `Purge`, `Delivered`, `CardFetch`, `DirectoryChanged`.
 
 ### Engine and adapter (MSH-06)
 
@@ -133,6 +133,35 @@ cargo run --features adapter --example mesh_adapter
 This seeded three-node example checks structural reception through the full
 adapter and transport path. It does not demonstrate multihop forwarding,
 end-to-end encryption or application delivery. See the [I/O decision](docs/adr/engine-io-and-adapter.md).
+
+### Telemetry (MSH-22)
+
+`SubmitTelemetry` frames an opaque payload with a one-byte application-owned
+`kind` and a sender-monotonic `u64` sequence, signs it under the existing
+Telemetry class, and emits `TelemetrySend` or `TelemetryBroadcast`. The mesh
+never reads the payload as a location or any other app schema. The coalescing
+key is BLAKE3 over a dedicated domain, the origin id and the kind byte; the
+sequence is deliberately excluded so a newer update replaces an older one
+waiting in aoNetwork's NET-21 queue. `NetworkAdapter` passes that key and a
+local-deadline-derived `SendOpts.expires_at` to `Network::send_opts`; it does
+not build a second radio queue.
+
+Relays decode the frame after the header and content-address checks, then
+apply freshness and throttling **before** relaying or spending a per-origin
+budget token. Stale, expired, rate-limited and hop-limited updates are silent
+policy drops; only malformed frames or a bad content address count against the
+sender. Expiry and the one-per-origin/10 s cap use only the caller's monotonic
+`now`, so a skewed `created_ms` cannot change them. Telemetry is never handed
+to `SyncItem`, the store, or the receipt tracker. Engine state is bounded by
+`TelemetryConfig::max_entries`, evicting by earliest local expiry then key.
+
+The fixed-seed report is reproducible with:
+
+```bash
+cargo run --release --features sim --example telemetry_report
+```
+
+The regression gate in `tests/sim_telemetry.rs` locks both seeds and rows.
 
 ### Packet format (MSH-03, MSH-04)
 
@@ -263,6 +292,9 @@ changes.
 | Base delay | 60-140 ms, seeded | Long enough for neighbour copies, short enough for a contact |
 | Final delay | 20-600 ms, shrinking with degree | Dense groups decide sooner |
 | Class TTL | Direct 8, Broadcast 6, Presence 3, Telemetry 3 | ADR-0001 table, clamped on submission too |
+| Telemetry freshness | 30 s | Long enough for a moving contact, short enough that stale ambient state is dropped |
+| Telemetry rate cap | One accepted update per origin per 10 s | A chatty origin cannot fill a slow link; measured with seed `1297304029` |
+| Telemetry state bound | 512 `(origin, kind)` entries | Bounded relay memory; earliest expiry, then key order, is evicted |
 
 The fixed mixed case in `tests/sim_suppression.rs` submits 100 messages on a
 seeded 50-node random graph (seed `1297304013`), every tenth one a sealed

@@ -13,6 +13,7 @@ use crate::routehint::RouteHintConfig;
 use crate::spray::SprayConfig;
 use crate::suppress::SuppressionConfig;
 use crate::sync::{SummaryConfig, SyncConfig};
+use crate::telemetry::TelemetryConfig;
 
 /// Limits for engine-owned state. These do not enforce radio topology policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +43,8 @@ pub struct MeshConfig {
     pub directory: DirectoryConfig,
     /// Reverse-path hint table and Direct forwarding mode (MSH-21).
     pub route_hint: RouteHintConfig,
+    /// Telemetry freshness, hop limit, coalescing and throttle (MSH-22).
+    pub telemetry: TelemetryConfig,
 }
 
 impl Default for MeshConfig {
@@ -72,6 +75,7 @@ impl Default for MeshConfig {
             presence: PresenceConfig::default(),
             directory: DirectoryConfig::default(),
             route_hint: RouteHintConfig::default(),
+            telemetry: TelemetryConfig::default(),
         }
     }
 }

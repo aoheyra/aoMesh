@@ -57,6 +57,19 @@ packet, hello or sync wire field changes. On the paired random-20 case
 unchanged at 230 and overhead at 23.0000, while additive uses 231
 transmissions and 23.1000. The line-20 control (seed `1297303584`) is identical
 in all modes.
+MSH-22 adds bounded latest-wins Telemetry. `SubmitTelemetry` frames an opaque
+payload with an application-owned kind and a monotonic sequence under the
+existing Telemetry class; the frame prefix is version, kind, `u64` sequence,
+then opaque bytes. `TelemetrySend`/`TelemetryBroadcast` carry a typed advisory
+whose stable `(origin, kind)` coalescing key and local deadline the adapter
+passes to aoNetwork's `SendOpts` and `Network::send_opts`. Relays check the
+frame and apply 30 s freshness, a one-per-origin/10 s cap and a three-hop limit
+before spending a relay budget; malformed frames alone are penalised. Telemetry
+is never stored or synced, and its bounded tracker uses local time only. The
+fixed slow-line seed `1297304023` shows eight bursts reduced to one in-flight
+frame plus one pending replacement at each receiver (six receptions, at most
+two sequences per node, sequence 8, 12 transmissions); the chatty seed
+`1297304029` accepts one of twelve attempts and emits no telemetry frame.
 
 MSH-17 adds signed delivery receipts and bounded store immunity. An
 authenticated delivery emits a cap-gated receipt envelope carrying a signed
