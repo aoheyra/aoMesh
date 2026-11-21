@@ -9,11 +9,13 @@
 //! One scenario runs in three phases:
 //!
 //! 1. settle until links have formed at the seeded radio topology;
-//! 2. submit sealed Direct messages from spread-out origins, or from one
-//!    flooding origin in MSH-10's ablation case, staggered so mobility and
-//!    scripted contacts can affect them;
+//! 2. submit sealed Direct messages from spread-out origins, one flooding
+//!    origin in MSH-10's ablation case, or plain Broadcast messages in
+//!    MSH-11's suppression case, staggered so mobility and scripted contacts
+//!    can affect them;
 //! 3. advance the world, applying optional mobility, and record deliveries,
-//!    transmissions, receptions, queue occupancy and radio bytes.
+//!    unique Broadcast receptions, transmissions, queue occupancy and radio
+//!    bytes.
 //!
 //! The report is one CSV row per scenario. `examples/sim_report` writes it
 //! and `tests/sim_baseline.rs` enforces the published numbers. Per-origin
@@ -21,7 +23,7 @@
 
 use crate::{
     Header, MeshConfig, MeshEngine, MeshHello, MeshInput, MeshOutput, MessageId, NetworkAdapter,
-    PacketClass, derive_msg_id, sign_packet,
+    PacketClass, SuppressionConfig, derive_msg_id, sign_packet,
 };
 use ao_idents::{Identity, SealedMessage};
 use ao_network::{
@@ -105,6 +107,24 @@ pub enum Traffic {
         /// Number of flood messages per honest message.
         weight: usize,
     },
+    /// Submit plain Broadcast messages from one origin (MSH-11).
+    ///
+    /// Broadcast has no sealed `Deliver` until later issues, so this case
+    /// measures unique content receptions per node instead.
+    Broadcast {
+        /// Node index of the flooding origin.
+        origin: usize,
+    },
+    /// Mostly Broadcast from one origin, with sealed Direct canaries.
+    ///
+    /// The canaries keep the MSH-27 delivery ratio meaningful while the
+    /// flooded class supplies the transmission count MSH-11 measures.
+    MixedBroadcast {
+        /// Node index of the flooding origin.
+        origin: usize,
+        /// Submit one Direct canary every `direct_every` messages.
+        direct_every: usize,
+    },
 }
 
 /// One reproducible experiment.
@@ -134,6 +154,12 @@ pub struct Scenario {
     ///
     /// Ablation runs set this to false to measure an unbounded flood.
     pub enforce_budgets: bool,
+    /// Whether engines enforce MSH-11 suppression for flooded classes.
+    ///
+    /// Ablation runs set this to false to measure immediate flooding.
+    pub enforce_suppression: bool,
+    /// Suppression bounds and timer parameters under test.
+    pub suppression: SuppressionConfig,
 }
 
 /// Everything one run measured. Ratios are fractions, not percentages.
@@ -145,8 +171,12 @@ pub struct Metrics {
     pub seed: u64,
     /// Simulated node count.
     pub nodes: usize,
-    /// Sealed messages submitted to the mesh.
+    /// Messages submitted to the mesh, of every class.
     pub submitted: u64,
+    /// Sealed Direct submissions, the denominator of `delivery_ratio`.
+    ///
+    /// Equals `submitted` for the published Direct-only baselines.
+    pub direct_submitted: u64,
     /// Authenticated deliveries emitted at destinations.
     pub delivered: u64,
     /// Deliveries of a message id already delivered at that node.
@@ -178,6 +208,15 @@ pub struct Metrics {
     /// Not part of the CSV report; MSH-10 uses it to check that a flood
     /// is throttled without hurting honest origins.
     pub delivered_by_origin: Vec<u64>,
+    /// Unique Broadcast content addresses observed at each node index.
+    ///
+    /// Not part of the CSV report. Broadcast has no `Deliver` event yet, so
+    /// MSH-11 uses these receptions as its reachability measure.
+    pub unique_receptions_by_node: Vec<u64>,
+    /// Sum of unique receptions across all nodes.
+    ///
+    /// Not part of the CSV report.
+    pub unique_receptions: u64,
 }
 
 impl Metrics {
@@ -226,6 +265,8 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             payload_len: 128,
             traffic: Traffic::Balanced,
             enforce_budgets: true,
+            enforce_suppression: true,
+            suppression: SuppressionConfig::default(),
         },
         Scenario {
             name: "waypoint-50",
@@ -241,6 +282,8 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             payload_len: 128,
             traffic: Traffic::Balanced,
             enforce_budgets: true,
+            enforce_suppression: true,
+            suppression: SuppressionConfig::default(),
         },
         Scenario {
             name: "community-100",
@@ -256,6 +299,8 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             payload_len: 128,
             traffic: Traffic::Balanced,
             enforce_budgets: true,
+            enforce_suppression: true,
+            suppression: SuppressionConfig::default(),
         },
         Scenario {
             name: "scripted-200",
@@ -269,6 +314,8 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             payload_len: 128,
             traffic: Traffic::Balanced,
             enforce_budgets: true,
+            enforce_suppression: true,
+            suppression: SuppressionConfig::default(),
         },
     ]
 }
@@ -297,6 +344,37 @@ pub fn flood_scenarios() -> Vec<Scenario> {
             weight: 1,
         },
         enforce_budgets: true,
+        enforce_suppression: true,
+        suppression: SuppressionConfig::default(),
+    }]
+}
+
+/// MSH-11's fixed 50-node suppression case.
+///
+/// One origin submits plain Broadcast packets into a static random graph;
+/// every tenth message is instead a sealed Direct canary so the MSH-27
+/// delivery ratio remains meaningful. The paired ablation sets
+/// `enforce_suppression = false`, which is exactly the old immediate-flooding
+/// behaviour, so the comparison isolates the counter-based relay decision
+/// from topology and radio contention.
+pub fn suppression_scenarios() -> Vec<Scenario> {
+    vec![Scenario {
+        name: "suppression-random-50",
+        seed: 1_297_304_013,
+        nodes: 50,
+        topology: Topology::Random,
+        mobility: Mobility::Static,
+        settle: Duration::from_secs(30),
+        run: Duration::from_secs(60),
+        messages: 100,
+        payload_len: 128,
+        traffic: Traffic::MixedBroadcast {
+            origin: 0,
+            direct_every: 10,
+        },
+        enforce_budgets: true,
+        enforce_suppression: true,
+        suppression: SuppressionConfig::default(),
     }]
 }
 
@@ -352,6 +430,7 @@ pub struct Simulation {
     side: i64,
     rng: u64,
     submitted: u64,
+    direct_submitted: u64,
     delivered: u64,
     duplicate_deliveries: u64,
     transmissions: u64,
@@ -364,6 +443,7 @@ pub struct Simulation {
     latencies: Vec<u64>,
     delivered_ids: Vec<BTreeSet<MessageId>>,
     delivered_by_origin: Vec<u64>,
+    received_ids: Vec<BTreeSet<MessageId>>,
     origin_index: BTreeMap<[u8; 16], usize>,
     links_after_settle: usize,
 }
@@ -403,6 +483,10 @@ impl Simulation {
             let engine_rng = EngineRng::seed_from_u64(scenario.seed ^ (i as u64 + 1));
             let mut engine_config = MeshConfig::default();
             engine_config.budgets.enforce = scenario.enforce_budgets;
+            engine_config.suppression = SuppressionConfig {
+                enabled: scenario.enforce_suppression,
+                ..scenario.suppression
+            };
             let engine = MeshEngine::with_config(engine_rng, engine_config);
             let mut adapter =
                 NetworkAdapter::new(engine, Network::new(NetworkConfig::default(), radio));
@@ -498,6 +582,7 @@ impl Simulation {
             side,
             rng,
             submitted: 0,
+            direct_submitted: 0,
             delivered: 0,
             duplicate_deliveries: 0,
             transmissions: 0,
@@ -510,6 +595,7 @@ impl Simulation {
             latencies: Vec::new(),
             delivered_ids,
             delivered_by_origin: vec![0; n],
+            received_ids: vec![BTreeSet::new(); n],
             origin_index,
             links_after_settle: 0,
         };
@@ -599,31 +685,57 @@ impl Simulation {
                         Poll::Pending => break,
                         Poll::Ready(event) => event,
                     };
-                    let input = match &event {
-                        NetworkEvent::LinkUp { link, remote_hello } => MeshInput::LinkUp {
-                            link: *link,
-                            remote_hello: remote_hello.clone(),
-                        },
+                    let (input, received_id) = match &event {
+                        NetworkEvent::LinkUp { link, remote_hello } => (
+                            MeshInput::LinkUp {
+                                link: *link,
+                                remote_hello: remote_hello.clone(),
+                            },
+                            None,
+                        ),
                         NetworkEvent::LinkDown { link, reason } => {
                             self.pending[i].remove(link);
                             self.tx_last[i].remove(link);
-                            MeshInput::LinkDown {
-                                link: *link,
-                                reason: *reason,
-                            }
+                            (
+                                MeshInput::LinkDown {
+                                    link: *link,
+                                    reason: *reason,
+                                },
+                                None,
+                            )
                         }
                         NetworkEvent::Data {
                             link,
                             channel,
                             payload,
-                        } => MeshInput::Data {
-                            link: *link,
-                            channel: *channel,
-                            payload,
-                            identity: &self.identities[i],
-                        },
+                        } => {
+                            // Broadcast has no Deliver event yet. Count a
+                            // structurally valid flooded packet as a unique
+                            // reception at this node, once per content id.
+                            let received_id = crate::Packet::decode(payload)
+                                .ok()
+                                .filter(|packet| {
+                                    matches!(
+                                        packet.header.class,
+                                        PacketClass::Broadcast | PacketClass::Presence
+                                    )
+                                })
+                                .map(|packet| packet.header.msg_id);
+                            (
+                                MeshInput::Data {
+                                    link: *link,
+                                    channel: *channel,
+                                    payload,
+                                    identity: &self.identities[i],
+                                },
+                                received_id,
+                            )
+                        }
                         _ => continue,
                     };
+                    if let Some(id) = received_id {
+                        self.received_ids[i].insert(id);
+                    }
                     let outputs = self.nodes[i]
                         .adapter
                         .engine_mut()
@@ -745,19 +857,30 @@ impl Simulation {
     /// affect delivery instead of finishing before the first contact changes.
     fn submit_one(&mut self, m: usize) {
         let n = self.nodes.len();
-        let origin = match self.scenario.traffic {
-            Traffic::Balanced => m % n,
+        let (origin, broadcast) = match self.scenario.traffic {
+            Traffic::Balanced => (m % n, false),
             Traffic::Flood {
                 origin: flood,
                 weight,
             } => {
                 let round = weight.max(1) + 1;
                 if m % round == 0 {
-                    flood.min(n - 1)
+                    (flood.min(n - 1), false)
                 } else {
                     let honest = n - 1;
                     let slot = (m / round) * weight + (m % round) - 1;
-                    (flood.min(n - 1) + 1 + slot % honest) % n
+                    ((flood.min(n - 1) + 1 + slot % honest) % n, false)
+                }
+            }
+            Traffic::Broadcast { origin } => (origin.min(n - 1), true),
+            Traffic::MixedBroadcast {
+                origin,
+                direct_every,
+            } => {
+                if m % direct_every.max(1) == 0 {
+                    (m % n, false)
+                } else {
+                    (origin.min(n - 1), true)
                 }
             }
         };
@@ -774,7 +897,25 @@ impl Simulation {
         let now_ms = self.world.now().as_millis() as u64;
         let mut rng = SealRng::seed_from_u64(self.scenario.seed ^ (m as u64 + 1));
         let plaintext = vec![(m % 251) as u8; self.scenario.payload_len];
-        let (header, payload) = {
+        let (header, payload) = if broadcast {
+            // Plain Broadcast: the engine caps TTL at ADR-0001's six hops
+            // on submission. Payload is opaque to the mesh.
+            let sender = &self.identities[origin];
+            let mut header = Header {
+                class: PacketClass::Broadcast,
+                dst: None,
+                msg_id: [0; 16].into(),
+                origin: *sender.node_id().as_bytes(),
+                created_ms: now_ms,
+                lifetime_s: 600,
+                payload_len: plaintext.len() as u64,
+                ttl: 255,
+                hops: 0,
+            };
+            let signature = sign_packet(sender, &mut header, &plaintext).expect("fixed key signs");
+            let packet = crate::Packet::new(header, signature, &plaintext).expect("lengths agree");
+            (packet.header, plaintext)
+        } else {
             let sender = &self.identities[origin];
             let recipient = &self.identities[dst];
             let (mut header, payload) =
@@ -784,6 +925,7 @@ impl Simulation {
             let packet = crate::Packet::new(header, signature, &payload).expect("lengths agree");
             (packet.header, payload)
         };
+        let submitted_id = header.msg_id;
         let outputs = self.nodes[origin]
             .adapter
             .engine_mut()
@@ -798,6 +940,11 @@ impl Simulation {
             )
             .expect("valid submission");
         self.submitted += 1;
+        if broadcast {
+            self.received_ids[origin].insert(submitted_id);
+        } else {
+            self.direct_submitted += 1;
+        }
         self.count_outputs(origin, now_ms, &outputs);
         let events = self.nodes[origin].adapter.apply(self.world.now(), outputs);
         for event in events {
@@ -856,6 +1003,7 @@ impl Simulation {
             seed: self.scenario.seed,
             nodes: self.scenario.nodes,
             submitted: self.submitted,
+            direct_submitted: self.direct_submitted,
             delivered: self.delivered,
             duplicate_deliveries: self.duplicate_deliveries,
             transmissions: self.transmissions,
@@ -864,12 +1012,23 @@ impl Simulation {
             radio_bytes: self.radio_bytes_run,
             mean_latency_ms: mean,
             max_latency_ms: max,
-            delivery_ratio: self.delivered as f64 / self.submitted as f64,
+            delivery_ratio: self.delivered as f64
+                / if self.direct_submitted > 0 {
+                    self.direct_submitted
+                } else {
+                    self.submitted
+                } as f64,
             overhead: self.transmissions as f64 / self.delivered.max(1) as f64,
             duplicate_ratio: self.duplicate_deliveries as f64 / self.delivered.max(1) as f64,
             peak_queued_bytes: self.peak_queued_bytes,
             links_after_settle: self.links_after_settle,
             delivered_by_origin: self.delivered_by_origin,
+            unique_receptions_by_node: self
+                .received_ids
+                .iter()
+                .map(|ids| ids.len() as u64)
+                .collect(),
+            unique_receptions: self.received_ids.iter().map(BTreeSet::len).sum::<usize>() as u64,
         }
     }
 }
@@ -950,6 +1109,7 @@ mod tests {
             seed: 1,
             nodes: 2,
             submitted: 3,
+            direct_submitted: 3,
             delivered: 2,
             duplicate_deliveries: 0,
             transmissions: 8,
@@ -964,6 +1124,8 @@ mod tests {
             peak_queued_bytes: 100,
             links_after_settle: 1,
             delivered_by_origin: vec![1, 1],
+            unique_receptions_by_node: vec![2, 2],
+            unique_receptions: 4,
         };
         let row = m.csv_row();
         assert_eq!(row.lines().count(), 1);

@@ -18,7 +18,8 @@
 //! seal's sender to `origin`, verifies the origin signature and runs
 //! the replay guard before a `Deliver` is emitted. MSH-10 bounds
 //! relays with per-origin and per-neighbour token buckets and
-//! releases abusive links.
+//! releases abusive links. MSH-11 suppresses Broadcast and Presence
+//! floods with seeded assessment delays and neighbour copy counters.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -37,6 +38,7 @@ pub mod sign;
 #[cfg(feature = "sim")]
 pub mod sim;
 pub mod store;
+pub mod suppress;
 
 #[cfg(feature = "adapter")]
 pub use adapter::{AdapterEvent, NetworkAdapter};
@@ -49,6 +51,7 @@ pub use seen::{Offer, SeenCache, SeenConfig};
 pub use sign::{
     RelayOutcome, VerifyError, derive_msg_id, sign_packet, verify_for_relay, verify_origin,
 };
+pub use suppress::SuppressionConfig;
 
 // A signed hello must fit the opaque blob aoNetwork allows (NET-04's
 // MAX_APP_HELLO); this fails at compile time if the layout ever grows.

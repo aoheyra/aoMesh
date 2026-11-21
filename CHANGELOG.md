@@ -35,6 +35,19 @@ from 0.6833 to 0.7533 and stays near the 0.7825 no-flood control; details and
 seeds are in the README and ADR-0001. The flood scenarios are additive; the
 four refreshed baseline scenarios are not changed by this feature.
 
+MSH-11 adds counter-based suppression for Broadcast and Presence. A fresh
+content id waits a seeded, degree-scaled assessment window while distinct
+neighbour copies are counted; enough copies cancel the relay and the timer
+otherwise sends one copy with the class TTL. Pending state is bounded and
+evicted by deadline. `MeshConfig` gains a `suppression: SuppressionConfig`
+field, the simulator gains `Traffic::MixedBroadcast`, per-node reception
+metrics, `suppression_scenarios` and an `enforce_suppression` ablation switch.
+No wire field changes. Suppression only sees packets admitted by MSH-10, so a
+budget denial cannot start a timer or blame its carrier. On the seeded 50-node
+mixed case transmissions fall from 5801 to 3316 (42.84%) with the Direct
+delivery ratio unchanged at 0.2000; the Broadcast-reception diagnostic and
+seeds are in the README and ADR-0001.
+
 MSH-27 adds a deterministic SimWorld harness behind feature `sim`. It drives
 signed hellos, link events and the engine through the adapter across a 20-node
 line, a 50-node random waypoint network, a 100-node community network and a

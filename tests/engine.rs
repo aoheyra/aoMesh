@@ -4,7 +4,7 @@ mod common;
 use ao_idents::{Identity, ReplayConfig};
 use ao_mesh::{
     BudgetConfig, ClassRate, Header, MeshConfig, MeshEngine, MeshError, MeshHello, MeshInput,
-    MeshOutput, Packet, PacketClass, sign_packet, verify_origin,
+    MeshOutput, Packet, PacketClass, SuppressionConfig, sign_packet, verify_origin,
 };
 use ao_network::{AppHello, Channel, DisconnectReason, Hello, LinkId, LocalTag};
 use rand::{SeedableRng, rngs::StdRng};
@@ -1100,6 +1100,252 @@ fn unverified_senders_neither_forward_nor_receive() {
     };
     assert_eq!(*link, LinkId::new(3));
 }
+fn fast_suppression_engine(neighbors: usize, enabled: bool) -> MeshEngine<StdRng> {
+    MeshEngine::with_config(
+        StdRng::seed_from_u64(0xB11C),
+        MeshConfig {
+            max_neighbors: neighbors,
+            suppression: SuppressionConfig {
+                enabled,
+                min_k: 2,
+                k_at_degree_ref: 3,
+                degree_ref: 8,
+                min_base_delay_ms: 10,
+                max_base_delay_ms: 10,
+                min_delay_ms: 10,
+                max_delay_ms: 10,
+                ..SuppressionConfig::default()
+            },
+            ..MeshConfig::default()
+        },
+    )
+}
+
+#[test]
+fn submission_clamps_each_class_to_its_adr_ttl() {
+    let wire = signed_with(PacketClass::Broadcast, |h| h.ttl = 255, b"caps");
+    assert_eq!(Packet::decode(&wire).unwrap().header.ttl, 6);
+    let direct = signed_with(PacketClass::Direct, |h| h.ttl = 255, b"caps");
+    assert_eq!(Packet::decode(&direct).unwrap().header.ttl, 8);
+    let presence = signed_with(PacketClass::Presence, |h| h.ttl = 255, b"caps");
+    assert_eq!(Packet::decode(&presence).unwrap().header.ttl, 3);
+}
+
+#[test]
+fn broadcast_waits_for_its_timer_before_relaying_once() {
+    let mut e = fast_suppression_engine(2, true);
+    for id in 1..=2u64 {
+        e.handle(
+            id,
+            MeshInput::LinkUp {
+                link: LinkId::new(id),
+                remote_hello: hello(),
+            },
+        )
+        .unwrap();
+    }
+    let wire = signed(PacketClass::Broadcast, b"timer");
+    assert!(
+        e.handle(
+            100,
+            MeshInput::Data {
+                link: LinkId::new(1),
+                channel: Channel::Message,
+                payload: &wire,
+                identity: &LOCAL,
+            },
+        )
+        .unwrap()
+        .is_empty(),
+        "the first copy must wait"
+    );
+    assert!(e.handle(109, MeshInput::Tick).unwrap().is_empty());
+    let due = e.handle(110, MeshInput::Tick).unwrap();
+    let [MeshOutput::Send { link, payload, .. }] = due.as_slice() else {
+        panic!("expected one timed relay, {due:?}")
+    };
+    assert_eq!(*link, LinkId::new(2));
+    let decoded = Packet::decode(payload).unwrap();
+    assert_eq!(decoded.header.ttl, 5);
+    assert_eq!(decoded.header.hops, 1);
+    assert!(
+        e.handle(111, MeshInput::Tick).unwrap().is_empty(),
+        "a timer fires once"
+    );
+}
+
+#[test]
+fn distinct_neighbour_copies_cancel_a_broadcast_relay() {
+    let mut e = fast_suppression_engine(3, true);
+    for id in 1..=3u64 {
+        e.handle(
+            id,
+            MeshInput::LinkUp {
+                link: LinkId::new(id),
+                remote_hello: hello(),
+            },
+        )
+        .unwrap();
+    }
+    let wire = signed(PacketClass::Broadcast, b"three");
+    for (at, link) in [(100, 1), (101, 1), (102, 2), (103, 3)] {
+        let out = e
+            .handle(
+                at,
+                MeshInput::Data {
+                    link: LinkId::new(link),
+                    channel: Channel::Message,
+                    payload: &wire,
+                    identity: &LOCAL,
+                },
+            )
+            .unwrap();
+        assert!(
+            out.is_empty(),
+            "link {link} should not trigger a send: {out:?}"
+        );
+    }
+    assert!(
+        e.handle(1_000, MeshInput::Tick).unwrap().is_empty(),
+        "enough copies cancel the pending relay"
+    );
+}
+
+#[test]
+fn disabled_suppression_restores_immediate_flooding() {
+    let mut e = fast_suppression_engine(2, false);
+    for id in 1..=2u64 {
+        e.handle(
+            id,
+            MeshInput::LinkUp {
+                link: LinkId::new(id),
+                remote_hello: hello(),
+            },
+        )
+        .unwrap();
+    }
+    let wire = signed(PacketClass::Broadcast, b"ablation");
+    let sent = e
+        .handle(
+            100,
+            MeshInput::Data {
+                link: LinkId::new(1),
+                channel: Channel::Message,
+                payload: &wire,
+                identity: &LOCAL,
+            },
+        )
+        .unwrap();
+    assert_eq!(sent.len(), 1);
+    assert!(e.handle(101, MeshInput::Tick).unwrap().is_empty());
+}
+
+#[test]
+fn budget_denied_broadcast_and_presence_never_enter_suppression() {
+    for class in [PacketClass::Broadcast, PacketClass::Presence] {
+        let wire = signed(class, b"throttled");
+        let index = match class {
+            PacketClass::Broadcast => 1,
+            PacketClass::Presence => 2,
+            other => panic!("unexpected class {other:?}"),
+        };
+        let mut budgets = BudgetConfig::default();
+        // One byte short of the encoded packet with a one-hour bucket: even
+        // the first copy must be denied, so nothing may be scheduled.
+        budgets.rates[index] = ClassRate {
+            bytes_per_hour: (wire.len() - 1) as u64,
+            burst_seconds: 3600,
+        };
+        budgets.penalty_excess = 1;
+        budgets.penalty_release_at = 1;
+        let config = MeshConfig {
+            max_neighbors: 2,
+            budgets,
+            suppression: SuppressionConfig {
+                enabled: true,
+                min_base_delay_ms: 10,
+                max_base_delay_ms: 10,
+                min_delay_ms: 10,
+                max_delay_ms: 10,
+                ..SuppressionConfig::default()
+            },
+            ..MeshConfig::default()
+        };
+        let mut e = MeshEngine::with_config(StdRng::seed_from_u64(0xB11C), config);
+        for id in 1..=2u64 {
+            e.handle(
+                id,
+                MeshInput::LinkUp {
+                    link: LinkId::new(id),
+                    remote_hello: hello(),
+                },
+            )
+            .unwrap();
+        }
+        let out = e
+            .handle(
+                100,
+                MeshInput::Data {
+                    link: LinkId::new(1),
+                    channel: Channel::Message,
+                    payload: &wire,
+                    identity: &LOCAL,
+                },
+            )
+            .unwrap();
+        assert!(out.is_empty(), "{class:?} denial must not relay: {out:?}");
+        assert!(
+            e.handle(1_000, MeshInput::Tick).unwrap().is_empty(),
+            "{class:?} denial must not start a suppression timer"
+        );
+        assert_eq!(
+            e.budgets().penalty(LinkId::new(1)),
+            0,
+            "{class:?} origin denial must not blame the carrier"
+        );
+    }
+}
+
+#[test]
+fn tampered_broadcast_is_not_counted_as_a_suppression_copy() {
+    let mut e = fast_suppression_engine(3, true);
+    for id in 1..=3u64 {
+        e.handle(
+            id,
+            MeshInput::LinkUp {
+                link: LinkId::new(id),
+                remote_hello: hello(),
+            },
+        )
+        .unwrap();
+    }
+    let mut wire = signed(PacketClass::Broadcast, b"clean");
+    // Change content, not just the signature: the content address is what
+    // suppression keys on, so a forged address must never enter a timer.
+    let last = wire.len() - 1;
+    wire[last] ^= 0x01;
+    let out = e
+        .handle(
+            100,
+            MeshInput::Data {
+                link: LinkId::new(1),
+                channel: Channel::Message,
+                payload: &wire,
+                identity: &LOCAL,
+            },
+        )
+        .unwrap();
+    assert!(
+        out.is_empty(),
+        "a forged packet cannot suppress or relay: {out:?}"
+    );
+    assert!(e.handle(1_000, MeshInput::Tick).unwrap().is_empty());
+    assert_eq!(
+        e.neighbors().get(LinkId::new(1)).unwrap().rejected_packets,
+        1
+    );
+}
+
 #[test]
 fn the_origin_never_rerelays_a_copy_of_its_own_submission() {
     let mut e = engine(2);

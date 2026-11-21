@@ -5,10 +5,12 @@ use crate::deliver;
 use crate::forward::{self, Action};
 use crate::neighbor::{MeshConfig, NeighborTable};
 use crate::seen::{Offer, SeenCache};
+use crate::suppress::{self, Sighting, SuppressionTable};
 use crate::{Header, Packet, PacketError, sign_packet};
 use ao_idents::{IdentError, Identity, ReplayGuard, Signature};
 use ao_network::{AppHello, BeaconFlags, Channel, DisconnectReason, Hello, LinkId, LocalTag};
 use rand_core::RngCore;
+use std::collections::BTreeSet;
 
 /// One input. Borrowed payloads and identities remain owned by the caller.
 #[non_exhaustive]
@@ -43,8 +45,7 @@ pub enum MeshInput<'a> {
         /// delivers, and the engine retains no key.
         identity: &'a Identity,
     },
-    /// Time-driven step; baseline forwarding needs no timers (MSH-11
-    /// adds assessment delays).
+    /// Time-driven step; fires completed MSH-11 assessment timers.
     Tick,
     /// Originate a packet. This does not encrypt or deliver its payload.
     Submit {
@@ -146,17 +147,16 @@ impl std::error::Error for MeshError {}
 /// one forwarding dedupe cache at `SeenConfig::default()`'s documented
 /// bounds (ADR-0003), and the replay guard at `MeshConfig::replay`'s
 /// window times senders (65536 message ids at the default, about
-/// 1.5 MiB only if every slot holds one).
+/// 1.5 MiB only if every slot holds one), and at most
+/// `MeshConfig::suppression.max_entries` pending floods (MSH-11).
 pub struct MeshEngine<R: RngCore> {
-    // MSH-11's assessment delay consumes this injected RNG; MSH-08
-    // relays immediately, so nothing reads it yet.
-    #[allow(dead_code)]
     rng: R,
     config: MeshConfig,
     neighbors: NeighborTable,
     seen: SeenCache,
     replay: ReplayGuard,
     budgets: BudgetTracker,
+    suppression: SuppressionTable,
 }
 impl<R: RngCore> MeshEngine<R> {
     /// Creates an engine with the default limits (`MeshConfig::default`).
@@ -176,6 +176,7 @@ impl<R: RngCore> MeshEngine<R> {
             seen: SeenCache::default(),
             replay: ReplayGuard::new(config.replay),
             budgets,
+            suppression: SuppressionTable::new(config.suppression),
         }
     }
     /// Read-only bookkeeping, not a list of authenticated identities.
@@ -203,11 +204,13 @@ impl<R: RngCore> MeshEngine<R> {
     /// MSH-10 gates onward relays on both the origin and sender token
     /// buckets and releases a neighbour whose penalty crosses its
     /// threshold; local delivery is never suppressed by a budget.
-    /// Submission errors are typed and the caller still owns the input
-    /// bytes.
+    /// Broadcast and Presence use MSH-11's seeded assessment delay and
+    /// cancel their relay when enough distinct neighbours carried the
+    /// same content address. Submission errors are typed and the caller
+    /// still owns the input bytes.
     pub fn handle(&mut self, now: u64, input: MeshInput<'_>) -> Result<Vec<MeshOutput>, MeshError> {
         match input {
-            MeshInput::Tick => Ok(Vec::new()),
+            MeshInput::Tick => Ok(self.drain_due(now)),
             MeshInput::LinkUp { link, remote_hello } => {
                 if self.neighbors.contains(link) {
                     // A repeated LinkUp keeps the existing entry, counters
@@ -298,46 +301,74 @@ impl<R: RngCore> MeshEngine<R> {
                 if release {
                     return Ok(Self::release_if_penalised(link, true));
                 }
-                match forward::on_data(identity.node_id(), &mut self.seen, now, packet) {
-                    Action::Drop => Ok(Vec::new()),
-                    Action::Reject => {
-                        // A forged content address is attributable to the
-                        // link that carried it, unlike a duplicate or a
-                        // packet whose ttl simply ran out.
-                        self.neighbors.reject(link);
-                        if self
-                            .budgets
-                            .penalize(now, link, self.config.budgets.penalty_invalid)
-                        {
-                            return Ok(Self::release_if_penalised(link, true));
-                        }
-                        Ok(Vec::new())
-                    }
-                    Action::Deliver {
-                        header,
-                        signature,
-                        payload,
-                    } => match deliver::open_delivery(
-                        identity,
-                        &mut self.replay,
-                        now,
-                        &header,
-                        &signature,
-                        &payload,
-                    ) {
-                        Ok(plaintext) => {
-                            // Recording only after acceptance: a forgery
-                            // that fails the pipeline must not consume
-                            // the dedupe key the honest copy needs.
-                            let offer =
-                                self.seen.check_and_insert(now, header.class, header.msg_id);
-                            debug_assert_eq!(offer, Offer::Fresh, "forward peeked fresh");
-                            Ok(vec![MeshOutput::Deliver {
+                // Complete timers that expired while this packet was in
+                // flight before adding a new sighting for the same id.
+                let mut outputs = self.drain_due(now);
+                match packet.header.class {
+                    crate::PacketClass::Direct => {
+                        match forward::on_data(identity.node_id(), &mut self.seen, now, packet) {
+                            Action::Drop => {}
+                            Action::Reject => {
+                                // A forged content address is attributable to the
+                                // link that carried it, unlike a duplicate or a
+                                // packet whose ttl simply ran out.
+                                self.neighbors.reject(link);
+                                if self.budgets.penalize(
+                                    now,
+                                    link,
+                                    self.config.budgets.penalty_invalid,
+                                ) {
+                                    return Ok(Self::release_if_penalised(link, true));
+                                }
+                            }
+                            Action::Deliver {
                                 header,
-                                payload: plaintext,
-                            }])
+                                signature,
+                                payload,
+                            } => match deliver::open_delivery(
+                                identity,
+                                &mut self.replay,
+                                now,
+                                &header,
+                                &signature,
+                                &payload,
+                            ) {
+                                Ok(plaintext) => {
+                                    // Recording only after acceptance: a forgery
+                                    // that fails the pipeline must not consume
+                                    // the dedupe key the honest copy needs.
+                                    let offer = self.seen.check_and_insert(
+                                        now,
+                                        header.class,
+                                        header.msg_id,
+                                    );
+                                    debug_assert_eq!(offer, Offer::Fresh, "forward peeked fresh");
+                                    outputs.push(MeshOutput::Deliver {
+                                        header,
+                                        payload: plaintext,
+                                    });
+                                }
+                                Err(_) => {
+                                    self.neighbors.reject(link);
+                                    if self.budgets.penalize(
+                                        now,
+                                        link,
+                                        self.config.budgets.penalty_invalid,
+                                    ) {
+                                        return Ok(Self::release_if_penalised(link, true));
+                                    }
+                                }
+                            },
+                            Action::Relay { bytes } if outcome == BudgetOutcome::Admitted => {
+                                let mut senders = BTreeSet::new();
+                                senders.insert(link);
+                                outputs.extend(self.send_to_links(bytes, &senders));
+                            }
+                            Action::Relay { .. } => {}
                         }
-                        Err(_) => {
+                    }
+                    crate::PacketClass::Broadcast | crate::PacketClass::Presence => {
+                        if !suppress::content_valid(&packet) {
                             self.neighbors.reject(link);
                             if self
                                 .budgets
@@ -345,23 +376,65 @@ impl<R: RngCore> MeshEngine<R> {
                             {
                                 return Ok(Self::release_if_penalised(link, true));
                             }
-                            Ok(Vec::new())
+                            return Ok(outputs);
                         }
-                    },
-                    Action::Relay { bytes } if outcome == BudgetOutcome::Admitted => Ok(self
-                        .neighbors
-                        .iter()
-                        // Never send a packet back down the link it
-                        // arrived on, and never through an unverified one.
-                        .filter(|neighbor| neighbor.link != link && neighbor.node_id.is_some())
-                        .map(|neighbor| MeshOutput::Send {
-                            link: neighbor.link,
-                            channel: Channel::Message,
-                            payload: bytes.clone(),
-                        })
-                        .collect()),
-                    Action::Relay { .. } => Ok(Vec::new()),
+                        if outcome != BudgetOutcome::Admitted {
+                            return Ok(outputs);
+                        }
+                        let msg_id = packet.header.msg_id;
+                        let class = packet.header.class;
+                        if self.seen.is_duplicate(now, &msg_id) {
+                            return Ok(outputs);
+                        }
+                        let Some(relay) =
+                            suppress::relay_bytes(packet, self.config.suppression.ttl(class))
+                        else {
+                            let _ = self.seen.check_and_insert(now, class, msg_id);
+                            return Ok(outputs);
+                        };
+                        if !self.config.suppression.enabled {
+                            let _ = self.seen.check_and_insert(now, class, msg_id);
+                            let mut senders = BTreeSet::new();
+                            senders.insert(link);
+                            outputs.extend(self.send_to_links(relay, &senders));
+                            return Ok(outputs);
+                        }
+                        let degree = self
+                            .neighbors
+                            .iter()
+                            .filter(|neighbor| neighbor.node_id.is_some() && neighbor.link != link)
+                            .count();
+                        let threshold = self
+                            .config
+                            .suppression
+                            .copy_threshold(degree, &mut self.rng);
+                        let deadline_ms = now.saturating_add(
+                            self.config
+                                .suppression
+                                .assessment_delay(degree, &mut self.rng),
+                        );
+                        match self.suppression.observe(Sighting {
+                            now,
+                            msg_id,
+                            class,
+                            sender: link,
+                            threshold,
+                            deadline_ms,
+                            relay,
+                        }) {
+                            suppress::Observe::Pending => {}
+                            suppress::Observe::Suppressed => {
+                                let _ = self.seen.check_and_insert(now, class, msg_id);
+                            }
+                            suppress::Observe::RelayNow(due) => {
+                                let _ = self.seen.check_and_insert(now, class, msg_id);
+                                outputs.extend(self.send_to_links(due.bytes, &due.senders));
+                            }
+                        }
+                    }
+                    crate::PacketClass::Telemetry => {}
                 }
+                Ok(outputs)
             }
             MeshInput::Submit {
                 identity,
@@ -374,6 +447,11 @@ impl<R: RngCore> MeshEngine<R> {
                         return Err(MeshError::UnknownLink(link));
                     }
                 }
+                // ADR-0001's per-class hop limit applies to locally
+                // submitted packets as well as relays. Clamp before
+                // validation and signing so the signed header is the
+                // one that goes on the wire (MSH-11).
+                header.ttl = header.ttl.min(self.config.suppression.ttl(header.class));
                 // Reject caller mistakes before signing or allocating the wire packet.
                 Packet::new(header, Signature::from_bytes([0; 64]), payload)
                     .map_err(MeshError::Packet)?;
@@ -404,6 +482,34 @@ impl<R: RngCore> MeshEngine<R> {
                 }])
             }
         }
+    }
+
+    /// Fires completed MSH-11 assessment windows. A dedupe record is written
+    /// only when this node actually transmits, so a later copy can still
+    /// cancel nothing but will be recognised as a duplicate.
+    fn drain_due(&mut self, now: u64) -> Vec<MeshOutput> {
+        let due = self.suppression.take_due(now);
+        let mut outputs = Vec::new();
+        for entry in due {
+            let _ = self.seen.check_and_insert(now, entry.class, entry.msg_id);
+            outputs.extend(self.send_to_links(entry.bytes, &entry.senders));
+        }
+        outputs
+    }
+
+    /// Sends one relayed packet to every verified neighbour that did not
+    /// already carry a copy. `BTreeSet` keeps the exclusion set bounded and
+    /// deterministic, matching the MSH-10 link cap.
+    fn send_to_links(&self, bytes: Vec<u8>, senders: &BTreeSet<LinkId>) -> Vec<MeshOutput> {
+        self.neighbors
+            .iter()
+            .filter(|neighbor| neighbor.node_id.is_some() && !senders.contains(&neighbor.link))
+            .map(|neighbor| MeshOutput::Send {
+                link: neighbor.link,
+                channel: Channel::Message,
+                payload: bytes.clone(),
+            })
+            .collect()
     }
 
     fn release_if_penalised(link: LinkId, release: bool) -> Vec<MeshOutput> {

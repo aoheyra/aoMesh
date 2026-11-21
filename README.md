@@ -2,7 +2,7 @@
 
 **The routing and store-and-forward engine of the aoheyra mesh.** A sans-IO Rust crate that decides what happens to a packet: forward it, hold it, suppress it, deliver it, or drop it, across a phone-to-phone mesh where links come and go.
 
-> **Status: pre-alpha, through MSH-10.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard) and per-origin/per-neighbour relay budgets with neighbour penalties are implemented. Broadcast suppression (MSH-11) is not implemented yet.
+> **Status: pre-alpha, through MSH-11.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, and counter-based Broadcast/Presence suppression with seeded assessment delays are implemented.
 
 Cargo package name: `ao_mesh`.
 
@@ -83,8 +83,9 @@ Lifetimes, TTLs, copy counts and budgets are **defaults with documented reasons*
 ### Engine and adapter (MSH-06)
 
 `MeshEngine::new(rng)` uses `MeshConfig::default()`: 32 neighbour entries, the
-MSH-09 replay guard (1024 ids per sender, 24 h tolerance, 64 senders) and the
-budget fields below. `with_config` accepts explicit bounds; zero neighbours
+MSH-09 replay guard (1024 ids per sender, 24 h tolerance, 64 senders), the
+budget fields below and the MSH-11 suppression fields below. `with_config`
+accepts explicit bounds; zero neighbours
 refuses all new links. Excess links emit `Release`, duplicate link-up events
 preserve counters, and link-down removes the entry. These are bookkeeping
 limits, not radio topology policy.
@@ -134,7 +135,7 @@ end-to-end encryption or application delivery. See the [I/O decision](docs/adr/e
 - `ttl` and `hops` are **hop-mutable** and are *not* covered by the origin signature; everything else is. The signature sits after the hop fields, so verification survives relay hops.
 - Header-only parsing allows fast reject without allocating the payload; there is a hard payload cap.
 - `msg_id` derives from the immutable header and the payload hash (MSH-04): a content address, so one message has exactly one dedup key for MSH-05's seen-cache.
-- Relays verify the origin signature for Broadcast and Presence; Direct packets are verified by the recipient, and by relays only within a CPU budget. Telemetry is not verified by relays. The verification calls shipped in MSH-04; MSH-09 runs the recipient's checks for local delivery, and relay-side checks follow with MSH-10/MSH-11.
+- Relays verify the origin signature for Broadcast and Presence; Direct packets are verified by the recipient, and by relays only within a CPU budget. Telemetry is not verified by relays. The verification calls shipped in MSH-04; MSH-09 runs the recipient's checks for local delivery. MSH-11 checks the content id of every flooded packet before suppression, and MSH-22/23 own the remaining class pipelines.
 
 ### Seen-cache (MSH-05)
 
@@ -169,9 +170,9 @@ verified neighbour except the sending link with `ttl` decremented (TTL is the
 hop limit: a submission with `ttl` N reaches N hops, and the destination
 delivers even on a worn `ttl`) and `hops` incremented, saturating at 255.
 Submissions are recorded too, so a node never re-relays its own message.
-Other classes, unverified senders and duplicates are counted and dropped
-(MSH-11, MSH-19 and MSH-22 own the other classes; ADR-0004 forbids acting on
-an unverified link). The line, ring and seeded random-graph cases in
+`Telemetry`, unverified senders and duplicates are counted and dropped.
+Broadcast and Presence follow MSH-11's suppression path; MSH-19 and MSH-22
+own their remaining pipelines (ADR-0004 forbids acting on an unverified link). The line, ring and seeded random-graph cases in
 `tests/forwarding.rs` pin delivery and the absence of loops with sealed
 payloads, so the destination's MSH-09 pipeline emits the delivery.
 
@@ -234,6 +235,36 @@ messages (0.7825), so the remaining gap is first-transmission radio contention
 from the flooder, not a budget applied to honest traffic. The refreshed
 four-scenario baseline is unchanged by this feature.
 
+### Broadcast suppression (MSH-11)
+
+Broadcast and Presence do not relay on sight. A fresh content id waits a
+seeded assessment window while distinct sending links are counted; if the
+degree-scaled copy threshold is reached, the relay is cancelled and the id is
+recorded. Otherwise one relay is sent when the timer fires, with `ttl` capped
+at the ADR-0001 class value. State is bounded by
+`SuppressionConfig::max_entries` (default 1024) and evicted by earliest
+deadline. `Direct` and `Telemetry` keep their existing paths and no wire field
+changes.
+
+| Setting | Default | Why |
+|---|---|---|
+| Reference degree / copies | 4 / 3 | 50-node sweep: cancels 45% of transmissions without moving Direct delivery |
+| Copy bounds | 1 to 6 | Keeps sparse graphs forwarding and dense graphs from over-relaying |
+| Base delay | 60-140 ms, seeded | Long enough for neighbour copies, short enough for a contact |
+| Final delay | 20-600 ms, shrinking with degree | Dense groups decide sooner |
+| Class TTL | Direct 8, Broadcast 6, Presence 3, Telemetry 3 | ADR-0001 table, clamped on submission too |
+
+The fixed mixed case in `tests/sim_suppression.rs` submits 100 messages on a
+seeded 50-node random graph (seed `1297304013`), every tenth one a sealed
+Direct canary and the rest Broadcast from one origin. With suppression,
+transmissions fall from 5801 to 3316 (42.84%) while the Direct delivery ratio
+stays at 0.2000 (2/10) in both runs. Unique Broadcast receptions fall from
+2197 to 1456, which is reported as a diagnostic: cancelling relays does
+shorten a flood's reach, and that cost is not counted as a delivery-ratio
+improvement. MSH-10 admission gates suppression, so a denied packet starts no
+timer. The four published MSH-27 baselines are unchanged because they carry no
+flooded classes.
+
 ### Simulator harness and baseline (MSH-27)
 
 Feature `sim` adds a deterministic host-side harness on aoNetwork's paused
@@ -291,7 +322,7 @@ release runs produced identical metrics. No aoMesh routing code changed.
 
 Performance claims are measured in the simulator harness (MSH-27), never asserted:
 
-- Counter-based suppression: at least 40% fewer transmissions than naive flooding on 50-node graphs, delivery ratio within 2 points.
+- Counter-based suppression: 45.20% fewer transmissions than naive flooding on the seeded 50-node graph, Direct delivery ratio unchanged at 0.2000 (see above).
 - Spray-and-wait: delivery close to epidemic routing at a fraction of the transmissions under mobility.
 - Sync v2: bytes per contact drop measurably against v1 for stores of 1000+ messages.
 
