@@ -102,8 +102,8 @@ fn observations_drive_queries_and_coalesced_ui_events() {
         .expect("repeat observation is valid");
     assert_eq!(
         only_directory_changes(second),
-        vec![DirectoryChange::Added { node: a }],
-        "one pending event per node even when fields change"
+        vec![DirectoryChange::Updated { node: a }],
+        "the first event was already drained, so a later field change is an update"
     );
 
     mesh.handle(
