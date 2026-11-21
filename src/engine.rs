@@ -4,6 +4,7 @@ use crate::budget::{BudgetOutcome, BudgetTracker};
 use crate::deliver;
 use crate::forward::{self, Action};
 use crate::neighbor::{MeshConfig, NeighborTable};
+use crate::receipt::{self, ReceiptError};
 use crate::seen::{Offer, SeenCache};
 use crate::suppress::{self, Sighting, SuppressionTable};
 use crate::sync::{
@@ -166,6 +167,23 @@ pub enum MeshOutput {
         /// Link to release.
         link: LinkId,
     },
+    /// Remove a delivered message from the host store (MSH-17). The engine
+    /// owns immunity policy, but the host owns the bytes.
+    Purge {
+        /// Content address whose copies are no longer needed.
+        id: MessageId,
+    },
+    /// An authenticated delivery receipt reached its sender (MSH-17). The
+    /// host maps `origin` to its own identity to move sender status to
+    /// Delivered; the engine deliberately holds no key or user state.
+    Delivered {
+        /// The acknowledged message.
+        id: MessageId,
+        /// Original sender from the acknowledged packet.
+        origin: [u8; 16],
+        /// Authenticated destination that issued the receipt.
+        by: [u8; 16],
+    },
 }
 
 /// Submission failure; no packet is emitted on error.
@@ -177,6 +195,8 @@ pub enum MeshError {
     Signing(IdentError),
     /// The selected link has not been admitted to the neighbour table.
     UnknownLink(LinkId),
+    /// A locally generated receipt could not be signed or encoded.
+    Receipt(ReceiptError),
 }
 impl core::fmt::Display for MeshError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -184,6 +204,7 @@ impl core::fmt::Display for MeshError {
             Self::Packet(e) => write!(f, "invalid submission: {e}"),
             Self::Signing(e) => write!(f, "signing failed: {e}"),
             Self::UnknownLink(link) => write!(f, "unknown submission link: {link:?}"),
+            Self::Receipt(error) => write!(f, "receipt failed: {error}"),
         }
     }
 }
@@ -208,6 +229,7 @@ pub struct MeshEngine<R: RngCore> {
     beacon: BeaconTracker,
     sync: SyncTracker,
     spray: crate::spray::SprayTracker,
+    receipt: crate::receipt::ReceiptTracker,
 }
 impl<R: RngCore> MeshEngine<R> {
     /// Creates an engine with the default limits (`MeshConfig::default`).
@@ -231,6 +253,7 @@ impl<R: RngCore> MeshEngine<R> {
             beacon: BeaconTracker::new(config.summary),
             sync: SyncTracker::new(config.sync),
             spray: crate::spray::SprayTracker::new(config.spray),
+            receipt: crate::receipt::ReceiptTracker::new(config.receipt),
         }
     }
     /// Read-only bookkeeping, not a list of authenticated identities.
@@ -255,6 +278,11 @@ impl<R: RngCore> MeshEngine<R> {
     /// carry the same ticket the relay policy holds.
     pub fn spray_copies_left(&self, id: MessageId) -> u8 {
         self.spray.copies_left(id)
+    }
+    /// Whether an acknowledged id is immune from store re-sync (MSH-17).
+    #[cfg(feature = "sim")]
+    pub(crate) fn is_immune(&self, id: MessageId) -> bool {
+        self.receipt.is_immune(id)
     }
     /// Processes one input at caller-supplied milliseconds.
     ///
@@ -308,6 +336,7 @@ impl<R: RngCore> MeshEngine<R> {
             }
             MeshInput::Tick => {
                 let mut outputs = self.drain_due(now);
+                self.receipt.expire(now);
                 let actions = self.sync.expire(now);
                 outputs.extend(self.apply_sync_actions(now, actions));
                 Ok(outputs)
@@ -341,6 +370,15 @@ impl<R: RngCore> MeshEngine<R> {
                 };
                 let spray = self.config.spray.enabled && caps & crate::hello::CAP_SPRAY_V1 != 0;
                 self.spray.set_caps(link, caps);
+                self.receipt.set_caps(link, caps);
+                let mut outputs = Vec::new();
+                for payload in self.receipt.pending_for(link) {
+                    outputs.push(MeshOutput::Send {
+                        link,
+                        channel: Channel::Message,
+                        payload,
+                    });
+                }
                 let remote_digest = hello.map_or([0; 4], |hello| hello.store_digest);
                 let actions = if caps & crate::hello::CAP_SYNC_V2 != 0 {
                     self.sync.start_v2(now, link, remote_digest, spray)
@@ -349,13 +387,15 @@ impl<R: RngCore> MeshEngine<R> {
                 } else {
                     Vec::new()
                 };
-                Ok(self.apply_sync_actions(now, actions))
+                outputs.extend(self.apply_sync_actions(now, actions));
+                Ok(outputs)
             }
             MeshInput::LinkDown { link, .. } => {
                 self.neighbors.remove(link);
                 self.budgets.link_down(link);
                 self.sync.link_down(link);
                 self.spray.link_down(link);
+                self.receipt.link_down(link);
                 Ok(Vec::new())
             }
             MeshInput::Data {
@@ -439,6 +479,51 @@ impl<R: RngCore> MeshEngine<R> {
                             ));
                         }
                     }
+                }
+                // A receipt envelope is self-authenticating and cap-gated.
+                // It is parsed header-first, before any packet decode, and a
+                // stray or malformed one is attributable to the sending link.
+                if payload.first() == Some(&crate::receipt::RECEIPT_MAGIC) {
+                    if !self.receipt.supports(link) {
+                        self.neighbors.reject(link);
+                        return Ok(Self::release_if_penalised(
+                            link,
+                            self.budgets
+                                .penalize(now, link, self.config.budgets.penalty_invalid),
+                        ));
+                    }
+                    let verified = self
+                        .neighbors
+                        .get(link)
+                        .is_some_and(|neighbor| neighbor.node_id.is_some());
+                    if !verified {
+                        return Ok(Self::release_if_penalised(
+                            link,
+                            self.budgets.penalize(
+                                now,
+                                link,
+                                self.config.budgets.penalty_unverified,
+                            ),
+                        ));
+                    }
+                    return Ok(match crate::receipt::decode_frame(payload) {
+                        Ok(Some(frame)) => {
+                            self.neighbors.received(now, link, payload.len(), true);
+                            self.on_receipt(now, link, identity, frame)
+                        }
+                        Ok(None) => Vec::new(),
+                        Err(_) => {
+                            self.neighbors.reject(link);
+                            Self::release_if_penalised(
+                                link,
+                                self.budgets.penalize(
+                                    now,
+                                    link,
+                                    self.config.budgets.penalty_invalid,
+                                ),
+                            )
+                        }
+                    });
                 }
                 // A spray envelope is parsed header-first and never allocates
                 // its inner packet. It is only meaningful on a link that
@@ -580,6 +665,38 @@ impl<R: RngCore> MeshEngine<R> {
                                             copies_left: incoming_copies.unwrap_or(1),
                                         });
                                     }
+                                    if self.config.receipt.enabled {
+                                        let hash = crate::sign::payload_hash(&payload);
+                                        let receipt =
+                                            receipt::encode_ack(now, identity, &header, &hash)
+                                                .map_err(MeshError::Receipt)?;
+                                        let frame = match receipt::decode_frame(&receipt) {
+                                            Ok(Some(frame)) => frame,
+                                            Ok(None) | Err(_) => {
+                                                return Err(MeshError::Receipt(
+                                                    ReceiptError::BadAck,
+                                                ));
+                                            }
+                                        };
+                                        let _ = self.receipt.accept(now, &frame, None);
+                                        self.spray.forget(msg_id);
+                                        outputs.push(MeshOutput::Purge { id: msg_id });
+                                        let links: Vec<LinkId> = self
+                                            .neighbors
+                                            .iter()
+                                            .filter(|neighbor| self.receipt.supports(neighbor.link))
+                                            .map(|neighbor| neighbor.link)
+                                            .collect();
+                                        for link in links {
+                                            for payload in self.receipt.pending_for(link) {
+                                                outputs.push(MeshOutput::Send {
+                                                    link,
+                                                    channel: Channel::Message,
+                                                    payload,
+                                                });
+                                            }
+                                        }
+                                    }
                                 }
                                 Err(_) => {
                                     self.neighbors.reject(link);
@@ -593,6 +710,12 @@ impl<R: RngCore> MeshEngine<R> {
                                 }
                             },
                             Action::Relay { bytes } if outcome == BudgetOutcome::Admitted => {
+                                // An acknowledged id must not be forwarded or
+                                // re-stored, even if an old spray copy arrives
+                                // after its receipt on another contact.
+                                if self.receipt.is_immune(msg_id) {
+                                    return Ok(Vec::new());
+                                }
                                 if self.config.spray.enabled && incoming_copies.is_some() {
                                     self.spray.observe(
                                         now,
@@ -799,6 +922,46 @@ impl<R: RngCore> MeshEngine<R> {
         }
     }
 
+    /// Applies an authenticated receipt: purge locally, report sender status
+    /// only to the origin, stop spraying the delivered id and gossip the
+    /// receipt to other capable links.
+    fn on_receipt(
+        &mut self,
+        now: u64,
+        sender: LinkId,
+        identity: &Identity,
+        frame: crate::receipt::ReceiptFrame<'_>,
+    ) -> Vec<MeshOutput> {
+        if !self.receipt.accept(now, &frame, Some(sender)) {
+            return Vec::new();
+        }
+        self.spray.forget(frame.msg_id);
+        let mut outputs = vec![MeshOutput::Purge { id: frame.msg_id }];
+        if frame.origin == *identity.node_id().as_bytes() {
+            outputs.push(MeshOutput::Delivered {
+                id: frame.msg_id,
+                origin: frame.origin,
+                by: frame.signer,
+            });
+        }
+        let links: Vec<LinkId> = self
+            .neighbors
+            .iter()
+            .filter(|neighbor| self.receipt.supports(neighbor.link))
+            .map(|neighbor| neighbor.link)
+            .collect();
+        for link in links {
+            for payload in self.receipt.pending_for(link) {
+                outputs.push(MeshOutput::Send {
+                    link,
+                    channel: Channel::Message,
+                    payload,
+                });
+            }
+        }
+        outputs
+    }
+
     /// Fires completed MSH-11 assessment windows. A dedupe record is written
     /// only when this node actually transmits, so a later copy can still
     /// cancel nothing but will be recognised as a duplicate.
@@ -848,9 +1011,9 @@ impl<R: RngCore> MeshEngine<R> {
                     let prefixes: Vec<_> = prefixes
                         .into_iter()
                         .filter(|prefix| {
-                            self.sync
-                                .local_id_for_prefix(*prefix)
-                                .is_none_or(|id| self.spray.can_sync(id, peer))
+                            self.sync.local_id_for_prefix(*prefix).is_none_or(|id| {
+                                !self.receipt.is_immune(id) && self.spray.can_sync(id, peer)
+                            })
                         })
                         .collect();
                     if !prefixes.is_empty() {
@@ -863,6 +1026,9 @@ impl<R: RngCore> MeshEngine<R> {
                     wire,
                     copies_left,
                 } => {
+                    if self.receipt.is_immune(id) {
+                        continue;
+                    }
                     if self.config.spray.enabled && copies_left > 1 {
                         if let Ok(header) = crate::Header::decode(&wire) {
                             if header.class == crate::PacketClass::Direct {

@@ -39,23 +39,38 @@ const MSG_ID_TAG: u8 = 0x02;
 /// `header.payload_len`, so a packet that cannot be built cannot derive an
 /// ID either.
 pub fn derive_msg_id(header: &Header, payload: &[u8]) -> MessageId {
+    derive_msg_id_from_hash(header, &payload_hash(payload))
+}
+
+/// Hashes a payload with the one domain/tag pair used by [`derive_msg_id`].
+pub(crate) fn payload_hash(payload: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(MSG_ID_DOMAIN.as_bytes());
+    hasher.update(&[PAYLOAD_HASH_TAG]);
+    hasher.update(payload);
+    let digest = hasher.finalize();
+    let mut out = [0; 32];
+    out.copy_from_slice(digest.as_bytes());
+    out
+}
+
+/// Derives a `MessageId` when the payload hash is already known.
+///
+/// Receipts carry the original header and payload hash instead of the whole
+/// payload, so relays can re-derive the acknowledged id without retaining
+/// application bytes. This is the same single derivation as
+/// [`derive_msg_id`], not a second hashing policy.
+pub(crate) fn derive_msg_id_from_hash(header: &Header, payload_hash: &[u8]) -> MessageId {
+    debug_assert_eq!(payload_hash.len(), blake3::OUT_LEN);
     let mut prefix = [0u8; MAX_IMMUTABLE_LEN];
     let n = header.encode_immutable_into(&mut prefix);
     prefix[MSG_ID_OFFSET..MSG_ID_OFFSET + MSG_ID_LEN].fill(0);
-
-    let payload_hash = {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(MSG_ID_DOMAIN.as_bytes());
-        hasher.update(&[PAYLOAD_HASH_TAG]);
-        hasher.update(payload);
-        hasher.finalize()
-    };
 
     let mut hasher = blake3::Hasher::new();
     hasher.update(MSG_ID_DOMAIN.as_bytes());
     hasher.update(&[MSG_ID_TAG]);
     hasher.update(&prefix[..n]);
-    hasher.update(payload_hash.as_bytes());
+    hasher.update(payload_hash);
     let hash = hasher.finalize();
     let mut id = [0u8; MSG_ID_LEN];
     id.copy_from_slice(&hash.as_bytes()[..MSG_ID_LEN]);

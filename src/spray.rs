@@ -247,6 +247,11 @@ impl SprayTracker {
         self.entries.get(&id).map_or(1, |entry| entry.copies_left)
     }
 
+    /// Stops spraying an id once a delivery receipt has purged it.
+    pub(crate) fn forget(&mut self, id: MessageId) {
+        self.entries.remove(&id);
+    }
+
     /// Whether a contact may carry this id to `peer`. The destination always
     /// receives a copy; other peers only receive one while the spray phase
     /// is active.

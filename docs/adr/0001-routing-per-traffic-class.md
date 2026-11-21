@@ -267,3 +267,35 @@ while spraying uses 186 transmissions against 193. Earlier sweeps with 8 and
 64 tickets delivered far below flooding, so the default moved from the ADR's
 original six-copy estimate to 255; the published MSH-27 rows remain the
 relay-only reference.
+
+## MSH-17 implementation
+
+Three designs were compared for the delivery acknowledgement. A fifth packet
+class would force changes to budgets, suppression, seen lifetimes, store class
+indexes and relay verification policy for no routing benefit. An aoIdents
+`SignedBlob` would reuse an IDN registry row whose documented purpose is
+presence and channels, and would need a sibling ADR and tag change. Trusting a
+receipt only from the directly connected neighbour cannot purge the rest of a
+spray tree. We chose an additive control envelope carrying a normal signed
+Direct packet, the acker's full `PublicIdentity`, the original header and the
+original payload hash. This stays inside the registered packet signature domain,
+lets every relay verify the signer is the true destination without a directory,
+and leaves the packet header untouched. It is cap-gated with
+`CAP_RECEIPT_V1` (`1 << 3`) and legacy peers receive no receipt bytes.
+
+The immunity list is a bounded LRU-like map (512 ids, five minutes) rather than
+an unbounded set or a replay-guard extension. Memory is bounded by configuration
+and every entry is deterministic: expiry is relative to local receipt time, and
+eviction chooses the earliest expiry then the id order. Hosts remain the store
+owner: the engine emits `Purge` and `Delivered` outputs and never holds a store
+or key. An immune id is also dropped from the spray relay and sync paths; without
+that check, an old spray ticket can re-store a copy after its receipt was
+accepted.
+
+The paired report fixes seeds and uses spray in both rows so stores are
+populated. With seed `1297303584` on line-20, receipts purge all 206 copies and
+the slowest purge takes 1,550 ms; with seed `1297303752` on scripted-200,
+receipts purge all 1,341 copies and the slowest purge takes 1,750 ms. Both
+ablations retain their copies (`206` and `1,436`), so the purge is attributable
+to MSH-17. The regression gate `tests/sim_receipts.rs` requires zero remaining
+copies and a purge latency below ten seconds.

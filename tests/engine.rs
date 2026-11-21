@@ -4,7 +4,8 @@ mod common;
 use ao_idents::{Identity, ReplayConfig};
 use ao_mesh::{
     BudgetConfig, ClassRate, Header, MeshConfig, MeshEngine, MeshError, MeshHello, MeshInput,
-    MeshOutput, Packet, PacketClass, SprayConfig, SuppressionConfig, sign_packet, verify_origin,
+    MeshOutput, Packet, PacketClass, ReceiptConfig, SprayConfig, SuppressionConfig, sign_packet,
+    verify_origin,
 };
 use ao_network::{AppHello, Channel, DisconnectReason, Hello, LinkId, LocalTag};
 use rand::{SeedableRng, rngs::StdRng};
@@ -16,13 +17,18 @@ use std::sync::LazyLock;
 /// `header()` stamps nor the `[1; 32]` sender the helpers build.
 static LOCAL: LazyLock<Identity> = LazyLock::new(|| Identity::from_seed([3; 32]));
 
-/// MSH-16's spray store events are exercised in their own tests; the
-/// forwarding pipeline assertions here stay relay-only (MSH-08).
+/// MSH-16's spray store events and MSH-17's receipt events are exercised in
+/// their own tests; the forwarding pipeline assertions here stay relay-only
+/// (MSH-08).
 fn no_spray_config() -> MeshConfig {
     MeshConfig {
         spray: SprayConfig {
             enabled: false,
             ..SprayConfig::default()
+        },
+        receipt: ReceiptConfig {
+            enabled: false,
+            ..ReceiptConfig::default()
         },
         ..MeshConfig::default()
     }

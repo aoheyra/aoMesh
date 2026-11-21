@@ -23,9 +23,9 @@
 
 use crate::store::{MemoryStore, MessageStore, StoreLimits, StoreMetadata, StoredMessage};
 use crate::{
-    CAP_SYNC_V1, CAPS, Header, MeshConfig, MeshEngine, MeshHello, MeshInput, MeshOutput, MessageId,
-    NetworkAdapter, Packet, PacketClass, SHORT_ID_BYTES, SYNC_MAGIC, SYNC_V2_VERSION, StoreSummary,
-    SuppressionConfig, SyncOffer, derive_msg_id, sign_packet,
+    CAP_RECEIPT_V1, CAP_SYNC_V1, CAPS, Header, MeshConfig, MeshEngine, MeshHello, MeshInput,
+    MeshOutput, MessageId, NetworkAdapter, Packet, PacketClass, SHORT_ID_BYTES, SYNC_MAGIC,
+    SYNC_V2_VERSION, StoreSummary, SuppressionConfig, SyncOffer, derive_msg_id, sign_packet,
 };
 use ao_idents::{Identity, SealedMessage};
 use ao_network::{
@@ -167,6 +167,11 @@ pub struct Scenario {
     /// The published MSH-27 baselines keep this false so they remain the
     /// relay-only MSH-08 reference; spray gets its own paired report.
     pub spray: bool,
+    /// Whether signed receipts and store purges are enabled (MSH-17).
+    ///
+    /// Ablation runs keep this false so the effect of receipts can be
+    /// measured without changing any other engine behaviour.
+    pub receipts: bool,
     /// Suppression bounds and timer parameters under test.
     pub suppression: SuppressionConfig,
 }
@@ -226,6 +231,32 @@ pub struct Metrics {
     ///
     /// Not part of the CSV report.
     pub unique_receptions: u64,
+    /// Store evictions caused by authenticated delivery receipts.
+    ///
+    /// Not part of the CSV report; MSH-17 uses it with `remaining_copies`.
+    pub purges: u64,
+    /// Authenticated receipts that reached their origin.
+    ///
+    /// Not part of the CSV report; this is the sender's Delivered status.
+    pub delivery_receipts: u64,
+    /// Stored copies still present when the scenario ends.
+    ///
+    /// Not part of the CSV report; includes messages that were never
+    /// delivered, for which no receipt can exist.
+    pub remaining_copies: usize,
+    /// Stored copies of delivered messages still present at the end.
+    ///
+    /// Not part of the CSV report; zero is the MSH-17 purge requirement.
+    pub remaining_delivered_copies: usize,
+    /// Of the remaining delivered copies, how many sit at nodes that already
+    /// hold the receipt. Non-zero means the host did not honour its purge.
+    ///
+    /// Not part of the CSV report; a diagnosis field for MSH-17.
+    pub remaining_delivered_copies_immune: usize,
+    /// Slowest interval from first delivery to an empty store set.
+    ///
+    /// Not part of the CSV report; bounded by the MSH-02 immunity lifetime.
+    pub max_purge_latency_ms: u64,
 }
 
 impl Metrics {
@@ -276,6 +307,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             enforce_budgets: true,
             enforce_suppression: true,
             spray: false,
+            receipts: false,
             suppression: SuppressionConfig::default(),
         },
         Scenario {
@@ -294,6 +326,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             enforce_budgets: true,
             enforce_suppression: true,
             spray: false,
+            receipts: false,
             suppression: SuppressionConfig::default(),
         },
         Scenario {
@@ -312,6 +345,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             enforce_budgets: true,
             enforce_suppression: true,
             spray: false,
+            receipts: false,
             suppression: SuppressionConfig::default(),
         },
         Scenario {
@@ -328,6 +362,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             enforce_budgets: true,
             enforce_suppression: true,
             spray: false,
+            receipts: false,
             suppression: SuppressionConfig::default(),
         },
     ]
@@ -359,6 +394,7 @@ pub fn flood_scenarios() -> Vec<Scenario> {
         enforce_budgets: true,
         enforce_suppression: true,
         spray: false,
+        receipts: false,
         suppression: SuppressionConfig::default(),
     }]
 }
@@ -389,6 +425,7 @@ pub fn suppression_scenarios() -> Vec<Scenario> {
         enforce_budgets: true,
         enforce_suppression: true,
         spray: false,
+        receipts: false,
         suppression: SuppressionConfig::default(),
     }]
 }
@@ -413,6 +450,7 @@ pub fn spray_scenarios() -> Vec<Scenario> {
         enforce_budgets: true,
         enforce_suppression: true,
         spray: false,
+        receipts: false,
         suppression: SuppressionConfig::default(),
     };
     let scripted = Scenario {
@@ -429,6 +467,7 @@ pub fn spray_scenarios() -> Vec<Scenario> {
         enforce_budgets: true,
         enforce_suppression: true,
         spray: false,
+        receipts: false,
         suppression: SuppressionConfig::default(),
     };
     vec![
@@ -436,12 +475,70 @@ pub fn spray_scenarios() -> Vec<Scenario> {
         Scenario {
             name: "spray-enabled-line-20",
             spray: true,
+            receipts: false,
             ..line
         },
         scripted.clone(),
         Scenario {
             name: "spray-enabled-scripted-200",
             spray: true,
+            receipts: false,
+            ..scripted
+        },
+    ]
+}
+
+/// MSH-17's paired store-purge case.
+///
+/// Both rows use spray so their stores are actually populated; the only
+/// difference is the receipt bit. This isolates bounded immunity gossip from
+/// the MSH-16 delivery measurements, whose published rows stay unchanged.
+pub fn receipt_scenarios() -> Vec<Scenario> {
+    let line = Scenario {
+        name: "receipt-relay-line-20",
+        seed: 1_297_303_584,
+        nodes: 20,
+        topology: Topology::Line,
+        mobility: Mobility::Static,
+        settle: Duration::from_secs(30),
+        run: Duration::from_secs(30),
+        messages: 20,
+        payload_len: 128,
+        traffic: Traffic::Balanced,
+        enforce_budgets: true,
+        enforce_suppression: true,
+        spray: true,
+        receipts: false,
+        suppression: SuppressionConfig::default(),
+    };
+    let scripted = Scenario {
+        name: "receipt-relay-scripted-200",
+        seed: 1_297_303_752,
+        nodes: 200,
+        topology: Topology::Scripted(scripted_contacts(200)),
+        mobility: Mobility::Scripted,
+        settle: Duration::from_secs(60),
+        run: Duration::from_secs(90),
+        messages: 100,
+        payload_len: 128,
+        traffic: Traffic::Balanced,
+        enforce_budgets: true,
+        enforce_suppression: true,
+        spray: true,
+        receipts: false,
+        suppression: SuppressionConfig::default(),
+    };
+    vec![
+        line.clone(),
+        Scenario {
+            name: "receipt-enabled-line-20",
+            receipts: true,
+            ..line
+        },
+        scripted.clone(),
+        Scenario {
+            name: "receipt-enabled-scripted-200",
+            receipts: true,
             ..scripted
         },
     ]
@@ -516,6 +613,12 @@ pub struct Simulation {
     received_ids: Vec<BTreeSet<MessageId>>,
     origin_index: BTreeMap<[u8; 16], usize>,
     links_after_settle: usize,
+    receipts: u64,
+    purges: u64,
+    store_holders: BTreeMap<MessageId, BTreeSet<usize>>,
+    first_delivery_ms: BTreeMap<MessageId, u64>,
+    purge_latencies: Vec<u64>,
+    purge_recorded: BTreeSet<MessageId>,
 }
 
 impl Simulation {
@@ -554,6 +657,7 @@ impl Simulation {
             let mut engine_config = MeshConfig::default();
             engine_config.budgets.enforce = scenario.enforce_budgets;
             engine_config.spray.enabled = scenario.spray;
+            engine_config.receipt.enabled = scenario.receipts;
             engine_config.suppression = SuppressionConfig {
                 enabled: scenario.enforce_suppression,
                 ..scenario.suppression
@@ -572,8 +676,13 @@ impl Simulation {
                 out.copy_from_slice(&t[..16]);
                 LocalTag::new(out)
             };
-            let signed =
-                MeshHello::sign(&identity, [0; 8], store_digest).expect("fixed identity signs");
+            let caps = if scenario.receipts {
+                CAPS
+            } else {
+                CAPS & !CAP_RECEIPT_V1
+            };
+            let signed = MeshHello::sign_with_caps(&identity, [0; 8], store_digest, caps)
+                .expect("fixed identity signs");
             let applied = adapter.apply(
                 world.now(),
                 vec![
@@ -678,6 +787,12 @@ impl Simulation {
             received_ids: vec![BTreeSet::new(); n],
             origin_index,
             links_after_settle: 0,
+            receipts: 0,
+            purges: 0,
+            store_holders: BTreeMap::new(),
+            first_delivery_ms: BTreeMap::new(),
+            purge_latencies: Vec::new(),
+            purge_recorded: BTreeSet::new(),
         };
         sim.apply_ranges();
         sim
@@ -751,6 +866,30 @@ impl Simulation {
         self.radio_bytes_run = 0;
     }
 
+    fn remove_store_holder(&mut self, id: MessageId, node: usize, now_ms: u64) {
+        let mut empty = false;
+        if let Some(holders) = self.store_holders.get_mut(&id) {
+            holders.remove(&node);
+            empty = holders.is_empty();
+        }
+        if empty {
+            self.store_holders.remove(&id);
+            if !self.purge_recorded.contains(&id) {
+                if let Some(first) = self.first_delivery_ms.get(&id).copied() {
+                    self.purge_latencies.push(now_ms.saturating_sub(first));
+                    self.purge_recorded.insert(id);
+                }
+            }
+        }
+    }
+
+    fn purge_stored(&mut self, node: usize, now_ms: u64, id: MessageId) {
+        if self.stores[node].evict(&id).is_some() {
+            self.purges += 1;
+        }
+        self.remove_store_holder(id, node, now_ms);
+    }
+
     fn store_item(&mut self, node: usize, now_ms: u64, wire: &[u8], copies_left: u8) {
         let metadata = StoreMetadata {
             copies_left: copies_left.max(1),
@@ -763,7 +902,14 @@ impl Simulation {
         let Ok(message) = StoredMessage::new(wire, metadata) else {
             return;
         };
-        let _ = self.stores[node].put(now_ms, message);
+        let id = message.header().msg_id;
+        let evicted = self.stores[node].put(now_ms, message).unwrap_or_default();
+        for gone in evicted {
+            self.remove_store_holder(gone, node, now_ms);
+        }
+        if self.stores[node].get(now_ms, &id).is_some() {
+            self.store_holders.entry(id).or_default().insert(node);
+        }
     }
 
     fn refresh_store_summary(&mut self, node: usize, now: Duration, now_ms: u64) {
@@ -798,6 +944,7 @@ impl Simulation {
         for _ in 0..MAX_STORE_SERVICE_ROUNDS {
             let mut needs = Vec::new();
             let mut items = Vec::new();
+            let mut purges = Vec::new();
             for output in &pending {
                 match output {
                     MeshOutput::SyncNeed { link, prefixes } => {
@@ -808,6 +955,7 @@ impl Simulation {
                         wire,
                         copies_left,
                     } => items.push((*id, wire.clone(), *copies_left)),
+                    MeshOutput::Purge { id } => purges.push(*id),
                     _ => {}
                 }
             }
@@ -821,6 +969,12 @@ impl Simulation {
                 stored = true;
             }
             if stored {
+                self.refresh_store_summary(node, now, now_ms);
+            }
+            if !purges.is_empty() {
+                for id in purges {
+                    self.purge_stored(node, now_ms, id);
+                }
                 self.refresh_store_summary(node, now, now_ms);
             }
             let mut extra = Vec::new();
@@ -977,9 +1131,25 @@ impl Simulation {
                         if let Some(origin) = self.origin_index.get(&header.origin) {
                             self.delivered_by_origin[*origin] += 1;
                         }
+                        self.first_delivery_ms
+                            .entry(header.msg_id)
+                            .or_insert(now_ms);
+                        if self
+                            .store_holders
+                            .get(&header.msg_id)
+                            .is_none_or(BTreeSet::is_empty)
+                        {
+                            self.purge_latencies.push(0);
+                            self.purge_recorded.insert(header.msg_id);
+                        }
                     } else {
                         self.duplicate_deliveries += 1;
                     }
+                }
+                MeshOutput::Delivered { origin, .. }
+                    if self.origin_index.get(origin) == Some(&node) =>
+                {
+                    self.receipts += 1;
                 }
                 _ => {}
             }
@@ -1235,6 +1405,27 @@ impl Simulation {
             peak_queued_bytes: self.peak_queued_bytes,
             links_after_settle: self.links_after_settle,
             delivered_by_origin: self.delivered_by_origin,
+            purges: self.purges,
+            delivery_receipts: self.receipts,
+            remaining_copies: self.store_holders.values().map(BTreeSet::len).sum(),
+            remaining_delivered_copies: self
+                .store_holders
+                .iter()
+                .filter(|(id, _)| self.first_delivery_ms.contains_key(id))
+                .map(|(_, holders)| holders.len())
+                .sum(),
+            remaining_delivered_copies_immune: self
+                .store_holders
+                .iter()
+                .filter(|(id, _)| self.first_delivery_ms.contains_key(id))
+                .map(|(id, holders)| {
+                    holders
+                        .iter()
+                        .filter(|node| self.nodes[**node].adapter.engine().is_immune(*id))
+                        .count()
+                })
+                .sum(),
+            max_purge_latency_ms: self.purge_latencies.iter().copied().max().unwrap_or(0),
             unique_receptions_by_node: self
                 .received_ids
                 .iter()
@@ -1693,6 +1884,12 @@ mod tests {
             delivered_by_origin: vec![1, 1],
             unique_receptions_by_node: vec![2, 2],
             unique_receptions: 4,
+            purges: 2,
+            delivery_receipts: 1,
+            remaining_copies: 0,
+            remaining_delivered_copies: 0,
+            remaining_delivered_copies_immune: 0,
+            max_purge_latency_ms: 18,
         };
         let row = m.csv_row();
         assert_eq!(row.lines().count(), 1);
