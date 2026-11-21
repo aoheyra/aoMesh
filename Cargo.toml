@@ -84,3 +84,7 @@ required-features = ["sim"]
 [[example]]
 name = "channel_report"
 required-features = ["sim"]
+
+[[example]]
+name = "restart_report"
+required-features = ["sim"]

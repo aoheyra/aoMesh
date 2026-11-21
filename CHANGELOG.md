@@ -105,6 +105,14 @@ one hour with a 16 KiB input cap, 2048 MiB RSS limit and 10-second timeout.
 `tests/resource_bounds.rs` pins allocation and CPU-proxy ceilings with a
 counting allocator. The separate fuzz crate uses dev-only `libfuzzer-sys` and
 `rand`; core dependencies and the sans-IO boundary are unchanged.
+MSH-29 adds versioned restart snapshots through the `Snapshot` trait on
+`MeshEngine`. A host stores the bytes and restores them into a fresh engine with
+the same config and RNG seed; seen-cache entries and eviction order, receipt
+immunity and spray copy counters survive, while store content, clock, config and
+link capabilities stay host-owned. The format is bounded at 4 MiB, typed errors
+reject malformed or version-mismatched bytes atomically, and the fixed-seed
+line-20 report shows 14 post-restart re-relays without restore against zero with
+restore, with delivery unchanged at 20/20.
 
 MSH-17 adds signed delivery receipts and bounded store immunity. An
 authenticated delivery emits a cap-gated receipt envelope carrying a signed

@@ -30,6 +30,10 @@ const PAYLOAD_HASH_LEN: usize = 32;
 const SIGNER_OFFSET: usize = HEADER_LEN;
 const MAX_ORIGINAL_HEADER: usize = MAX_IMMUTABLE_LEN + 2;
 const MAX_ACK_PACKET: usize = 512;
+/// Largest receipt envelope an immunity entry can hold. The MSH-29 snapshot
+/// uses this to reject a hostile length before allocating the wire buffer.
+pub(crate) const MAX_RECEIPT_WIRE: usize =
+    HEADER_LEN + PUBLIC_IDENTITY_LEN + MAX_ORIGINAL_HEADER + PAYLOAD_HASH_LEN + MAX_ACK_PACKET;
 const MAX_GOSSIP_PER_CONTACT: usize = 16;
 const ACK_LIFETIME_S: u64 = 300;
 
@@ -270,10 +274,17 @@ impl Default for ReceiptConfig {
 }
 
 #[derive(Debug, Clone)]
-struct Immunity {
-    wire: Vec<u8>,
-    expires_at_ms: u64,
-    sent_to: BTreeSet<LinkId>,
+pub(crate) struct ImmunityEntry {
+    pub(crate) wire: Vec<u8>,
+    pub(crate) expires_at_ms: u64,
+    pub(crate) sent_to: BTreeSet<LinkId>,
+}
+
+/// The bounded state an MSH-29 snapshot carries. Link-specific capability
+/// bits are not included: the host re-announces live links after a restart.
+#[derive(Debug, Clone)]
+pub(crate) struct ImmunityState {
+    pub(crate) entries: BTreeMap<MessageId, ImmunityEntry>,
 }
 
 /// Deterministic, bounded immunity state owned by the sans-IO engine.
@@ -281,7 +292,7 @@ struct Immunity {
 pub struct ReceiptTracker {
     config: ReceiptConfig,
     caps: BTreeMap<LinkId, u32>,
-    entries: BTreeMap<MessageId, Immunity>,
+    entries: BTreeMap<MessageId, ImmunityEntry>,
 }
 
 impl ReceiptTracker {
@@ -293,6 +304,18 @@ impl ReceiptTracker {
             caps: BTreeMap::new(),
             entries: BTreeMap::new(),
         }
+    }
+
+    /// Copies the bounded immunity set into an MSH-29 snapshot payload.
+    pub(crate) fn export_state(&self) -> ImmunityState {
+        ImmunityState {
+            entries: self.entries.clone(),
+        }
+    }
+
+    /// Installs a validated snapshot, leaving link capabilities untouched.
+    pub(crate) fn import_state(&mut self, state: ImmunityState) {
+        self.entries = state.entries;
     }
 
     /// Records the capability set a link advertised in its signed hello.
@@ -355,7 +378,7 @@ impl ReceiptTracker {
         }
         self.entries.insert(
             frame.msg_id,
-            Immunity {
+            ImmunityEntry {
                 wire: frame.wire.to_vec(),
                 expires_at_ms: now.saturating_add(self.config.lifetime_s.saturating_mul(1_000)),
                 sent_to,

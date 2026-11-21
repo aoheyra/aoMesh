@@ -78,6 +78,17 @@ pub enum Offer {
     Duplicate,
 }
 
+/// The exact bounded state an MSH-29 snapshot carries.
+///
+/// Both structures are kept, including stale order slots: capacity eviction
+/// is defined in terms of the deque, so dropping a stale slot would change
+/// which recording is shed after a restart.
+#[derive(Debug)]
+pub(crate) struct SeenState {
+    pub(crate) entries: BTreeMap<MessageId, u64>,
+    pub(crate) order: VecDeque<MessageId>,
+}
+
 /// The forwarding dedupe cache (MSH-05), keyed by `msg_id`.
 ///
 /// Both bounds always hold: [`SeenCache::len`] never exceeds
@@ -134,6 +145,20 @@ impl SeenCache {
             order: VecDeque::with_capacity(config.capacity),
             config,
         }
+    }
+
+    /// Copies the bounded recordings and their order into snapshot state.
+    pub(crate) fn export_state(&self) -> SeenState {
+        SeenState {
+            entries: self.entries.clone(),
+            order: self.order.clone(),
+        }
+    }
+
+    /// Installs a validated snapshot without changing this cache's bounds.
+    pub(crate) fn import_state(&mut self, state: SeenState) {
+        self.entries = state.entries;
+        self.order = state.order;
     }
 
     /// Offers a packet's `msg_id` and reports whether it was already seen

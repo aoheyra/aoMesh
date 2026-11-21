@@ -463,8 +463,11 @@ impl<R: RngCore> MeshEngine<R> {
         &self.channels
     }
     /// Whether an acknowledged id is immune from store re-sync (MSH-17).
-    #[cfg(feature = "sim")]
-    pub(crate) fn is_immune(&self, id: MessageId) -> bool {
+    ///
+    /// Hosts can read this before re-offering a stored copy; it is policy
+    /// state, not message content or a key.
+    #[must_use]
+    pub fn is_immune(&self, id: MessageId) -> bool {
         self.receipt.is_immune(id)
     }
     /// Processes one input at caller-supplied milliseconds.
@@ -1954,4 +1957,30 @@ fn parse_channel_envelope(
         return Ok(None);
     }
     ChannelEnvelope::decode(payload).map(Some)
+}
+
+impl<R: RngCore> crate::snapshot::Snapshot for MeshEngine<R> {
+    fn snapshot(&self) -> Result<Vec<u8>, crate::snapshot::SnapshotError> {
+        crate::snapshot::encode_snapshot(
+            self.seen.export_state(),
+            self.receipt.export_state(),
+            self.spray.export_state(),
+        )
+    }
+
+    fn restore(&mut self, bytes: &[u8]) -> Result<(), crate::snapshot::SnapshotError> {
+        // Decode against this engine's bounds first: a snapshot from a
+        // differently configured host is rejected without partial state.
+        let (seen, immunity, spray) = crate::snapshot::decode_snapshot(
+            bytes,
+            self.seen.capacity(),
+            self.config.receipt.max_entries,
+            self.config.spray.max_entries,
+            self.config.max_neighbors,
+        )?;
+        self.seen.import_state(seen);
+        self.receipt.import_state(immunity);
+        self.spray.import_state(spray);
+        Ok(())
+    }
 }

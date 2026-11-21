@@ -624,3 +624,20 @@ exceed `StoreLimits`. The three `fuzz/` targets run nightly for one hour each
 with `libFuzzer` under AddressSanitizer; their dev-only dependencies are
 justified in the README. Core dependencies and the sans-IO boundary are
 unchanged.
+## Restart snapshot parameters (MSH-29)
+
+The snapshot carries routing bookkeeping only; it does not change any class
+mechanism or packet default above. The defaults are:
+
+| Setting | Default | Reason |
+|---|---|---|
+| Version | 1 | First format; a mismatch is rejected instead of guessed at |
+| Max bytes | 4 MiB | Above the ~1.85 MiB worst case of default bounds, small enough to bound host memory and reject oversized input |
+| Sections | seen, seen order, immunity, spray | Exactly the state that decides whether a restarted node re-relays, suppresses by receipt, or spends a copy |
+| Host-owned state | config, RNG, clock, store bytes, link caps | Keeps the core deterministic and avoids persisting another crate's session data |
+
+The default worst case is 4096 seen entries (id, class, expiry plus order slot),
+512 immunity entries (id, expiry, receipt wire, link set) and 4096 spray tickets.
+The paired report with seed `1297303584` on line-20 produced 5,374-byte
+snapshots and showed 14 post-restart re-relays without restore versus zero with
+restore, with delivery unchanged at 20/20.

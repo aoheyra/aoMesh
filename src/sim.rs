@@ -28,8 +28,8 @@ use crate::{
     CAP_PRESENCE_V1, CAP_RECEIPT_V1, CAP_SYNC_V1, CAPS, CHANNEL_MAGIC, ChannelEnvelope,
     DirectoryChange, Header, MeshConfig, MeshEngine, MeshHello, MeshInput, MeshOutput, MessageId,
     NetworkAdapter, Packet, PacketClass, PresenceConfig, RouteHintMode, SHORT_ID_BYTES, SYNC_MAGIC,
-    SYNC_V2_VERSION, StoreSummary, SuppressionConfig, SyncOffer, TelemetryConfig, TelemetryFrame,
-    TelemetryKind, derive_channel_id, derive_msg_id, sign_packet,
+    SYNC_V2_VERSION, Snapshot, StoreSummary, SuppressionConfig, SyncOffer, TelemetryConfig,
+    TelemetryFrame, TelemetryKind, derive_channel_id, derive_msg_id, sign_packet,
 };
 use ao_idents::{Identity, NodeId, SealedMessage};
 use ao_network::{
@@ -200,6 +200,22 @@ pub struct DirectoryPlan {
     pub observed_skew_ms: u64,
 }
 
+/// A mid-run engine restart (MSH-29).
+///
+/// The host snapshots every engine, drops it and constructs a new one with
+/// the same RNG seed and config. With `restore` set the snapshot is applied;
+/// the ablation discards it. Live links are re-announced with `MeshInput::LinkUp`
+/// because link capabilities are per-session and are not persisted. One
+/// previously relayed packet is replayed on each node immediately afterwards:
+/// that delayed copy is exactly what a lost seen-cache would re-relay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Restart {
+    /// Run-relative time of the restart.
+    pub at: Duration,
+    /// Whether the new engine receives the old engine's snapshot.
+    pub restore: bool,
+}
+
 /// One reproducible experiment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Scenario {
@@ -256,6 +272,8 @@ pub struct Scenario {
     pub directory: Option<DirectoryPlan>,
     /// Telemetry freshness, throttle and state bounds under test (MSH-22).
     pub telemetry: TelemetryConfig,
+    /// Mid-run engine restart, if this scenario exercises MSH-29.
+    pub restart: Option<Restart>,
 }
 
 /// Everything one run measured. Ratios are fractions, not percentages.
@@ -436,6 +454,18 @@ pub struct Metrics {
     ///
     /// Not part of the published MSH-27 CSV.
     pub channel_bytes: u64,
+    /// Bytes in the largest MSH-29 snapshot taken at the restart.
+    ///
+    /// Not part of the CSV report.
+    pub restart_snapshot_bytes: usize,
+    /// Message sends after the restart whose id this node had already sent.
+    ///
+    /// Not part of the CSV report; the MSH-29 replay signal must be zero.
+    pub restart_replays: u64,
+    /// All message sends after the restart, for context on `restart_replays`.
+    ///
+    /// Not part of the CSV report.
+    pub restart_sends_after: u64,
 }
 
 impl Metrics {
@@ -554,6 +584,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             presence_config: PresenceConfig::default(),
             directory: None,
             telemetry: TelemetryConfig::default(),
+            restart: None,
         },
         Scenario {
             name: "waypoint-50",
@@ -578,6 +609,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             presence_config: PresenceConfig::default(),
             directory: None,
             telemetry: TelemetryConfig::default(),
+            restart: None,
         },
         Scenario {
             name: "community-100",
@@ -602,6 +634,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             presence_config: PresenceConfig::default(),
             directory: None,
             telemetry: TelemetryConfig::default(),
+            restart: None,
         },
         Scenario {
             name: "scripted-200",
@@ -624,6 +657,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             presence_config: PresenceConfig::default(),
             directory: None,
             telemetry: TelemetryConfig::default(),
+            restart: None,
         },
     ]
 }
@@ -661,6 +695,7 @@ pub fn flood_scenarios() -> Vec<Scenario> {
         presence_config: PresenceConfig::default(),
         directory: None,
         telemetry: TelemetryConfig::default(),
+        restart: None,
     }]
 }
 
@@ -697,6 +732,7 @@ pub fn suppression_scenarios() -> Vec<Scenario> {
         presence_config: PresenceConfig::default(),
         directory: None,
         telemetry: TelemetryConfig::default(),
+        restart: None,
     }]
 }
 
@@ -733,6 +769,7 @@ pub fn channel_scenarios() -> Vec<Scenario> {
         presence_config: PresenceConfig::default(),
         directory: None,
         telemetry: TelemetryConfig::default(),
+        restart: None,
     }]
 }
 
@@ -763,6 +800,7 @@ pub fn spray_scenarios() -> Vec<Scenario> {
         presence_config: PresenceConfig::default(),
         directory: None,
         telemetry: TelemetryConfig::default(),
+        restart: None,
     };
     let scripted = Scenario {
         name: "spray-relay-scripted-200",
@@ -785,6 +823,7 @@ pub fn spray_scenarios() -> Vec<Scenario> {
         presence_config: PresenceConfig::default(),
         directory: None,
         telemetry: TelemetryConfig::default(),
+        restart: None,
     };
     vec![
         line.clone(),
@@ -831,6 +870,7 @@ pub fn receipt_scenarios() -> Vec<Scenario> {
         presence_config: PresenceConfig::default(),
         directory: None,
         telemetry: TelemetryConfig::default(),
+        restart: None,
     };
     let scripted = Scenario {
         name: "receipt-relay-scripted-200",
@@ -853,6 +893,7 @@ pub fn receipt_scenarios() -> Vec<Scenario> {
         presence_config: PresenceConfig::default(),
         directory: None,
         telemetry: TelemetryConfig::default(),
+        restart: None,
     };
     vec![
         line.clone(),
@@ -911,6 +952,7 @@ pub fn presence_scenarios() -> Vec<Scenario> {
         },
         directory: None,
         telemetry: TelemetryConfig::default(),
+        restart: None,
     }]
 }
 
@@ -950,6 +992,7 @@ pub fn telemetry_scenarios() -> Vec<Scenario> {
             rate_limit_ms: 0,
             ..TelemetryConfig::default()
         },
+        restart: None,
     };
     let chatty = Scenario {
         name: "telemetry-chatty-random-20",
@@ -976,6 +1019,7 @@ pub fn telemetry_scenarios() -> Vec<Scenario> {
         presence_config: PresenceConfig::default(),
         directory: None,
         telemetry: TelemetryConfig::default(),
+        restart: None,
     };
     vec![slow, chatty]
 }
@@ -1019,6 +1063,7 @@ pub fn directory_scenarios() -> Vec<Scenario> {
             observed_skew_ms: 5_000,
         }),
         telemetry: TelemetryConfig::default(),
+        restart: None,
     }]
 }
 
@@ -1051,6 +1096,7 @@ pub fn route_hint_scenarios() -> Vec<Scenario> {
         presence_config: PresenceConfig::default(),
         directory: None,
         telemetry: TelemetryConfig::default(),
+        restart: None,
     };
     let random = Scenario {
         name: "hint-spray-random-20",
@@ -1073,6 +1119,7 @@ pub fn route_hint_scenarios() -> Vec<Scenario> {
         presence_config: PresenceConfig::default(),
         directory: None,
         telemetry: TelemetryConfig::default(),
+        restart: None,
     };
     vec![
         line.clone(),
@@ -1096,6 +1143,52 @@ pub fn route_hint_scenarios() -> Vec<Scenario> {
             name: "hint-substitute-random-20",
             route_hint: RouteHintMode::SubstituteCopy,
             ..random
+        },
+    ]
+}
+
+/// MSH-29's paired restart case.
+///
+/// Both rows use the fixed line-20 seed, spray and receipts so all three
+/// snapshot sections are populated. Engines restart halfway through the run;
+/// only the `restore` bit differs, so the replay count is attributable to
+/// the snapshot rather than to topology, traffic or the RNG stream.
+pub fn restart_scenarios() -> Vec<Scenario> {
+    let base = Scenario {
+        name: "restart-lost-line-20",
+        seed: 1_297_303_584,
+        nodes: 20,
+        topology: Topology::Line,
+        mobility: Mobility::Static,
+        settle: Duration::from_secs(30),
+        run: Duration::from_secs(30),
+        messages: 20,
+        payload_len: 128,
+        traffic: Traffic::Balanced,
+        enforce_budgets: true,
+        enforce_suppression: true,
+        spray: true,
+        receipts: true,
+        route_hint: RouteHintMode::Off,
+        suppression: SuppressionConfig::default(),
+        presence: false,
+        presence_config: PresenceConfig::default(),
+        directory: None,
+        telemetry: TelemetryConfig::default(),
+        restart: Some(Restart {
+            at: Duration::from_secs(16),
+            restore: false,
+        }),
+    };
+    vec![
+        base.clone(),
+        Scenario {
+            name: "restart-restored-line-20",
+            restart: Some(Restart {
+                at: Duration::from_secs(16),
+                restore: true,
+            }),
+            ..base
         },
     ]
 }
@@ -1129,6 +1222,27 @@ fn next(state: &mut u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
+}
+
+fn engine_config(scenario: &Scenario) -> MeshConfig {
+    let mut config = MeshConfig::default();
+    config.budgets.enforce = scenario.enforce_budgets;
+    config.spray.enabled = scenario.spray;
+    config.receipt.enabled = scenario.receipts;
+    config.presence = PresenceConfig {
+        enabled: scenario.presence,
+        ..scenario.presence_config
+    };
+    if let Some(plan) = &scenario.directory {
+        config.directory = plan.config;
+    }
+    config.route_hint.mode = scenario.route_hint;
+    config.suppression = SuppressionConfig {
+        enabled: scenario.enforce_suppression,
+        ..scenario.suppression
+    };
+    config.telemetry = scenario.telemetry;
+    config
 }
 
 struct Node {
@@ -1203,6 +1317,13 @@ pub struct Simulation {
     channel_transmissions: u64,
     channel_bytes: u64,
     channel_subscribers: usize,
+    restart_done: bool,
+    restart_snapshot_bytes: usize,
+    restart_replays: u64,
+    restart_sends_after: u64,
+    sent_ids: Vec<BTreeSet<MessageId>>,
+    probe_wires: Vec<Option<(LinkId, Channel, Vec<u8>)>>,
+    link_hellos: Vec<BTreeMap<LinkId, Hello>>,
 }
 
 impl Simulation {
@@ -1245,24 +1366,7 @@ impl Simulation {
             card_hash.copy_from_slice(&digest.as_bytes()[8..16]);
             let identity = Identity::from_seed(seed);
             let engine_rng = EngineRng::seed_from_u64(scenario.seed ^ (i as u64 + 1));
-            let mut engine_config = MeshConfig::default();
-            engine_config.budgets.enforce = scenario.enforce_budgets;
-            engine_config.spray.enabled = scenario.spray;
-            engine_config.receipt.enabled = scenario.receipts;
-            engine_config.presence = PresenceConfig {
-                enabled: scenario.presence,
-                ..scenario.presence_config
-            };
-            if let Some(plan) = &scenario.directory {
-                engine_config.directory = plan.config;
-            }
-            engine_config.route_hint.mode = scenario.route_hint;
-            engine_config.suppression = SuppressionConfig {
-                enabled: scenario.enforce_suppression,
-                ..scenario.suppression
-            };
-            engine_config.telemetry = scenario.telemetry;
-            let mut engine = MeshEngine::with_config(engine_rng, engine_config);
+            let mut engine = MeshEngine::with_config(engine_rng, engine_config(&scenario));
             // Subscription is a local host declaration. Only configured
             // subscribers get one; relays keep an empty channel registry and
             // forward from the ordinary Broadcast path.
@@ -1487,6 +1591,13 @@ impl Simulation {
             channel_transmissions: 0,
             channel_bytes: 0,
             channel_subscribers,
+            restart_done: false,
+            restart_snapshot_bytes: 0,
+            restart_replays: 0,
+            restart_sends_after: 0,
+            sent_ids: vec![BTreeSet::new(); n],
+            probe_wires: vec![None; n],
+            link_hellos: vec![BTreeMap::new(); n],
         };
         sim.apply_ranges();
         sim
@@ -1733,23 +1844,31 @@ impl Simulation {
                         Poll::Pending => break,
                         Poll::Ready(event) => event,
                     };
-                    let (input, observed) = match &event {
-                        NetworkEvent::LinkUp { link, remote_hello } => (
-                            MeshInput::LinkUp {
-                                link: *link,
-                                remote_hello: remote_hello.clone(),
-                            },
-                            (None, None),
-                        ),
+                    let (input, received_id, telemetry, probe_source) = match &event {
+                        NetworkEvent::LinkUp { link, remote_hello } => {
+                            self.link_hellos[i].insert(*link, remote_hello.clone());
+                            (
+                                MeshInput::LinkUp {
+                                    link: *link,
+                                    remote_hello: remote_hello.clone(),
+                                },
+                                None,
+                                None,
+                                None,
+                            )
+                        }
                         NetworkEvent::LinkDown { link, reason } => {
                             self.pending[i].remove(link);
                             self.tx_last[i].remove(link);
+                            self.link_hellos[i].remove(link);
                             (
                                 MeshInput::LinkDown {
                                     link: *link,
                                     reason: *reason,
                                 },
-                                (None, None),
+                                None,
+                                None,
+                                None,
                             )
                         }
                         NetworkEvent::Data {
@@ -1757,32 +1876,36 @@ impl Simulation {
                             channel,
                             payload,
                         } => {
+                            let decoded = packet_bytes(payload)
+                                .and_then(|bytes| crate::Packet::decode(bytes).ok());
                             // Broadcast has no Deliver event yet. Count a
                             // structurally valid flooded packet as a unique
                             // reception at this node, once per content id.
                             // Telemetry has no Deliver either; its framed
                             // sequence is the only observable coalescing
                             // result at a receiver.
-                            let observed =
-                                crate::Packet::decode(payload)
-                                    .ok()
-                                    .and_then(|packet| match packet.header.class {
-                                        PacketClass::Broadcast | PacketClass::Presence => {
-                                            Some((Some(packet.header.msg_id), None))
-                                        }
-                                        PacketClass::Telemetry => TelemetryFrame::decode(
-                                            packet.payload,
-                                        )
+                            let telemetry = decoded
+                                .as_ref()
+                                .filter(|packet| packet.header.class == PacketClass::Telemetry)
+                                .and_then(|packet| {
+                                    TelemetryFrame::decode(packet.payload)
                                         .ok()
-                                        .map(|frame| {
-                                            (
-                                                None,
-                                                Some((packet.header.origin, frame.kind, frame.seq)),
-                                            )
-                                        }),
-                                        PacketClass::Direct => None,
-                                    });
-                            let (received_id, telemetry) = observed.unwrap_or((None, None));
+                                        .map(|frame| (packet.header.origin, frame.kind, frame.seq))
+                                });
+                            let received_id = decoded
+                                .as_ref()
+                                .filter(|packet| {
+                                    matches!(
+                                        packet.header.class,
+                                        PacketClass::Broadcast | PacketClass::Presence
+                                    )
+                                })
+                                .map(|packet| packet.header.msg_id);
+                            // The replay probe needs every class: Direct is
+                            // the traffic that actually fills a relay store.
+                            let probe_source = decoded
+                                .as_ref()
+                                .map(|packet| (*link, *channel, packet.header.msg_id));
                             (
                                 MeshInput::Data {
                                     link: *link,
@@ -1790,12 +1913,13 @@ impl Simulation {
                                     payload,
                                     identity: &self.identities[i],
                                 },
-                                (received_id, telemetry),
+                                received_id,
+                                telemetry,
+                                probe_source,
                             )
                         }
                         _ => continue,
                     };
-                    let (received_id, telemetry) = observed;
                     if let Some(id) = received_id {
                         self.received_ids[i].insert(id);
                     }
@@ -1809,6 +1933,9 @@ impl Simulation {
                         .engine_mut()
                         .handle(now_ms, input)
                         .expect("engine inputs are well formed");
+                    if let Some((link, channel, id)) = probe_source {
+                        self.capture_probe(i, link, channel, id, &outputs);
+                    }
                     self.count_outputs(i, now_ms, &outputs);
                     self.service_stores(i, now, now_ms, outputs.clone());
                     let events = self.nodes[i].adapter.apply(now, outputs);
@@ -1948,6 +2075,51 @@ impl Simulation {
         })
     }
 
+    /// Keeps one wire this node actually relayed, for the post-restart probe.
+    ///
+    /// A delayed copy of the same content is what a store-and-forward relay
+    /// sees when a peer repeats a packet after the engine comes back. The
+    /// probe is recorded only when the node put that id on the air, so the
+    /// restored and ablated rows differ solely in persisted state.
+    fn capture_probe(
+        &mut self,
+        node: usize,
+        link: LinkId,
+        channel: Channel,
+        id: MessageId,
+        outputs: &[MeshOutput],
+    ) {
+        if self.probe_wires[node].is_some() {
+            return;
+        }
+        for output in outputs {
+            let payload = match output {
+                MeshOutput::Send { payload, .. } | MeshOutput::Broadcast { payload, .. } => payload,
+                _ => continue,
+            };
+            if probe_id(payload) == Some(id) {
+                self.probe_wires[node] = Some((link, channel, payload.clone()));
+                return;
+            }
+        }
+    }
+
+    /// Tracks which ids this node has already put on the air so a restarted
+    /// engine can be checked for re-relays of the same content.
+    fn count_relay(&mut self, node: usize, payload: &[u8]) {
+        let Some(id) = probe_id(payload) else {
+            return;
+        };
+        if self.restart_done {
+            self.restart_sends_after += 1;
+            if self.sent_ids[node].contains(&id) {
+                self.restart_replays += 1;
+            }
+        } else {
+            let _ = self.sent_ids[node].insert(id);
+        }
+    }
+
     fn count_outputs(&mut self, node: usize, now_ms: u64, outputs: &[MeshOutput]) {
         for output in outputs {
             match output {
@@ -1966,6 +2138,7 @@ impl Simulation {
                         self.channel_transmissions += 1;
                         self.channel_bytes += payload.len() as u64;
                     }
+                    self.count_relay(node, payload);
                 }
                 MeshOutput::Broadcast { payload, .. } => {
                     let links = self.nodes[node].adapter.network().links();
@@ -1977,6 +2150,7 @@ impl Simulation {
                     for info in links {
                         *self.pending[node].entry(info.link).or_insert(0) += payload.len() as u64;
                     }
+                    self.count_relay(node, payload);
                 }
                 MeshOutput::TelemetrySend { link, payload, .. } => {
                     self.transmissions += 1;
@@ -2389,6 +2563,87 @@ impl Simulation {
         }
     }
 
+    /// Restarts every engine at a scenario checkpoint (MSH-29).
+    ///
+    /// The radio facade and its live links stay in place; only the engine is
+    /// replaced. The host snapshots all engines before mutating any of them,
+    /// so a snapshot failure cannot leave a half-restarted simulation. Links
+    /// are re-announced because their capability bits belong to the session,
+    /// not to the routing snapshot.
+    fn restart(&mut self) {
+        self.restart_done = true;
+        let now = self.world.now();
+        let now_ms = now.as_millis() as u64;
+        let restore = self.scenario.restart.is_some_and(|restart| restart.restore);
+        let n = self.nodes.len();
+        let mut snapshots = Vec::with_capacity(n);
+        for i in 0..n {
+            let bytes = self.nodes[i]
+                .adapter
+                .engine()
+                .snapshot()
+                .expect("engine state has a valid snapshot");
+            self.restart_snapshot_bytes = self.restart_snapshot_bytes.max(bytes.len());
+            snapshots.push(bytes);
+        }
+        let hellos = self.link_hellos.clone();
+        let probes = self.probe_wires.clone();
+        for i in 0..n {
+            let engine_rng = EngineRng::seed_from_u64(self.scenario.seed ^ (i as u64 + 1));
+            let mut engine = MeshEngine::with_config(engine_rng, engine_config(&self.scenario));
+            if restore {
+                engine
+                    .restore(&snapshots[i])
+                    .expect("a snapshot taken from this engine restores");
+            }
+            let _ = self.nodes[i].adapter.replace_engine(engine);
+
+            for (link, remote_hello) in &hellos[i] {
+                let outputs = self.nodes[i]
+                    .adapter
+                    .engine_mut()
+                    .handle(
+                        now_ms,
+                        MeshInput::LinkUp {
+                            link: *link,
+                            remote_hello: remote_hello.clone(),
+                        },
+                    )
+                    .expect("recorded link hello is well formed");
+                self.count_outputs(i, now_ms, &outputs);
+                let events = self.nodes[i].adapter.apply(now, outputs);
+                for event in events {
+                    if let crate::AdapterEvent::SendFailed { .. } = event {
+                        self.send_failures += 1;
+                    }
+                }
+            }
+
+            if let Some((link, channel, payload)) = probes[i].as_ref() {
+                let outputs = self.nodes[i]
+                    .adapter
+                    .engine_mut()
+                    .handle(
+                        now_ms,
+                        MeshInput::Data {
+                            link: *link,
+                            channel: *channel,
+                            payload,
+                            identity: &self.identities[i],
+                        },
+                    )
+                    .expect("a previously relayed wire is still well formed");
+                self.count_outputs(i, now_ms, &outputs);
+                let events = self.nodes[i].adapter.apply(now, outputs);
+                for event in events {
+                    if let crate::AdapterEvent::SendFailed { .. } = event {
+                        self.send_failures += 1;
+                    }
+                }
+            }
+        }
+    }
+
     /// Runs the full scenario and returns its metrics.
     pub fn run(mut self) -> Metrics {
         let settle_steps = (self.scenario.settle.as_millis() / TICK.as_millis()) as usize;
@@ -2426,6 +2681,14 @@ impl Simulation {
                 let target = (step + 1) * self.scenario.messages / submit_steps;
                 while (self.submitted as usize) < target {
                     self.submit_one(self.submitted as usize);
+                }
+            }
+            if !self.restart_done {
+                if let Some(restart) = self.scenario.restart {
+                    let now_ms = self.world.now().as_millis() as u64;
+                    if now_ms.saturating_sub(self.run_start_ms) >= restart.at.as_millis() as u64 {
+                        self.restart();
+                    }
                 }
             }
             self.pump(1);
@@ -2563,6 +2826,9 @@ impl Simulation {
             channel_delivered_ids: self.channel_delivered_ids,
             channel_transmissions: self.channel_transmissions,
             channel_bytes: self.channel_bytes,
+            restart_snapshot_bytes: self.restart_snapshot_bytes,
+            restart_replays: self.restart_replays,
+            restart_sends_after: self.restart_sends_after,
             unique_receptions_by_node: self
                 .received_ids
                 .iter()
@@ -2601,6 +2867,24 @@ fn is_channel_payload(wire: &[u8]) -> bool {
         packet.header.class == PacketClass::Broadcast
             && packet.payload.first() == Some(&CHANNEL_MAGIC)
     })
+}
+
+/// Returns the mesh packet inside an optional spray envelope.
+fn packet_bytes(payload: &[u8]) -> Option<&[u8]> {
+    if payload.first() == Some(&crate::SPRAY_MAGIC) && payload.len() >= 6 {
+        let len = u16::from_le_bytes([payload[4], payload[5]]) as usize;
+        payload.get(6..6 + len)
+    } else {
+        Some(payload)
+    }
+}
+
+/// Content address of one emitted message send, through a spray envelope if
+/// present. Control frames return `None` and never count as a replay.
+fn probe_id(payload: &[u8]) -> Option<MessageId> {
+    Packet::decode(packet_bytes(payload)?)
+        .ok()
+        .map(|packet| packet.header.msg_id)
 }
 
 fn near(a: (i64, i64), b: (i64, i64), radius: i64) -> bool {
@@ -3079,6 +3363,9 @@ mod tests {
             channel_delivered_ids: vec![BTreeSet::new(), BTreeSet::new()],
             channel_transmissions: 3,
             channel_bytes: 6_144,
+            restart_snapshot_bytes: 0,
+            restart_replays: 0,
+            restart_sends_after: 0,
         };
         let row = m.csv_row();
         assert_eq!(row.lines().count(), 1);

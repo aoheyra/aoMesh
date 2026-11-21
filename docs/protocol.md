@@ -609,6 +609,22 @@ locally: the directory's typed observations do not carry a signing key proved
 under the packet domain, so no signature check is relaxed. No new hello
 capability bit is required because old peers already treat the payload as
 opaque Broadcast bytes.
+## Restart snapshot bytes (MSH-29)
+
+MSH-29 defines a local host-owned snapshot, not a radio or peer protocol wire
+format. `MeshEngine::snapshot()` writes magic `AMSH`, a one-byte version
+(`SNAPSHOT_VERSION = 1`), four little-endian section counts, then
+BTreeMap-ordered sections for seen entries, seen eviction order, receipt
+immunity and spray tickets. Every integer is little-endian; receipt wires are
+stored verbatim and revalidated with the frame decoder on restore.
+
+The host stores the bytes, rebuilds the engine with the same config and RNG
+seed, calls `restore`, and re-announces live links with `MeshInput::LinkUp`.
+Link capabilities, config, clock and stored packets are deliberately not in the
+snapshot. `MAX_SNAPSHOT_LEN` is 4 MiB; bad magic, wrong version, oversized or
+truncated input, trailing bytes, count/bound mismatches, duplicate entries and
+invalid receipt wires produce a typed `SnapshotError` before any state changes.
+No packet header or sync frame changes, so this needs no hello capability bit.
 
 ## Simulation evidence (MSH-27)
 

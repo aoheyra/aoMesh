@@ -142,11 +142,18 @@ impl Default for SprayConfig {
 }
 
 #[derive(Debug, Clone)]
-struct Entry {
-    copies_left: u8,
-    destination: [u8; 16],
-    expires_at_ms: u64,
-    handed_to: BTreeSet<LinkId>,
+pub(crate) struct SprayEntry {
+    pub(crate) copies_left: u8,
+    pub(crate) destination: [u8; 16],
+    pub(crate) expires_at_ms: u64,
+    pub(crate) handed_to: BTreeSet<LinkId>,
+}
+
+/// The bounded state an MSH-29 snapshot carries. Link capabilities are not
+/// included: the host re-announces live links after a restart.
+#[derive(Debug, Clone)]
+pub(crate) struct SprayState {
+    pub(crate) entries: BTreeMap<MessageId, SprayEntry>,
 }
 
 /// Deterministic, bounded spray state owned by the sans-IO engine.
@@ -158,7 +165,7 @@ struct Entry {
 pub struct SprayTracker {
     config: SprayConfig,
     caps: BTreeMap<LinkId, u32>,
-    entries: BTreeMap<MessageId, Entry>,
+    entries: BTreeMap<MessageId, SprayEntry>,
 }
 
 impl SprayTracker {
@@ -170,6 +177,18 @@ impl SprayTracker {
             caps: BTreeMap::new(),
             entries: BTreeMap::new(),
         }
+    }
+
+    /// Copies the bounded ticket set into an MSH-29 snapshot payload.
+    pub(crate) fn export_state(&self) -> SprayState {
+        SprayState {
+            entries: self.entries.clone(),
+        }
+    }
+
+    /// Installs a validated snapshot, leaving link capabilities untouched.
+    pub(crate) fn import_state(&mut self, state: SprayState) {
+        self.entries = state.entries;
     }
 
     /// Records the capability set a link advertised in its signed hello.
@@ -227,7 +246,7 @@ impl SprayTracker {
         }
         self.entries.insert(
             id,
-            Entry {
+            SprayEntry {
                 copies_left: copies,
                 destination,
                 expires_at_ms,

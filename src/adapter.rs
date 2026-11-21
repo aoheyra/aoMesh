@@ -112,6 +112,14 @@ impl<R: RngCore, T: Transport> NetworkAdapter<R, T> {
     pub fn new(engine: MeshEngine<R>, network: Network<T>) -> Self {
         Self { engine, network }
     }
+    /// Replaces the engine without tearing down the network facade.
+    ///
+    /// A host restoring an MSH-29 snapshot keeps its live radio links and
+    /// re-announces them to the new engine; only the routing state is swapped.
+    /// The previous engine is returned so the caller can drop it explicitly.
+    pub fn replace_engine(&mut self, engine: MeshEngine<R>) -> MeshEngine<R> {
+        std::mem::replace(&mut self.engine, engine)
+    }
     /// Inspect engine state without a second source of truth.
     pub fn engine(&self) -> &MeshEngine<R> {
         &self.engine

@@ -2,7 +2,7 @@
 
 **The routing and store-and-forward engine of the aoheyra mesh.** A sans-IO Rust crate that decides what happens to a packet: forward it, hold it, suppress it, deliver it, or drop it, across a phone-to-phone mesh where links come and go.
 
-> **Status: pre-alpha, through MSH-28.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest, bounded anti-entropy sync, range-based reconciliation on meeting links, binary spray-and-wait for Direct traffic, signed delivery receipts with bounded store purging, relative-age lifetime ceilings, bounded presence announcements with trickle timing, a bounded ephemeral NodeDirectory with coalesced UI events, bounded reverse-path route hints derived from directory observations, bounded latest-wins telemetry with typed advisory coalescing, local public-channel subscriptions over signed Broadcast envelopes, and resource-bounded decoders with nightly fuzz targets are implemented.
+> **Status: pre-alpha, through MSH-29.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest, bounded anti-entropy sync, range-based reconciliation on meeting links, binary spray-and-wait for Direct traffic, signed delivery receipts with bounded store purging, relative-age lifetime ceilings, bounded presence announcements with trickle timing, a bounded ephemeral NodeDirectory with coalesced UI events, bounded reverse-path route hints derived from directory observations, bounded latest-wins telemetry with typed advisory coalescing, local public-channel subscriptions over signed Broadcast envelopes, resource-bounded decoders with nightly fuzz targets, and versioned restart snapshots for seen-cache, immunity and spray state are implemented.
 
 Cargo package name: `ao_mesh`.
 
@@ -188,6 +188,32 @@ A bounded dedupe cache for forwarding: `check_and_insert(now, class, msg_id)` an
 - Bounded in **size and time**: at most 4096 recordings (oldest evicted first), each expiring at its class's window from ADR-0001 (Direct 24 h, Broadcast 6 h, Presence 30 min, Telemetry 5 min). A duplicate does not extend the window.
 - No input can grow it past the bound: one million insertions peak at 263,560 bytes, asserted against the documented 512 KiB ceiling by `tests/seen_memory.rs`. Decision record ADR-0003.
 - Capacity and windows are configurable through `SeenConfig`; capacity 0 records nothing, a zero window never deduplicates.
+- MSH-29 snapshots preserve both the entry map and the eviction order, so an eviction after restart happens at the same point as without a restart.
+
+### Restart persistence (MSH-29)
+
+The host owns the bytes: `MeshEngine` implements `Snapshot`, whose `snapshot()`
+returns `Result<Vec<u8>, SnapshotError>` and whose `restore(&[u8])` is atomic.
+The format is local host state, not a radio wire format: magic `AMSH`, version
+byte, four little-endian counts, then BTreeMap-ordered seen entries, seen order,
+receipt-immunity entries and spray tickets. All integers are little-endian.
+`SNAPSHOT_VERSION` is 1 and `MAX_SNAPSHOT_LEN` is 4 MiB, above the roughly
+1.85 MiB worst case of the default bounds.
+
+Malformed, truncated, trailing, oversized or version-mismatched bytes are
+rejected with a typed `SnapshotError` before any engine state is changed.
+Restore checks counts against the receiving engine's config bounds, revalidates
+immunity receipt wires and rejects duplicate ids or links. Store content, RNG
+seed, config, wall clock and live link capabilities stay host-owned: the host
+rebuilds the engine with the same seed and config, calls `restore`, and
+re-announces links with `MeshInput::LinkUp`.
+
+`tests/restart.rs` covers no re-relay after restart, immunity and copy-counter
+survival, store isolation and atomic rejection. `tests/sim_restart.rs` locks the
+fixed-seed paired report from `examples/restart_report`: with seed
+`1_297_303_584` on line-20, the lost-state row re-relays 14 post-restart sends
+(723 transmissions) while the restored row re-relays none (566 transmissions);
+both deliver 20/20 and snapshot 5,374 bytes.
 
 ### MeshHello (MSH-07)
 
@@ -957,3 +983,11 @@ for one hour nightly and uploads crash artifacts on failure; no one-hour
 campaign is claimed locally. `libfuzzer-sys` (MIT/Apache-2.0, Rust-Fuzz, small
 binding crate) and `rand` 0.9 (MIT/Apache-2.0, already a dev-dependency) are
 dev-only; the core dependency set is unchanged.
+## Restart state (MSH-29)
+
+A restart snapshot is local, versioned host state rather than a protocol
+wire format: no capability negotiation or packet layout is involved. It
+covers the forwarding seen-cache, receipt immunity and spray tickets;
+stored packets, RNG state, config and radio sessions remain with the host.
+See the engine `Snapshot` trait and the paired restart report described in
+the seen-cache section above.

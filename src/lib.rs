@@ -33,7 +33,8 @@
 //! channel key reuses MSH-10's bucket table and MSH-11's suppression. MSH-28
 //! bounds every decoder and host-supplied stream; `tests/resource_bounds.rs`
 //! and the `fuzz/` targets check those limits without changing the sans-IO
-//! core.
+//! core. MSH-29 snapshots the bounded seen-cache, immunity list and spray
+//! tickets so a restart cannot re-relay traffic the node already handled.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -57,6 +58,7 @@ pub mod seen;
 pub mod sign;
 #[cfg(feature = "sim")]
 pub mod sim;
+pub mod snapshot;
 pub mod spray;
 pub mod store;
 pub mod suppress;
@@ -92,6 +94,9 @@ pub use seen::{Offer, SeenCache, SeenConfig};
 pub use sign::{
     RelayOutcome, VerifyError, derive_msg_id, sign_packet, verify_for_relay, verify_origin,
     verify_origin_with_signing_pk,
+};
+pub use snapshot::{
+    MAX_SNAPSHOT_LEN, SNAPSHOT_MAGIC, SNAPSHOT_VERSION, Snapshot, SnapshotError, SnapshotSection,
 };
 pub use spray::{MAX_COPIES, SPRAY_MAGIC, SPRAY_VERSION, SprayConfig, SprayError, SprayTracker};
 pub use suppress::SuppressionConfig;
