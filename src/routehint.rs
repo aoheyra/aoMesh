@@ -104,8 +104,10 @@ struct Entry {
 ///
 /// Ranking is `(hops ascending, seq descending, link id ascending)`, so a
 /// lower hop count always wins, then a newer sequence, then link order breaks
-/// an exact tie. A hint that loses is ignored and never extends the winner's
-/// lifetime.
+/// an exact tie. Only a strictly fresher observation (lower hops or higher
+/// seq) restarts the lifetime: a lower link id at equal hops and seq changes
+/// the chosen neighbour but keeps the retained observation's age. A hint that
+/// loses is ignored and never extends the winner's lifetime.
 #[derive(Debug)]
 pub struct RouteHintTable {
     config: RouteHintConfig,
@@ -185,10 +187,22 @@ impl RouteHintTable {
         // the table's clock floor keeps expiry relative to the newest local
         // time observed, never to peer time or to an earlier epoch.
         let effective_now = now.max(self.clock_floor_ms);
-        let rank = Self::rank(observation.hops, observation.seq, observation.neighbour);
+        let incoming = Self::freshness(observation.hops, observation.seq);
         if let Some(entry) = self.entries.get_mut(&observation.destination) {
-            if rank >= Self::rank(entry.hint.hops, entry.hint.seq, entry.hint.neighbour) {
+            let retained = Self::freshness(entry.hint.hops, entry.hint.seq);
+            if incoming > retained {
+                // Worse hops or an older sequence: link order cannot rescue it.
                 return false;
+            }
+            if incoming == retained {
+                if observation.neighbour >= entry.hint.neighbour {
+                    return false;
+                }
+                // The freshest fact is unchanged, so a better link id is only
+                // a deterministic tie-break. Keep the original age: choosing
+                // a neighbour is not new evidence and must not refresh expiry.
+                entry.hint.neighbour = observation.neighbour;
+                return true;
             }
             let expires_at_ms = if effective_now > entry.observed_at_ms {
                 effective_now.saturating_add(self.config.lifetime_ms)
@@ -232,8 +246,10 @@ impl RouteHintTable {
         true
     }
 
-    fn rank(hops: u8, seq: u64, neighbour: LinkId) -> (u8, Reverse<u64>, LinkId) {
-        (hops, Reverse(seq), neighbour)
+    /// Lower is fresher. Link id is deliberately excluded: it breaks exact
+    /// ties without making an observation newer.
+    fn freshness(hops: u8, seq: u64) -> (u8, Reverse<u64>) {
+        (hops, Reverse(seq))
     }
 }
 
@@ -298,11 +314,22 @@ mod tests {
         let hint = table.hint(10, node(9)).expect("lower link wins a tie");
         assert_eq!(hint.neighbour, LINK_A);
         assert_eq!(hint.expires_at_ms, 1_000);
+        // An equal fact from a higher link id loses the tie.
+        assert!(!observe(&mut table, 200, 2, 7, LINK_B));
         // Same rank at a later time cannot extend the winner's lifetime.
         assert!(!observe(&mut table, 500, 2, 7, LINK_A));
         assert_eq!(
             table.hint(500, node(9)).map(|hint| hint.expires_at_ms),
             Some(1_000)
+        );
+        // A strictly fresher fact does restart the lifetime, whichever link
+        // carried it.
+        assert!(observe(&mut table, 600, 1, 7, LINK_C));
+        assert_eq!(
+            table
+                .hint(600, node(9))
+                .map(|hint| (hint.neighbour, hint.expires_at_ms)),
+            Some((LINK_C, 1_600))
         );
     }
 
