@@ -549,10 +549,15 @@ mod tests {
         );
         assert_eq!(t.origin_count(), 1);
         assert_eq!(
-            admit(&mut t, 11_000, &ORIGIN, 7, 5),
+            admit(&mut t, 10_000, &ORIGIN, 7, 5),
             Err(TelemetryError::RateLimited { retry_ms: 1_000 })
         );
-        assert_eq!(admit(&mut t, 12_000, &ORIGIN, 7, 5).unwrap().seq, 5);
+        // Exactly 10 seconds after the first acceptance, admission opens.
+        assert_eq!(admit(&mut t, 11_000, &ORIGIN, 7, 5).unwrap().seq, 5);
+        assert_eq!(
+            admit(&mut t, 11_001, &ORIGIN, 7, 6),
+            Err(TelemetryError::RateLimited { retry_ms: 9_999 })
+        );
     }
 
     #[test]
