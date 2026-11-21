@@ -141,7 +141,7 @@ fn flood_packet(tag: u8) -> Vec<u8> {
 #[test]
 fn hostile_inputs_stay_inside_the_documented_bounds() {
     // ---- 1. Packet and header decode never allocate, whatever the size. ----
-    let mut oversize = Header {
+    let oversize = Header {
         class: PacketClass::Direct,
         dst: Some([2; 16]),
         msg_id: [1; 16].into(),
@@ -182,16 +182,16 @@ fn hostile_inputs_stay_inside_the_documented_bounds() {
     .encode()
     .expect("fixture fits");
     trailing.extend_from_slice(&[7; 64]);
-    oversize.truncate(5);
-    oversize[2] = 2; // summary tag
-    oversize[3..5].copy_from_slice(&8u16.to_be_bytes());
+    // A sync truncation fixture needs the sync magic/version, not the
+    // unrelated packet header used in the packet-decoder checks above.
+    let truncated_summary = vec![0x53, 1, 2, 0, 8];
 
     reset();
     for _ in 0..1_000 {
         assert!(SyncFrame::decode(&big_item).is_err());
         assert!(SyncFrameV2::decode(&big_v2).is_err());
         assert!(SyncFrame::decode(&trailing).is_err());
-        assert!(SyncFrame::decode(&oversize).is_err());
+        assert!(SyncFrame::decode(&truncated_summary).is_err());
     }
     assert!(
         allocs() <= 4_000,
