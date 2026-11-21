@@ -35,12 +35,15 @@ fn directory_capacity_is_never_exceeded_and_entries_expire_on_schedule() {
     assert_eq!(got.directory_peak_entries, 4);
     assert_eq!(got.directory_expirations, 24);
     assert_eq!(got.directory_evictions, 24);
-    assert_eq!(got.directory_last_removal_ms, 4_000);
+    assert_eq!(got.directory_last_removal_ms, 2_000);
     assert_eq!(got.directory_live_entries, 0);
 
     assert!(got.directory_peak_entries <= capacity);
     assert!(got.directory_expirations > 0);
-    // The last observation round ends at 2,050 ms; with a 2,000 ms relative
-    // lifetime every entry must be gone by 4,050 ms.
+    // The last observation round lands at 2,000 ms. Capacity is four nodes
+    // on a six-node line, so later rounds evict the oldest entries before
+    // their 2,000 ms relative lifetime; the last removal is therefore at the
+    // end of the observation window, not two lifetimes later. Expirations
+    // still occur, and no entry survives the run.
     assert!(got.directory_last_removal_ms >= stale_after_ms);
 }

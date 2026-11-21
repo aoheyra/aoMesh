@@ -2800,7 +2800,15 @@ impl Simulation {
         self.run_started = true;
         self.reset_queue_baseline();
         let hint_every = HINT_REFRESH.as_millis() as u64;
-        self.inject_route_hints(self.world.now().as_millis() as u64);
+        // A scenario with its own directory plan already supplies typed
+        // observations on a fixed schedule (MSH-20). Injecting route-hint
+        // facts as well would change its directory churn and hide expiry
+        // regressions (MSH-21). Other rows still get the identical hint
+        // facts in both Off and On modes so latency remains comparable.
+        let inject_hints = self.scenario.directory.is_none();
+        if inject_hints {
+            self.inject_route_hints(self.world.now().as_millis() as u64);
+        }
         let run_steps = (self.scenario.run.as_millis() / TICK.as_millis()) as usize;
         let steps = run_steps.max(1);
         // Keep the last fifth of the run free so the final message can
@@ -2844,7 +2852,7 @@ impl Simulation {
             }
             self.pump(1);
             let now_ms = self.world.now().as_millis() as u64;
-            if now_ms % hint_every == 0 {
+            if inject_hints && now_ms % hint_every == 0 {
                 self.inject_route_hints(now_ms);
             }
         }
