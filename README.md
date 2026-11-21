@@ -2,8 +2,7 @@
 
 **The routing and store-and-forward engine of the aoheyra mesh.** A sans-IO Rust crate that decides what happens to a packet: forward it, hold it, suppress it, deliver it, or drop it, across a phone-to-phone mesh where links come and go.
 
-> **Status: pre-alpha, through MSH-19.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest, bounded anti-entropy sync, range-based reconciliation on meeting links, binary spray-and-wait for Direct traffic, signed delivery receipts with bounded store purging, and bounded presence announcements with trickle timing are implemented.
-> **Status: pre-alpha, through MSH-20.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest, bounded anti-entropy sync, range-based reconciliation on meeting links, binary spray-and-wait for Direct traffic, signed delivery receipts with bounded store purging, and a bounded ephemeral NodeDirectory with coalesced UI events are implemented.
+> **Status: pre-alpha, through MSH-21.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest, bounded anti-entropy sync, range-based reconciliation on meeting links, binary spray-and-wait for Direct traffic, signed delivery receipts with bounded store purging, relative-age lifetime ceilings, bounded presence announcements with trickle timing, a bounded ephemeral NodeDirectory with coalesced UI events, and bounded reverse-path route hints derived from directory observations are implemented.
 
 Cargo package name: `ao_mesh`.
 
@@ -33,7 +32,7 @@ aoMesh consumes **aoNetwork** (links and frames) and **aoIdents** (signatures, s
 - **Stores and forwards**: `MessageStore` trait with quotas and eviction, store summary and beacon digest, anti-entropy sync when two nodes meet.
 - **Controls abuse mesh-wide**: per-origin and per-class relay budgets, neighbour penalty scores.
 - Handles **delivery receipts and immunity** so copies are purged after delivery.
-- Maintains a bounded mesh-wide **NodeDirectory** from typed presence observations, with LRU eviction, relative-time expiry and coalesced UI changes; reverse-path route hints and public channels follow in later issues.
+- Maintains a bounded mesh-wide **NodeDirectory** from typed presence observations, with LRU eviction, relative-time expiry and coalesced UI changes; derives bounded **reverse-path route hints** from those facts, while public channels follow in a later issue.
 - Ships a **simulator harness** with mobility models and metrics, so every routing parameter can be swept and every claim measured.
 
 ## What it deliberately does not do
@@ -79,8 +78,7 @@ Lifetimes, TTLs, copy counts and budgets are **defaults with documented reasons*
    aoNetwork  (NetworkEvent in, actions out)      aoIdents (sign, open, replay)
 ```
 
-**Engine inputs:** `LinkUp`, `LinkDown`, `Data`, `Tick`, `Submit`, `KnownCards`, `StoreSummary`, `SyncItems`. **Outputs:** `Send`, `Broadcast`, `Release`, `Deliver`, `SetHello`, `SetBeacon`, `SyncNeed`, `SyncItem`, `ReleaseOpportunistic`, `Purge`, `Delivered`, `CardFetch`.
-**Engine inputs:** `LinkUp`, `LinkDown`, `Data`, `Tick`, `Submit`, `StoreSummary`, `SyncItems`, `ObserveNode`. **Outputs:** `Send`, `Broadcast`, `Release`, `Deliver`, `SetHello`, `SetBeacon`, `SyncNeed`, `SyncItem`, `ReleaseOpportunistic`, `Purge`, `Delivered`, `DirectoryChanged`.
+**Engine inputs:** `LinkUp`, `LinkDown`, `Data`, `Tick`, `Submit`, `KnownCards`, `ObserveNode`, `StoreSummary`, `SyncItems`. **Outputs:** `Send`, `Broadcast`, `Release`, `Deliver`, `SetHello`, `SetBeacon`, `SyncNeed`, `SyncItem`, `ReleaseOpportunistic`, `Purge`, `Delivered`, `CardFetch`, `DirectoryChanged`.
 
 ### Engine and adapter (MSH-06)
 
@@ -412,6 +410,7 @@ Performance claims are measured in the simulator harness (MSH-27), never asserte
 - Counter-based suppression: 45.20% fewer transmissions than naive flooding on the seeded 50-node graph, Direct delivery ratio unchanged at 0.2000 (see above).
 - Presence: all 49 peers learned within 50 ms on the seeded 50-node circulant, with a 15,480 B/h per-source steady refresh against a 64 KiB/h budget (see above).
 - Spray-and-wait: delivery close to epidemic routing at a fraction of the transmissions under mobility.
+- Reverse-path hints: fresh-path mean latency drops from 356 ms to 337 ms on the seeded random-20 case with transmissions unchanged at 230; the additive alternative used 231 (see above).
 - Sync v2: bytes per contact drop measurably against v1 for stores of 1000+ messages.
 
 Metrics: delivery ratio, latency, overhead (transmissions per delivery), duplicate ratio, buffer occupancy. Reports are CSV (see the [MSH-27 baseline](#simulator-harness-and-baseline-msh-27)); nightly CI enforces thresholds and fails on regression.
@@ -450,6 +449,13 @@ relay-only MSH-08 reference:
 ```bash
 cargo run --release --all-features --example spray_report
 cargo test --release --all-features --test sim_spray
+```
+
+MSH-21 adds another paired report; the published rows keep `RouteHintMode::Off`:
+
+```bash
+cargo run --release --features sim --example routehint_report
+cargo test --release --all-features --test sim_routehint
 ```
 
 Tests are `cargo test` only: no Miri or callgrind locally. CI runs fmt, clippy, tests on three operating systems, `cargo doc`, cargo-deny, an MSRV build and miri on every pull request.
@@ -623,6 +629,63 @@ The scripted-200 case keeps 99 percent delivery while using 48 percent fewer
 transmissions. `tests/spray.rs` covers envelope bounds, the binary split, the
 destination shortcut, wait-phase delivery, tracker eviction and capability
 fallback; `tests/sim_spray.rs` locks the fixed-seed numbers.
+
+## Reverse-path route hints (MSH-21)
+
+Direct traffic can use a bounded, local table of reverse-path hints derived
+from MSH-20 directory observations: "destination D was last seen through
+verified neighbour N, H hops away". Verified MSH-19 presence announcements feed
+the directory automatically; host-supplied facts use `MeshInput::ObserveNode`.
+A hint is never signed, never encoded on the wire and never used to authenticate
+a packet. The hint source accepts no peer time: only local `now` sets expiry,
+and a backwards local clock is clamped to the table's clock floor so clock skew
+cannot keep a hint fresh. A fact whose via-node is not currently a verified
+neighbour cannot steer traffic.
+
+Hints rank by lowest hops, then highest `seq`, then lowest `LinkId`; an exact
+tie never refreshes the winner. `Tick` expires entries and `LinkDown` removes
+every hint supplied by that link. In the default `SubstituteCopy` mode a fresh
+hint replaces one ordinary spray recipient with a one-ticket copy along the
+hint, so the transmission count and `copies_left` accounting stay unchanged;
+a node holding its last ticket waits and hands that copy to the destination.
+`Off` records nothing and changes no decision. `AdditiveUnicast` was measured
+as a rejected option because it lowers latency only by adding a transmission.
+
+| Setting | Default | Why |
+|---|---|---|
+| Mode | `SubstituteCopy` | Lower fresh-path latency at unchanged transmissions per delivery |
+| Maximum entries | 1024 | One per destination, bounded to the documented directory scale |
+| Lifetime | 300,000 ms | Shorter than the 10-15 min presence refresh, so stale paths age out |
+| Fresh hop ceiling | 8 | Matches Direct's TTL; longer paths are not trusted |
+
+The paired report keeps topology, mobility, traffic, budgets, spray and
+receipts identical and changes only the hint mode. The last three columns are
+the fresh-path diagnostic: every row receives the same seeded observations,
+so the `Off` row is the honest latency baseline.
+
+| Scenario | Seed | Delivered / submitted | Transmissions | Mean latency (ms) | Fresh-path deliveries | Fresh-path latency (ms) | Overhead |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `hint-spray-line-20` | 1297303584 | 20 / 20 | 186 | 727 | 20 / 20 | 727 | 9.3000 |
+| `hint-additive-line-20` | 1297303584 | 20 / 20 | 186 | 727 | 20 / 20 | 727 | 9.3000 |
+| `hint-substitute-line-20` | 1297303584 | 20 / 20 | 186 | 727 | 20 / 20 | 727 | 9.3000 |
+| `hint-spray-random-20` | 1297303632 | 10 / 20 | 230 | 360 | 8 / 8 | 356 | 23.0000 |
+| `hint-additive-random-20` | 1297303632 | 10 / 20 | 231 | 345 | 8 / 8 | 337 | 23.1000 |
+| `hint-substitute-random-20` | 1297303632 | 10 / 20 | 230 | 345 | 8 / 8 | 337 | 23.0000 |
+
+On the random-20 case, substitution cuts fresh-path mean latency from 356 ms
+to 337 ms and overall mean latency from 360 ms to 345 ms while transmissions
+stay at 230 and overhead at 23.0000. Additive reaches the same 337 ms but uses
+231 transmissions (23.1000), so it was rejected. The line-20 rows are an
+unchanged-behaviour control: the hint already lies on the spray path. Unit and
+integration tests cover freshest selection, tie-breaking, capacity eviction,
+expiry fallback, backwards clocks, unknown or unverified links, `Off` mode and
+a Direct packet delivered through a substituted hint; the fixed-seed gate
+locks every row above.
+
+```bash
+cargo run --release --features sim --example routehint_report
+cargo test --release --all-features --test sim_routehint
+```
 
 ## Signed delivery receipts and immunity (MSH-17)
 

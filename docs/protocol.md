@@ -414,6 +414,37 @@ carry the same count in `SprayItem`, so a stored copy received through
 MSH-14/15 can continue spraying on a later contact. The host persists the count
 as `StoreMetadata::copies_left`; the engine keeps at most 4096 live tickets.
 
+## Reverse-path route hints (MSH-21)
+
+No packet, hello or sync wire field changes. A hint is local routing advice:
+"the freshest observation for destination D arrived from verified neighbour N,
+H hops away". It is not signed, is never sent to a peer and never authenticates
+a packet. It is derived exclusively from MSH-20 directory observations:
+verified MSH-19 announcements feed them, and host facts use
+`MeshInput::ObserveNode`. A fact is retained as a hint only while its via-node
+names a verified neighbour. The source accepts no peer-supplied timestamp:
+expiry uses only local `now`, and a backwards local clock is clamped to the
+table's clock floor so neither skew nor replay can extend freshness. The
+simulator injects BFS-derived directory facts every five seconds, including in
+the hint-off control rows.
+
+Observations from links that are down or lack a verified identity are ignored,
+as are zero-hop or over-ceiling hop counts. Hints rank by `(hops ascending,
+seq descending, LinkId ascending)`; an equal-rank observation never refreshes
+the winner's expiry. The table holds at most `RouteHintConfig::max_entries`
+destinations, evicting the earliest expiry then the lowest `NodeId`. `Tick`
+expires hints and `LinkDown` removes every hint that link supplied, so a stale
+or vanished path cannot survive.
+
+With `RouteHintMode::SubstituteCopy` (the measured default) a fresh hint takes
+the place of one ordinary spray recipient: the engine sends one one-ticket
+copy along the hint and omits one other recipient, so neither the transmission
+count nor the remaining-ticket accounting grows. `AdditiveUnicast` sent one
+extra send and was rejected by the paired report. `Off` records nothing and
+leaves every forwarding decision unchanged. Config defaults are 1024 entries,
+300,000 ms lifetime, an eight-hop ceiling and `SubstituteCopy`; the measured
+rows and seeds are in the MSH-21 section of the README.
+
 ## Signed delivery receipts (MSH-17)
 
 `MeshHello` adds `CAP_RECEIPT_V1` (`1 << 3`). The packet header, signature

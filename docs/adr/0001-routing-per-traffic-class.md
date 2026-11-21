@@ -422,3 +422,55 @@ A store may set local ceilings at construction, but never extend the packet's
 sender lifetime. Relative age and local elapsed time determine expiry; remote
 `created_ms` does not. See [lifetime policy](lifetime-expiry.md) for the clock
 contract, examples versus accepted defaults, and validation boundaries.
+
+## MSH-21 implementation
+
+Reverse-path hints use a bounded local table keyed by destination `NodeId`.
+The only source is MSH-20's directory: verified MSH-19 announcements feed it
+automatically, and host facts enter through `MeshInput::ObserveNode`. The
+engine mints a hint only when the retained fact's via-node names a currently
+verified neighbour; the simulator derives those facts from BFS and injects them
+every five seconds, including into the hint-off control rows. No peer time is
+accepted: only local `now` sets expiry, and a backwards clock is clamped to the
+table's clock floor.
+Hints rank by `(hops ascending, seq descending, LinkId ascending)`, which is
+deterministic and testable; exact ties do not refresh expiry. `Tick` expires
+entries, `LinkDown` removes that link's hints, and eviction at capacity takes
+the earliest expiry then the lowest `NodeId`. Nothing is signed, stored on the
+wire or used to authenticate a packet.
+
+Three forwarding options were compared against the same fixed-seed spray
+baseline. `Off` costs no memory, CPU or airtime but leaves the shortest path
+unused. `AdditiveUnicast` lowers latency by sending one extra unicast on top of
+spray: extra radio bytes and phone battery, a higher transmissions-per-delivery
+ratio, and one more output to test. `SubstituteCopy` makes the hint one of the
+existing spray copies and omits one other recipient: same number of sends and
+the same `copies_left` accounting, one bounded lookup per spray decision, and
+lower latency. The second and third options were measured in
+`route_hint_scenarios()`; all other fields, including topology, mobility,
+traffic, budgets, spray and receipts, are identical across each pair.
+
+| Scenario | Seed | Delivered / submitted | Transmissions | Mean latency (ms) | Fresh-path latency (ms) | Overhead |
+|---|---:|---:|---:|---:|---:|---:|
+| `hint-spray-line-20` | 1297303584 | 20 / 20 | 186 | 727 | 727 | 9.3000 |
+| `hint-additive-line-20` | 1297303584 | 20 / 20 | 186 | 727 | 727 | 9.3000 |
+| `hint-substitute-line-20` | 1297303584 | 20 / 20 | 186 | 727 | 727 | 9.3000 |
+| `hint-spray-random-20` | 1297303632 | 10 / 20 | 230 | 360 | 356 | 23.0000 |
+| `hint-additive-random-20` | 1297303632 | 10 / 20 | 231 | 345 | 337 | 23.1000 |
+| `hint-substitute-random-20` | 1297303632 | 10 / 20 | 230 | 345 | 337 | 23.0000 |
+
+On random-20, both active modes cut fresh-path mean latency from 356 ms to
+337 ms, but only substitution keeps transmissions at 230 and overhead at
+23.0000; additive uses 231 and 23.1000. The line-20 rows are identical in all
+three modes, showing that a hint already on the spray path changes nothing.
+Delivery counts are unchanged in every pair. `SubstituteCopy` is therefore the
+default: it meets the issue's latency goal without increasing transmissions.
+`AdditiveUnicast` stays in the report solely as the rejected measured option;
+`Off` is available for ablation and keeps published rows unchanged.
+
+| Setting | Default | Reason |
+|---|---|---|
+| Mode | `SubstituteCopy` | Measured latency win with unchanged transmissions per delivery |
+| Maximum entries | 1024 | Bounded per-destination state at the documented directory scale |
+| Lifetime | 300,000 ms | Shorter than the 10-15 min presence refresh, so stale paths age out |
+| Fresh hop ceiling | 8 | Matches Direct's TTL; longer paths are not trusted |
