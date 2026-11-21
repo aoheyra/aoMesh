@@ -1405,6 +1405,7 @@ impl Simulation {
                     )
                     .expect("presence tick inputs are well formed");
                 self.count_outputs(i, now_ms, &outputs);
+                self.note_directory_changes(&outputs, now_ms);
                 self.service_stores(i, now, now_ms, outputs.clone());
                 let events = self.nodes[i].adapter.apply(now, outputs);
                 for event in events {
