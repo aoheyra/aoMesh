@@ -18,7 +18,10 @@ The fixed 50-node report on seed `1297304021` learns 49 of 49 peers in 50 ms,
 emits no card fetches, and uses 15,480 B/h per source at steady state against
 the 64 KiB/h budget. The one-copy cancellation in MSH-11 suppression is also
 fixed at the algorithm level: the effective threshold is floored at two
-distinct sending links for every flooded class, with a unit regression.
+distinct sending links for every flooded class, with a unit regression. The
+MSH-17 enabled 200-node report consequently sends 27,926 instead of 27,958
+packets on seed `1297303752`; delivery, receipts, purges and purge latency are
+unchanged.
 
 Breaking unreleased API change: `MeshInput::Tick` now takes a borrowed
 `Identity` and an eight-byte card hash. New host seams are
