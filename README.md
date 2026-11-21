@@ -584,3 +584,13 @@ cargo test --release --all-features --test sim_receipts
 
 `tests/receipts.rs` covers the two-node pipeline; `tests/sim_receipts.rs` locks
 the fixed-seed numbers and requires zero delivered copies at every node.
+## Lifetime and expiry (MSH-18)
+
+`expiry::LifetimePolicy` provides per-class ceilings using the ADR-0001 defaults.
+`MemoryStore::with_lifetime_policy` applies a custom policy consistently to
+admission, lookup, summaries and cleanup. The effective lifetime never exceeds
+the sender's lifetime and signed wire bytes are unchanged. Age carried from
+previous encounters plus local monotonic elapsed time determines expiry;
+remote timestamps are ignored. `expiry::age_at` carries consumed age between
+encounters with different local epochs. See [the expiry decision](docs/adr/lifetime-expiry.md)
+for the caller contract and restart/sync boundaries.
