@@ -82,6 +82,16 @@ Release profile, stable Rust, fixed seeds from `baseline_scenarios()`:
 
 Every scenario has zero send failures and zero duplicate deliveries.
 
+MSH-19 adds one separate scenario rather than changing the four gates above.
+`presence_scenarios()` uses seed `1297304021` on a static 50-node circulant
+(steps 1, 8 and 12), submits no application messages, and declares every card
+hash up front. The fixed report learns 49 of 49 peers in 50 ms, emits zero
+`CardFetch` events, and sends 6,036 announcement frames (1,557,288 bytes) in
+the last 60 seconds. `tests/sim_presence.rs` locks the exact CSV header and
+row; `cargo run --release --features sim --example presence_report` reproduces
+it. Presence is disabled in all four baseline scenarios, so their rows stay
+comparable.
+
 ## Consequences
 
 - Any routing, codec or adapter change that affects these numbers must be

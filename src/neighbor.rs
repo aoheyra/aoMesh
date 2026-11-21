@@ -6,6 +6,7 @@ use ao_network::{Hello, LinkId};
 use std::collections::BTreeMap;
 
 use crate::budget::BudgetConfig;
+use crate::presence::PresenceConfig;
 use crate::receipt::ReceiptConfig;
 use crate::spray::SprayConfig;
 use crate::suppress::SuppressionConfig;
@@ -32,6 +33,8 @@ pub struct MeshConfig {
     pub spray: SprayConfig,
     /// Signed receipts and bounded immunity policy (MSH-17).
     pub receipt: ReceiptConfig,
+    /// Bounded presence announcements and trickle timing (MSH-19).
+    pub presence: PresenceConfig,
 }
 
 impl Default for MeshConfig {
@@ -58,6 +61,7 @@ impl Default for MeshConfig {
             sync: SyncConfig::default(),
             spray: SprayConfig::default(),
             receipt: ReceiptConfig::default(),
+            presence: PresenceConfig::default(),
         }
     }
 }

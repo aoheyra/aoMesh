@@ -21,7 +21,7 @@ Units: TTL = hop limit; Copies = copies in the network; Lifetime = how long a co
 
 **Broadcast and channels — TTL 6, forward once, 6 h, 256 KiB/h.** Each node forwards at most once and the counter suppresses re-floods, so the copy count is bounded by topology rather than by the sender; six hours outlives a suppressed flood (the origin re-announces newer content anyway); the budget is a quarter of Direct's because every duplicate is re-relayed by many nodes.
 
-**Presence — TTL 3, 30 min, 64 KiB/h.** Trickle refreshes every 10–15 minutes, so a packet only has to outlive one missed period; three hops cover the immediate neighbourhood where presence is useful; the budget bounds Sybil spam to a few dozen announcements per hour.
+**Presence — TTL 3, 30 min, 64 KiB/h.** A 150-byte signed announcement carries the origin's card hash, capabilities, sequence and existing public identity. Trickle refreshes from 1 minute to a 15-minute steady bound, so a packet only has to outlive one missed period; three hops cover the immediate neighbourhood where presence is useful; the budget bounds Sybil spam to a few dozen announcements per hour. With the measured 258-byte average wire frame, one source's steady refresh is 15,480 B/h against the 64 KiB/h allowance.
 
 **Telemetry — TTL 3, 5 min, 32 KiB/h.** Location is worthless when stale, so nothing is stored and the newest wins; three hops is the bound for "who is near me"; being the lowest budget, telemetry is the first class shed under pressure.
 
@@ -106,20 +106,27 @@ keep their existing paths; no wire field changes.
 |---|---|---|
 | Pending entries | 1024 | Bounds memory while covering a contact's worth of distinct content |
 | Reference degree / copies | 4 / 3 | Calibrated by the 50-node sweep: 45.20% fewer transmissions, Direct ratio unchanged |
-| Copy bounds | 1 to 6 | Sparse graphs still forward; hostile or extreme degrees cannot mint unbounded work |
+| Copy bounds | 1 to 6 configured, 2 effective | Sparse graphs still forward; hostile or extreme degrees cannot mint unbounded work |
 | Base delay | 60-140 ms, seeded | Long enough for neighbour copies, short enough for a contact |
 | Final delay | 20-600 ms, shrinking with degree | Dense groups decide sooner without letting sparse groups relay blind |
 | Class TTLs | 8, 6, 3, 3 | Same table as above; submission and relay both clamp |
 
 Three threshold policies were considered. A fixed `k = 2` is simple but
 leaves most of the flood's redundancy in dense graphs. A fixed `k = 1`
-removes almost all transmissions but isolates nodes that only hear one copy.
-A degree-scaled `k` with fractional seeded rounding is the chosen option: it
-spends relays where neighbours are scarce and cancels them where the mesh
-already offered several chances. The delay shrinks with degree for the same
-reason. The reference degree is four, calibrated by the 50-node sweep; bounds
-keep `k` and the delay finite for hostile degree claims. State is bounded at
-1024 pending messages and evicted by earliest deadline.
+removes almost all transmissions but isolates nodes that only hear one copy;
+the MSH-19 convergence work reproduced that failure on degree-one paths, where
+one arrival cancelled the only relay and extinguished the flood at the first
+hop. A degree-scaled `k` with fractional seeded rounding is the chosen option:
+it spends relays where neighbours are scarce and cancels them where the mesh
+already offered several chances. The effective threshold is now floored at two
+distinct sending links for every flooded class, so `min_k = 1` can no longer
+produce that isolation. This is a routing fix, not a scenario special case.
+The delay shrinks with degree for the same reason. The reference degree is
+four, calibrated by the 50-node sweep; bounds keep `k` and the delay finite
+for hostile degree claims. State is bounded at 1024 pending messages and
+evicted by earliest deadline. CI rechecks the fixed suppression scenario
+without lowering its thresholds; the published Direct-only baselines carry no
+flooded classes and are unaffected.
 
 The simulator ablation sets `SuppressionConfig::enabled = false`, restoring
 immediate flooding without changing topology, identities or traffic. Suppression
@@ -131,6 +138,73 @@ Direct delivery ratio stays at 0.2000. Unique Broadcast receptions fall from
 so that diagnostic is reported alongside the acceptance numbers rather than
 hidden. The four published MSH-27 baselines are unchanged because they carry no
 flooded classes.
+
+## MSH-19 implementation
+
+Three designs were compared for announcing a card hash across the mesh. A new
+`PresenceCard` packet class would give the smallest payload and a separate
+budget, but it would change the header class table, seen-cache windows, relay
+policy and every peer's decoder for no routing gain. Gossiping only the
+eight-byte hash in an ordinary Presence payload would be cheaper still, but a
+relay could not bind the hash to an origin: a hostile neighbour could inject or
+rewrite directory facts that every other node accepted. The chosen design is a
+fixed 150-byte body inside the existing signed `PacketClass::Presence` packet,
+carrying the card hash, capabilities, sequence and the origin's existing
+`PublicIdentity` and agreement binding. Every hop derives `origin` from the
+carried keys, verifies the binding and checks the packet signature under the
+already registered `aoheyra/mesh/v1/packet` domain. No new class, header field,
+crypto domain, key storage or app schema is introduced.
+
+On delivery ratio and latency, the hash-only option would converge at least as
+fast but is unverifiable; the new-class option has the same reach with a larger
+protocol surface. The signed body converges 49 of 49 peers in 50 ms on the
+fixed diameter-three, 50-node circulant. On overhead, the measured wire frame
+averages 258 bytes, so one source's 60-second refresh is 15,480 B/h (15.1
+KiB/h), far below this table's 64 KiB/h Presence budget; the whole 50-node
+mesh sends 6,036 announcement frames in the last 60 seconds. Relays remain
+bounded by the MSH-10 per-origin buckets. On memory, the tracker keeps at most
+1024 learned entries and 1024 host-declared hashes; on CPU, each accepted
+announcement costs one binding check and one signature verification per hop,
+with no key directory lookup. Timing, ordering, eviction and tie-breaks use
+only caller-supplied time and injected randomness, so the result is
+deterministic and testable; maintenance is limited to aoMesh's presence module
+because the crypto types and domain already exist in aoIdents.
+
+`MeshHello` advertises `CAP_PRESENCE_V1` (`1 << 4`) in its existing `caps`
+field. A peer without the bit receives no announcement bytes and keeps the
+pre-MSH-19 Presence suppression path, so the body is additive. The host borrows
+its `Identity` and card hash on each `MeshInput::Tick`, supplies
+`MeshInput::KnownCards`, and consumes `MeshOutput::CardFetch` for hashes it must
+resolve; the engine retains no key and stops repeating an unanswered fetch for
+the same node and hash. A sequence counter is monotonic across card and
+capability changes; a higher value wins and the full body gives a deterministic
+tie-break.
+
+| Setting | Default | Reason |
+|---|---|---|
+| Enabled | `true` | Cap gating restricts exposure on each link |
+| Learned entries | 1024 | Bounds memory independently of the directory |
+| Known cards | 1024 | Bounds one host input |
+| Quick delay | 1000 ms | Bounded convergence after a change |
+| Base / steady interval | 60 s / 900 s | Doubling trickle inside the 30 min entry lifetime |
+| Entry lifetime | 1800 s | ADR-0001 Presence lifetime, measured in local monotonic time |
+
+The first implementation exposed a trickle bug: a quick deadline was stored as
+a time only, so ticks while the host had not yet supplied identity data kept
+pushing it forward. The deadline now carries the facts it was scheduled for;
+the host's later ticks cannot postpone that first send. The convergence work
+also exposed the MSH-11 one-copy cancellation described above; it is fixed in
+the suppression algorithm, not in the presence scenario.
+
+The fixed report uses seed `1297304021` with no application traffic:
+
+| Scenario | Seed | Converged | Convergence | Fewest learned | Card fetches | Steady sends / bytes |
+|---|---:|---|---:|---:|---:|---:|
+| `presence-smallworld-50` | 1297304021 | true | 50 ms | 49/49 | 0 | 6036 / 1,557,288 |
+
+`cargo run --release --features sim --example presence_report` prints the exact
+CSV row and `tests/sim_presence.rs` locks the header, seed and row so a wire or
+timer change cannot pass unnoticed.
 
 ## MSH-13 implementation
 

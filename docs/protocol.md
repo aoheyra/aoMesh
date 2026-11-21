@@ -40,8 +40,8 @@ Telemetry; the recipient always verifies a Direct packet addressed to it
 (`sign::verify_for_relay`, `sign::verify_origin`). MSH-04 ships the calls;
 MSH-09 runs the recipient's check for local delivery, and MSH-11 checks the
 content id of every flooded packet before adding it to suppression state.
-The remaining relay-side verification paths belong to the class-specific
-issues (MSH-19, MSH-22, MSH-23).
+MSH-19 verifies every Presence announcement at every hop; MSH-22 and MSH-23
+own the remaining class-specific paths.
 
 `msg_id` is a content address, in two domain-separated steps under
 `aoheyra/mesh/v1/msg-id`:
@@ -138,6 +138,12 @@ MeshHello rejections report `hello::HelloError`: `Truncated`,
 aoIdents reports it), `NodeIdMismatch`, `IncompatibleProto`. Each has a
 test that triggers it.
 
+Presence announcement work reports `presence::PresenceError`: `BadLength`,
+`BadMagic`, `BadVersion`, `BadClass`, `MsgIdMismatch`, `BadBinding`,
+`OriginMismatch`, `TooManyKnownCards`, `Signing` and `Packet`. Packet-driven
+failures are dropped and attributed to the sending link, not returned as a
+`MeshError`; only host-supplied state or local signing reaches the caller.
+
 ## Engine integration (MSH-06, MSH-08)
 
 The wire layout is unchanged. Submit validates the payload/header agreement,
@@ -230,10 +236,13 @@ deadline. The node counts **distinct sending links**, so retransmissions from
 one neighbour are only one copy.
 
 A seeded assessment delay shrinks as the verified neighbour degree grows.
-Before the deadline the node sends nothing. If the seeded copy threshold is
-reached from different links, the pending entry is cancelled and the
-seen-cache records the id: the mesh has already given this node enough
-chances to hear the content, and this node adds no duplicate. If the timer
+Before the deadline the node sends nothing. The effective threshold is the
+seeded degree-scaled value floored at two distinct links: one copy proves only
+that this node heard the packet, and cancelling on it extinguished floods on
+degree-one paths. If the effective threshold is reached from different links,
+the pending entry is cancelled and the seen-cache records the id: the mesh has
+already given this node enough chances to hear the content, and this node adds
+no duplicate. If the timer
 wins, the node re-encodes the packet with `ttl` capped at the class value,
 decrements `ttl` once, increments `hops`, records the id and sends one copy
 to every verified neighbour except the links already counted. The configured
@@ -245,6 +254,59 @@ and locally submitted packets are clamped to their ADR-0001 class TTL before
 signing. `SuppressionConfig::enabled` is a simulator ablation switch only.
 The pending table never holds payload bytes borrowed from a neighbour: the
 relay bytes are encoded once when the first copy arrives.
+
+## Presence announcements (MSH-19)
+
+No packet class, header field or signature domain changes. A presence
+announcement is an ordinary signed `PacketClass::Presence` packet with no
+`dst`, TTL clamped by `SuppressionConfig::presence_ttl` (3), and a fixed
+150-byte payload:
+
+| Offset | Size | Field | Notes |
+|---|---:|---|---|
+| 0 | 1 | Magic | `0x56` |
+| 1 | 1 | Version | `1` |
+| 2 | 8 | `card_hash` | Opaque eight-byte identity-card announcement hash |
+| 10 | 4 | `caps` | Capability bits, big endian |
+| 14 | 8 | `seq` | Monotonic per origin, big endian |
+| 22 | 32 | `signing_pk` | Origin Ed25519 verification key |
+| 54 | 32 | `agreement_pk` | Origin X25519 agreement key |
+| 86 | 64 | `binding` | aoIdents agreement-key binding signature |
+
+The decoder checks the exact length, magic and version before reading any
+field. The two keys and binding are the origin's `PublicIdentity`, already
+defined by aoIdents; the mesh carries them so every relay can authenticate the
+body without a directory or key store. Verification re-derives `msg_id`, calls
+`PublicIdentity::verify_binding`, derives `origin` with `compute_node_id`, and
+checks the packet signature under the existing `aoheyra/mesh/v1/packet`
+domain. A changed `ttl` or `hops` keeps the signature valid; a changed
+immutable field, card hash, capability bit or sequence does not. A body that
+fails any check is attributable invalid traffic and increments the sending
+link's penalty.
+
+`MeshHello` advertises `CAP_PRESENCE_V1` (`1 << 4`) in its existing `caps`
+field. An announcement is emitted and accepted only on links whose negotiated
+capabilities include the bit. A capability peer without it never receives
+announcement bytes and follows the pre-MSH-19 Presence relay path; the new
+body is an additive wire change, not a version bump.
+
+The host supplies the borrowed `Identity` and an eight-byte card hash on each
+`MeshInput::Tick`, and declares hashes it can resolve through
+`MeshInput::KnownCards`. The engine keeps only a sequence number, a typed
+trickle deadline and bounded learned entries; the host receives
+`MeshOutput::CardFetch { node_id, card_hash }` once per unknown hash until it
+declares that hash. Learned entries are latest-wins: a higher `seq` replaces
+an older one, and equal sequences use the full carried body as a
+deterministic tie-break. Entries expire after `PresenceConfig::lifetime_s`
+using local monotonic time, never a remote clock. The tracker holds at most
+`max_entries` learned nodes and `max_known_cards` declared hashes.
+
+A change sets a quick deadline carrying the facts it was scheduled for, so
+repeated ticks while it is pending cannot postpone the first announcement.
+After emission, quiet refreshes double from `base_interval_ms` to
+`steady_interval_ms`. Duplicate announcements are stopped by the MSH-05
+seen-cache; fresh ones use MSH-11's suppression with Presence TTL 3 and are
+sent only to capability links.
 
 ## Store summary and beacon digest (MSH-13)
 

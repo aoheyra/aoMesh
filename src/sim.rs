@@ -21,11 +21,13 @@
 //! and `tests/sim_baseline.rs` enforces the published numbers. Per-origin
 //! delivery counts are kept off the CSV for the MSH-10 flood test.
 
+use crate::presence::{ANNOUNCE_LEN, ANNOUNCE_MAGIC};
 use crate::store::{MemoryStore, MessageStore, StoreLimits, StoreMetadata, StoredMessage};
 use crate::{
-    CAP_RECEIPT_V1, CAP_SYNC_V1, CAPS, Header, MeshConfig, MeshEngine, MeshHello, MeshInput,
-    MeshOutput, MessageId, NetworkAdapter, Packet, PacketClass, SHORT_ID_BYTES, SYNC_MAGIC,
-    SYNC_V2_VERSION, StoreSummary, SuppressionConfig, SyncOffer, derive_msg_id, sign_packet,
+    CAP_PRESENCE_V1, CAP_RECEIPT_V1, CAP_SYNC_V1, CAPS, Header, MeshConfig, MeshEngine, MeshHello,
+    MeshInput, MeshOutput, MessageId, NetworkAdapter, Packet, PacketClass, PresenceConfig,
+    SHORT_ID_BYTES, SYNC_MAGIC, SYNC_V2_VERSION, StoreSummary, SuppressionConfig, SyncOffer,
+    derive_msg_id, sign_packet,
 };
 use ao_idents::{Identity, SealedMessage};
 use ao_network::{
@@ -55,6 +57,16 @@ pub enum Topology {
     Line,
     /// A cycle of `n` nodes, each in range of its two neighbours.
     Ring,
+    /// A fixed circulant: each node reaches `i +/- step` for every step.
+    ///
+    /// MSH-19 uses coprime steps 1, 8 and 12 on 50 nodes. The six-degree
+    /// graph has diameter three, exactly ADR-0001's Presence TTL, so the
+    /// convergence case does not need a longer relay hop limit. The scenario
+    /// raises aoNetwork's link cap to six; production still uses five.
+    Circulant {
+        /// Positive index offsets, all smaller than `n / 2`.
+        steps: Vec<usize>,
+    },
     /// `groups` clusters with seeded centres, for community mobility.
     Communities {
         /// Number of equally sized communities.
@@ -129,6 +141,10 @@ pub enum Traffic {
         /// Submit one Direct canary every `direct_every` messages.
         direct_every: usize,
     },
+    /// No application traffic: only MSH-19 announcements are gossiped.
+    ///
+    /// This isolates presence convergence and overhead from message delivery.
+    Presence,
 }
 
 /// One reproducible experiment.
@@ -174,6 +190,13 @@ pub struct Scenario {
     pub receipts: bool,
     /// Suppression bounds and timer parameters under test.
     pub suppression: SuppressionConfig,
+    /// Whether links advertise and consume MSH-19 announcements.
+    ///
+    /// Existing baselines leave this false so their published numbers and
+    /// pre-MSH-19 fallback behaviour stay unchanged.
+    pub presence: bool,
+    /// Presence trickle parameters under test.
+    pub presence_config: PresenceConfig,
 }
 
 /// Everything one run measured. Ratios are fractions, not percentages.
@@ -257,17 +280,43 @@ pub struct Metrics {
     ///
     /// Not part of the CSV report; bounded by the MSH-02 immunity lifetime.
     pub max_purge_latency_ms: u64,
+    /// Whether every node learned every other node's announcement.
+    ///
+    /// Not part of the CSV report; MSH-19 convergence evidence.
+    pub presence_converged: bool,
+    /// Run-relative time when the last node reached full knowledge.
+    ///
+    /// Not part of the CSV report; zero when convergence did not happen.
+    pub convergence_ms: u64,
+    /// Fewest announcements learned by any node at the end of the run.
+    ///
+    /// Not part of the CSV report; the denominator is `nodes - 1`.
+    pub learned_nodes_min: usize,
+    /// Unknown-card host events emitted during the run.
+    ///
+    /// Not part of the CSV report; the fixed scenario declares all hashes.
+    pub card_fetches: u64,
+    /// Announcement sends and wire bytes during the run.
+    ///
+    /// Not part of the CSV report; these isolate MSH-19 from other traffic.
+    pub announcement_sends: u64,
+    /// Announcement wire bytes during the run.
+    pub announcement_bytes: u64,
+    /// Announcement sends in the last 60 seconds of the run.
+    pub steady_announcement_sends: u64,
+    /// Announcement wire bytes in the last 60 seconds of the run.
+    pub steady_announcement_bytes: u64,
 }
 
 impl Metrics {
     /// CSV column names, in the same order as [`Self::csv_row`].
     pub fn csv_header() -> &'static str {
-        "scenario,seed,nodes,submitted,delivered,duplicate_deliveries,transmissions,receptions,send_failures,radio_bytes,mean_latency_ms,max_latency_ms,delivery_ratio,overhead,duplicate_ratio,peak_queued_bytes,links_after_settle"
+        "scenario,seed,nodes,submitted,delivered,duplicate_deliveries,transmissions,receptions,send_failures,radio_bytes,mean_latency_ms,max_latency_ms,delivery_ratio,overhead,duplicate_ratio,peak_queued_bytes,links_after_settle,presence_converged,convergence_ms,learned_nodes_min,card_fetches,announcement_sends,announcement_bytes,steady_announcement_sends,steady_announcement_bytes"
     }
     /// One CSV line with four decimal places on every ratio.
     pub fn csv_row(&self) -> String {
         format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{},{},{},{},{},{},{},{},{},{}",
             self.scenario,
             self.seed,
             self.nodes,
@@ -285,6 +334,14 @@ impl Metrics {
             self.duplicate_ratio,
             self.peak_queued_bytes,
             self.links_after_settle,
+            self.presence_converged,
+            self.convergence_ms,
+            self.learned_nodes_min,
+            self.card_fetches,
+            self.announcement_sends,
+            self.announcement_bytes,
+            self.steady_announcement_sends,
+            self.steady_announcement_bytes,
         )
     }
 }
@@ -309,6 +366,8 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             spray: false,
             receipts: false,
             suppression: SuppressionConfig::default(),
+            presence: false,
+            presence_config: PresenceConfig::default(),
         },
         Scenario {
             name: "waypoint-50",
@@ -328,6 +387,8 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             spray: false,
             receipts: false,
             suppression: SuppressionConfig::default(),
+            presence: false,
+            presence_config: PresenceConfig::default(),
         },
         Scenario {
             name: "community-100",
@@ -347,6 +408,8 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             spray: false,
             receipts: false,
             suppression: SuppressionConfig::default(),
+            presence: false,
+            presence_config: PresenceConfig::default(),
         },
         Scenario {
             name: "scripted-200",
@@ -364,6 +427,8 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             spray: false,
             receipts: false,
             suppression: SuppressionConfig::default(),
+            presence: false,
+            presence_config: PresenceConfig::default(),
         },
     ]
 }
@@ -396,6 +461,8 @@ pub fn flood_scenarios() -> Vec<Scenario> {
         spray: false,
         receipts: false,
         suppression: SuppressionConfig::default(),
+        presence: false,
+        presence_config: PresenceConfig::default(),
     }]
 }
 
@@ -427,6 +494,8 @@ pub fn suppression_scenarios() -> Vec<Scenario> {
         spray: false,
         receipts: false,
         suppression: SuppressionConfig::default(),
+        presence: false,
+        presence_config: PresenceConfig::default(),
     }]
 }
 
@@ -452,6 +521,8 @@ pub fn spray_scenarios() -> Vec<Scenario> {
         spray: false,
         receipts: false,
         suppression: SuppressionConfig::default(),
+        presence: false,
+        presence_config: PresenceConfig::default(),
     };
     let scripted = Scenario {
         name: "spray-relay-scripted-200",
@@ -469,6 +540,8 @@ pub fn spray_scenarios() -> Vec<Scenario> {
         spray: false,
         receipts: false,
         suppression: SuppressionConfig::default(),
+        presence: false,
+        presence_config: PresenceConfig::default(),
     };
     vec![
         line.clone(),
@@ -510,6 +583,8 @@ pub fn receipt_scenarios() -> Vec<Scenario> {
         spray: true,
         receipts: false,
         suppression: SuppressionConfig::default(),
+        presence: false,
+        presence_config: PresenceConfig::default(),
     };
     let scripted = Scenario {
         name: "receipt-relay-scripted-200",
@@ -527,6 +602,8 @@ pub fn receipt_scenarios() -> Vec<Scenario> {
         spray: true,
         receipts: false,
         suppression: SuppressionConfig::default(),
+        presence: false,
+        presence_config: PresenceConfig::default(),
     };
     vec![
         line.clone(),
@@ -542,6 +619,45 @@ pub fn receipt_scenarios() -> Vec<Scenario> {
             ..scripted
         },
     ]
+}
+
+/// MSH-19's fixed 50-node presence case.
+///
+/// The topology is a seeded four-degree circulant with diameter two, so
+/// ADR-0001's three-hop Presence TTL can reach the whole mesh. No application
+/// messages are submitted: every byte on the wire is an announcement or an
+/// ordinary link-control frame. The one-second quick delay proves bounded
+/// convergence, and a 60-second steady interval is deliberately more frequent
+/// than the 15-minute default so a short run still measures a conservative
+/// per-node hourly overhead. All nodes declare each other's card hashes, so
+/// zero `CardFetch` events is part of the expected steady state.
+pub fn presence_scenarios() -> Vec<Scenario> {
+    vec![Scenario {
+        name: "presence-smallworld-50",
+        seed: 1_297_304_021,
+        nodes: 50,
+        topology: Topology::Circulant {
+            steps: vec![1, 8, 12],
+        },
+        mobility: Mobility::Static,
+        settle: Duration::from_secs(30),
+        run: Duration::from_secs(120),
+        messages: 0,
+        payload_len: 0,
+        traffic: Traffic::Presence,
+        enforce_budgets: true,
+        enforce_suppression: true,
+        spray: false,
+        receipts: false,
+        suppression: SuppressionConfig::default(),
+        presence: true,
+        presence_config: PresenceConfig {
+            quick_ms: 1_000,
+            base_interval_ms: 60_000,
+            steady_interval_ms: 60_000,
+            ..PresenceConfig::default()
+        },
+    }]
 }
 
 /// A permanent chain plus short-lived shortcuts on a 200-node chain.
@@ -577,6 +693,7 @@ fn next(state: &mut u64) -> u64 {
 
 struct Node {
     adapter: NetworkAdapter<EngineRng, SimTransport>,
+    card_hash: [u8; 8],
     pos: (i64, i64),
     group: usize,
 }
@@ -619,6 +736,13 @@ pub struct Simulation {
     first_delivery_ms: BTreeMap<MessageId, u64>,
     purge_latencies: Vec<u64>,
     purge_recorded: BTreeSet<MessageId>,
+    presence_converged: bool,
+    convergence_ms: u64,
+    card_fetches: u64,
+    announcement_sends: u64,
+    announcement_bytes: u64,
+    steady_announcement_sends: u64,
+    steady_announcement_bytes: u64,
 }
 
 impl Simulation {
@@ -631,7 +755,10 @@ impl Simulation {
     /// never packet-driven paths.
     pub fn new(scenario: Scenario) -> Self {
         assert!(scenario.nodes > 0, "a scenario needs nodes");
-        assert!(scenario.messages > 0, "a scenario needs messages");
+        assert!(
+            scenario.messages > 0 || matches!(scenario.traffic, Traffic::Presence),
+            "a scenario needs messages"
+        );
         let world = SimWorld::new(WorldConfig {
             seed: scenario.seed,
             ..WorldConfig::default()
@@ -643,6 +770,7 @@ impl Simulation {
         let mut rng = scenario.seed;
         let mut nodes = Vec::with_capacity(n);
         let mut identities = Vec::with_capacity(n);
+        let mut card_hashes = Vec::with_capacity(n);
         for i in 0..n {
             let radio = world
                 .add_node(SimNode::default())
@@ -650,14 +778,21 @@ impl Simulation {
             let mut seed_input = [0u8; 16];
             seed_input[..8].copy_from_slice(&scenario.seed.to_be_bytes());
             seed_input[8..].copy_from_slice(&(i as u64).to_be_bytes());
+            let digest = blake3::hash(&seed_input);
             let mut seed = [0u8; 32];
-            seed.copy_from_slice(blake3::hash(&seed_input).as_bytes());
+            seed.copy_from_slice(digest.as_bytes());
+            let mut card_hash = [0u8; 8];
+            card_hash.copy_from_slice(&digest.as_bytes()[8..16]);
             let identity = Identity::from_seed(seed);
             let engine_rng = EngineRng::seed_from_u64(scenario.seed ^ (i as u64 + 1));
             let mut engine_config = MeshConfig::default();
             engine_config.budgets.enforce = scenario.enforce_budgets;
             engine_config.spray.enabled = scenario.spray;
             engine_config.receipt.enabled = scenario.receipts;
+            engine_config.presence = PresenceConfig {
+                enabled: scenario.presence,
+                ..scenario.presence_config
+            };
             engine_config.suppression = SuppressionConfig {
                 enabled: scenario.enforce_suppression,
                 ..scenario.suppression
@@ -667,8 +802,16 @@ impl Simulation {
             // advertise the engine's actual digest, otherwise every link
             // looks different and MSH-14 starts a needless sync contact.
             let store_digest = engine.sync().local_digest();
-            let mut adapter =
-                NetworkAdapter::new(engine, Network::new(NetworkConfig::default(), radio));
+            let network_config = if matches!(scenario.topology, Topology::Circulant { .. }) {
+                // The circulant's full six-degree graph is part of the
+                // scenario; aoNetwork still owns and enforces the cap.
+                NetworkConfig::default()
+                    .with_max_links(6)
+                    .expect("six is a valid link cap")
+            } else {
+                NetworkConfig::default()
+            };
+            let mut adapter = NetworkAdapter::new(engine, Network::new(network_config, radio));
             let tag = {
                 let mut t = next(&mut rng).to_be_bytes().repeat(2);
                 t[0] = i as u8;
@@ -676,12 +819,15 @@ impl Simulation {
                 out.copy_from_slice(&t[..16]);
                 LocalTag::new(out)
             };
-            let caps = if scenario.receipts {
+            let mut caps = if scenario.receipts {
                 CAPS
             } else {
                 CAPS & !CAP_RECEIPT_V1
             };
-            let signed = MeshHello::sign_with_caps(&identity, [0; 8], store_digest, caps)
+            if !scenario.presence {
+                caps &= !CAP_PRESENCE_V1;
+            }
+            let signed = MeshHello::sign_with_caps(&identity, card_hash, store_digest, caps)
                 .expect("fixed identity signs");
             let applied = adapter.apply(
                 world.now(),
@@ -706,7 +852,7 @@ impl Simulation {
             );
             let pos = match scenario.topology {
                 Topology::Line => ((i as i64) * radius, 0),
-                Topology::Ring => ring_position(i, n, side),
+                Topology::Ring | Topology::Circulant { .. } => ring_position(i, n, side),
                 Topology::Random | Topology::Communities { .. } | Topology::Scripted(_) => {
                     let x = (next(&mut rng) % side as u64) as i64;
                     let y = (next(&mut rng) % side as u64) as i64;
@@ -714,8 +860,10 @@ impl Simulation {
                 }
             };
             identities.push(identity);
+            card_hashes.push(card_hash);
             nodes.push(Node {
                 adapter,
+                card_hash,
                 pos,
                 group: match scenario.topology {
                     Topology::Communities { groups } => i % groups.max(1),
@@ -726,9 +874,16 @@ impl Simulation {
         let mut ranges = vec![vec![false; n]; n];
         for a in 0..n {
             for b in a + 1..n {
-                let on = match scenario.topology {
+                let on = match &scenario.topology {
                     Topology::Line => b == a + 1,
                     Topology::Ring => b == a + 1 || (a == 0 && b == n - 1),
+                    Topology::Circulant { steps } => {
+                        let forward = (b + n - a) % n;
+                        steps.iter().any(|step| {
+                            *step != 0
+                                && (*step == forward || n.checked_sub(*step) == Some(forward))
+                        })
+                    }
                     Topology::Random => near(nodes[a].pos, nodes[b].pos, radius),
                     Topology::Communities { .. } => {
                         near(nodes[a].pos, nodes[b].pos, radius)
@@ -739,6 +894,27 @@ impl Simulation {
                 };
                 ranges[a][b] = on;
                 ranges[b][a] = on;
+            }
+        }
+        // The host declares all cards up front. With a complete set the
+        // presence scenario must emit no CardFetch events, which also proves
+        // that refreshes do not repeatedly ask for the same hash.
+        if scenario.presence {
+            for node in &mut nodes {
+                let outputs = node
+                    .adapter
+                    .engine_mut()
+                    .handle(
+                        0,
+                        MeshInput::KnownCards {
+                            hashes: &card_hashes,
+                        },
+                    )
+                    .expect("bounded known-card input");
+                assert!(
+                    outputs.is_empty(),
+                    "known cards are host state, not packets: {outputs:?}"
+                );
             }
         }
         let applied = vec![vec![false; n]; n];
@@ -793,6 +969,13 @@ impl Simulation {
             first_delivery_ms: BTreeMap::new(),
             purge_latencies: Vec::new(),
             purge_recorded: BTreeSet::new(),
+            presence_converged: false,
+            convergence_ms: 0,
+            card_fetches: 0,
+            announcement_sends: 0,
+            announcement_bytes: 0,
+            steady_announcement_sends: 0,
+            steady_announcement_bytes: 0,
         };
         sim.apply_ranges();
         sim
@@ -1104,9 +1287,52 @@ impl Simulation {
                         }
                     }
                 }
+                // Presence trickle is host-driven: the borrowed identity and
+                // card hash are supplied on every tick, never retained.
+                let card_hash = self.nodes[i].card_hash;
+                let outputs = self.nodes[i]
+                    .adapter
+                    .engine_mut()
+                    .handle(
+                        now_ms,
+                        MeshInput::Tick {
+                            identity: &self.identities[i],
+                            card_hash,
+                        },
+                    )
+                    .expect("presence tick inputs are well formed");
+                self.count_outputs(i, now_ms, &outputs);
+                self.service_stores(i, now, now_ms, outputs.clone());
+                let events = self.nodes[i].adapter.apply(now, outputs);
+                for event in events {
+                    if let crate::AdapterEvent::SendFailed { .. } = event {
+                        self.send_failures += 1;
+                    }
+                }
+            }
+            if self.scenario.presence && !self.presence_converged && self.run_started {
+                let learned = self
+                    .nodes
+                    .iter()
+                    .map(|node| node.adapter.engine().presence().len())
+                    .min()
+                    .unwrap_or(0);
+                if learned >= self.nodes.len().saturating_sub(1) {
+                    self.presence_converged = true;
+                    self.convergence_ms = now_ms.saturating_sub(self.run_start_ms);
+                }
             }
             self.sample_queues();
         }
+    }
+
+    /// True only for an MSH-19 announcement, not other Presence traffic.
+    fn is_announcement(payload: &[u8]) -> bool {
+        Packet::decode(payload).is_ok_and(|packet| {
+            packet.header.class == PacketClass::Presence
+                && packet.payload.len() == ANNOUNCE_LEN
+                && packet.payload.first() == Some(&ANNOUNCE_MAGIC)
+        })
     }
 
     fn count_outputs(&mut self, node: usize, now_ms: u64, outputs: &[MeshOutput]) {
@@ -1115,6 +1341,14 @@ impl Simulation {
                 MeshOutput::Send { link, payload, .. } => {
                     self.transmissions += 1;
                     *self.pending[node].entry(*link).or_insert(0) += payload.len() as u64;
+                    if self.run_started && Self::is_announcement(payload) {
+                        self.announcement_sends += 1;
+                        self.announcement_bytes += payload.len() as u64;
+                        if now_ms >= self.run_start_ms + 60_000 {
+                            self.steady_announcement_sends += 1;
+                            self.steady_announcement_bytes += payload.len() as u64;
+                        }
+                    }
                 }
                 MeshOutput::Broadcast { payload, .. } => {
                     let links = self.nodes[node].adapter.network().links();
@@ -1151,6 +1385,7 @@ impl Simulation {
                 {
                     self.receipts += 1;
                 }
+                MeshOutput::CardFetch { .. } => self.card_fetches += 1,
                 _ => {}
             }
         }
@@ -1254,6 +1489,10 @@ impl Simulation {
                     (origin.min(n - 1), true)
                 }
             }
+            // Presence scenarios submit no application messages, so this is
+            // unreachable for the fixed scenario. Returning keeps the harness
+            // total without a panic on a misconfigured scenario.
+            Traffic::Presence => return,
         };
         // Destinations stay inside the packet's eight-hop TTL so the
         // baseline measures forwarding, not expiry at an impossible
@@ -1380,6 +1619,17 @@ impl Simulation {
             self.latencies.iter().sum::<u64>() / self.latencies.len() as u64
         };
         let max = self.latencies.iter().copied().max().unwrap_or(0);
+        let learned_nodes_min = self
+            .nodes
+            .iter()
+            .map(|node| node.adapter.engine().presence().len())
+            .min()
+            .unwrap_or(0);
+        let denominator = if self.direct_submitted > 0 {
+            self.direct_submitted
+        } else {
+            self.submitted
+        };
         Metrics {
             scenario: self.scenario.name,
             seed: self.scenario.seed,
@@ -1394,12 +1644,11 @@ impl Simulation {
             radio_bytes: self.radio_bytes_run,
             mean_latency_ms: mean,
             max_latency_ms: max,
-            delivery_ratio: self.delivered as f64
-                / if self.direct_submitted > 0 {
-                    self.direct_submitted
-                } else {
-                    self.submitted
-                } as f64,
+            delivery_ratio: if denominator == 0 {
+                0.0
+            } else {
+                self.delivered as f64 / denominator as f64
+            },
             overhead: self.transmissions as f64 / self.delivered.max(1) as f64,
             duplicate_ratio: self.duplicate_deliveries as f64 / self.delivered.max(1) as f64,
             peak_queued_bytes: self.peak_queued_bytes,
@@ -1432,6 +1681,14 @@ impl Simulation {
                 .map(|ids| ids.len() as u64)
                 .collect(),
             unique_receptions: self.received_ids.iter().map(BTreeSet::len).sum::<usize>() as u64,
+            presence_converged: self.presence_converged,
+            convergence_ms: self.convergence_ms,
+            learned_nodes_min,
+            card_fetches: self.card_fetches,
+            announcement_sends: self.announcement_sends,
+            announcement_bytes: self.announcement_bytes,
+            steady_announcement_sends: self.steady_announcement_sends,
+            steady_announcement_bytes: self.steady_announcement_bytes,
         }
     }
 }
@@ -1890,6 +2147,14 @@ mod tests {
             remaining_delivered_copies: 0,
             remaining_delivered_copies_immune: 0,
             max_purge_latency_ms: 18,
+            presence_converged: true,
+            convergence_ms: 9_000,
+            learned_nodes_min: 1,
+            card_fetches: 0,
+            announcement_sends: 12,
+            announcement_bytes: 1_800,
+            steady_announcement_sends: 4,
+            steady_announcement_bytes: 600,
         };
         let row = m.csv_row();
         assert_eq!(row.lines().count(), 1);
@@ -1899,7 +2164,7 @@ mod tests {
         );
         assert_eq!(
             row,
-            "test,1,2,3,2,0,8,6,0,1024,12,20,0.6667,4.0000,0.0000,100,1"
+            "test,1,2,3,2,0,8,6,0,1024,12,20,0.6667,4.0000,0.0000,100,1,true,9000,1,0,12,1800,4,600"
         );
     }
 

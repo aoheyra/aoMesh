@@ -194,7 +194,17 @@ fn default_bound_and_every_input_change_only_their_owned_state() {
     assert_eq!(n.rejected_packets, 0);
     assert_eq!(n.received_bytes, packet.len() as u64);
     assert_eq!(n.last_rx_ms, Some(20));
-    assert!(e.handle(30, MeshInput::Tick).unwrap().is_empty());
+    assert!(
+        e.handle(
+            30,
+            MeshInput::Tick {
+                identity: &LOCAL,
+                card_hash: [0; 8]
+            }
+        )
+        .unwrap()
+        .is_empty()
+    );
     assert_eq!(e.neighbors().get(link).unwrap().last_rx_ms, Some(20));
     assert!(
         e.handle(
@@ -1193,8 +1203,26 @@ fn broadcast_waits_for_its_timer_before_relaying_once() {
         .is_empty(),
         "the first copy must wait"
     );
-    assert!(e.handle(109, MeshInput::Tick).unwrap().is_empty());
-    let due = e.handle(110, MeshInput::Tick).unwrap();
+    assert!(
+        e.handle(
+            109,
+            MeshInput::Tick {
+                identity: &LOCAL,
+                card_hash: [0; 8]
+            }
+        )
+        .unwrap()
+        .is_empty()
+    );
+    let due = e
+        .handle(
+            110,
+            MeshInput::Tick {
+                identity: &LOCAL,
+                card_hash: [0; 8],
+            },
+        )
+        .unwrap();
     let [MeshOutput::Send { link, payload, .. }] = due.as_slice() else {
         panic!("expected one timed relay, {due:?}")
     };
@@ -1203,7 +1231,15 @@ fn broadcast_waits_for_its_timer_before_relaying_once() {
     assert_eq!(decoded.header.ttl, 5);
     assert_eq!(decoded.header.hops, 1);
     assert!(
-        e.handle(111, MeshInput::Tick).unwrap().is_empty(),
+        e.handle(
+            111,
+            MeshInput::Tick {
+                identity: &LOCAL,
+                card_hash: [0; 8]
+            }
+        )
+        .unwrap()
+        .is_empty(),
         "a timer fires once"
     );
 }
@@ -1240,7 +1276,15 @@ fn distinct_neighbour_copies_cancel_a_broadcast_relay() {
         );
     }
     assert!(
-        e.handle(1_000, MeshInput::Tick).unwrap().is_empty(),
+        e.handle(
+            1_000,
+            MeshInput::Tick {
+                identity: &LOCAL,
+                card_hash: [0; 8]
+            }
+        )
+        .unwrap()
+        .is_empty(),
         "enough copies cancel the pending relay"
     );
 }
@@ -1271,7 +1315,17 @@ fn disabled_suppression_restores_immediate_flooding() {
         )
         .unwrap();
     assert_eq!(sent.len(), 1);
-    assert!(e.handle(101, MeshInput::Tick).unwrap().is_empty());
+    assert!(
+        e.handle(
+            101,
+            MeshInput::Tick {
+                identity: &LOCAL,
+                card_hash: [0; 8]
+            }
+        )
+        .unwrap()
+        .is_empty()
+    );
 }
 
 #[test]
@@ -1329,7 +1383,15 @@ fn budget_denied_broadcast_and_presence_never_enter_suppression() {
             .unwrap();
         assert!(out.is_empty(), "{class:?} denial must not relay: {out:?}");
         assert!(
-            e.handle(1_000, MeshInput::Tick).unwrap().is_empty(),
+            e.handle(
+                1_000,
+                MeshInput::Tick {
+                    identity: &LOCAL,
+                    card_hash: [0; 8]
+                }
+            )
+            .unwrap()
+            .is_empty(),
             "{class:?} denial must not start a suppression timer"
         );
         assert_eq!(
@@ -1373,7 +1435,17 @@ fn tampered_broadcast_is_not_counted_as_a_suppression_copy() {
         out.is_empty(),
         "a forged packet cannot suppress or relay: {out:?}"
     );
-    assert!(e.handle(1_000, MeshInput::Tick).unwrap().is_empty());
+    assert!(
+        e.handle(
+            1_000,
+            MeshInput::Tick {
+                identity: &LOCAL,
+                card_hash: [0; 8]
+            }
+        )
+        .unwrap()
+        .is_empty()
+    );
     assert_eq!(
         e.neighbors().get(LinkId::new(1)).unwrap().rejected_packets,
         1

@@ -211,7 +211,14 @@ fn link_up_data_and_link_down_run_through_the_facade_and_engine() {
     );
     assert!(
         nodes[0]
-            .handle(world.now(), 5000, MeshInput::Tick)
+            .handle(
+                world.now(),
+                5000,
+                MeshInput::Tick {
+                    identity: &identity,
+                    card_hash: [0; 8],
+                },
+            )
             .unwrap()
             .is_empty()
     );

@@ -39,7 +39,11 @@ pub struct SuppressionConfig {
     pub degree_ref: usize,
     /// Copy threshold at `degree_ref`.
     pub k_at_degree_ref: usize,
-    /// Lower bound for the degree-scaled copy threshold.
+    /// Configured lower bound for the degree-scaled copy threshold.
+    ///
+    /// [`SuppressionTable::observe`] always requires at least two distinct
+    /// sending links, because one copy cannot prove the flood reached this
+    /// node's neighbours.
     pub min_k: usize,
     /// Upper bound for the degree-scaled copy threshold.
     pub max_k: usize,
@@ -289,13 +293,15 @@ impl SuppressionTable {
                 self.entries.remove(&victim);
             }
         }
-        let threshold = threshold.max(1);
+        // One copy proves only that this node heard the packet. Cancelling on
+        // it would let suppression extinguish a flood at the first hop,
+        // especially on a line or a small-degree graph. Every degree-scaled
+        // threshold is therefore floored at two distinct sending links; if no
+        // second copy arrives, `take_due` relays when the timer fires.
+        let threshold = threshold.max(2);
         let mut senders = BTreeSet::new();
         senders.insert(sender);
         if senders.len() >= threshold {
-            // A threshold of one means a single sighting is enough to
-            // cancel; the seen-cache still records it so later copies
-            // cannot restart this decision.
             return Observe::Suppressed;
         }
         self.entries.insert(
@@ -440,6 +446,20 @@ mod tests {
             Observe::Suppressed
         );
         assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn a_single_copy_is_never_enough_to_cancel_a_flood() {
+        let mut table = SuppressionTable::new(config());
+        assert_eq!(
+            table.observe(sight(0, ID, LINK_A, 1, 100, vec![1])),
+            Observe::Pending,
+            "a degree-one neighbour must not extinguish the flood"
+        );
+        assert_eq!(
+            table.observe(sight(1, ID, LINK_B, 1, 100, vec![1])),
+            Observe::Suppressed
+        );
     }
 
     #[test]
