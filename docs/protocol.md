@@ -158,6 +158,18 @@ verified `node_id` (ADR-0004) and content whose bytes no longer match its
 trust decision: this path verifies no origin signature, and MSH-09
 authenticates local delivery. Link-up authentication is MSH-07 (above).
 
+## Simulation evidence (MSH-27)
+
+No wire format changes. Feature `sim` drives the codec and engine over aoNetwork's
+paused `SimWorld` with fixed seeds, signed hellos, mobility and scripted
+contacts. It reports delivery ratio, latency, overhead, duplicate ratio, radio
+bytes and queue occupancy as CSV; the published seeds, numbers and regeneration
+commands are in the README section "Simulator harness and baseline". The
+nightly `sim` workflow fails on any directional regression against those
+numbers, so protocol or routing changes must state their measured effect. See
+[the simulator baseline decision](adr/simulator-baseline.md) for the scenario
+and metric choices.
+
 ## Local storage metadata
 
 MSH-12 stores encoded packets unchanged. Local copies_left, priority,

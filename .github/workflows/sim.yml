@@ -1,0 +1,30 @@
+name: Simulator baseline
+
+on:
+  schedule:
+    # 03:17 UTC every day, after the day's merges settle.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  baseline:
+    name: Published baseline
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v7
+      - name: install rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: write CSV report
+        run: cargo run --release --features sim --example sim_report -- baselines.csv
+      - name: enforce thresholds
+        run: cargo test --release --all-features --test sim_baseline
+      - name: upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-baselines
+          path: baselines.csv

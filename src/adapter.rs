@@ -50,6 +50,16 @@ impl<R: RngCore, T: Transport> NetworkAdapter<R, T> {
     pub fn network(&self) -> &Network<T> {
         &self.network
     }
+    /// Borrow the engine to feed a host input directly. The simulator uses
+    /// this to count the outputs before the adapter applies them.
+    pub fn engine_mut(&mut self) -> &mut MeshEngine<R> {
+        &mut self.engine
+    }
+    /// Borrow the network to poll a transport event directly. The
+    /// simulator uses this with [`Self::engine_mut`] and [`Self::apply`].
+    pub fn network_mut(&mut self) -> &mut Network<T> {
+        &mut self.network
+    }
     /// Earliest network timer; the caller must arrange a wakeup by this time.
     pub fn next_deadline(&self) -> Option<Duration> {
         self.network.next_deadline()

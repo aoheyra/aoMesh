@@ -14,9 +14,18 @@ categories = ["network-programming"]
 [features]
 # Runtime-neutral async glue, compatible with a Tokio-owned task.
 adapter = []
+# Deterministic SimWorld scenarios and the CSV metrics report (MSH-27).
+# The simulator is host-side tooling, never part of the sans-IO core.
+sim = ["adapter", "rand08", "rand"]
 
 [dependencies]
 rand_core = "0.9"
+# aoIdents seals under rand_core 0.6; the simulator needs a deterministic
+# CSPRNG on that trait line. Production callers pass their own CSPRNG.
+rand08 = { package = "rand", version = "0.8", optional = true }
+# The engine is on rand_core 0.9; rand 0.9 supplies its seeded StdRng.
+# The dev-dependency below uses the same package and version.
+rand = { version = "0.9", optional = true }
 # Siblings are consumed by git (master until v0.1.0 tags exist, then tags).
 # Local overrides: docs/local-development.md — never commit a [patch].
 ao_network = { version = "0.1.0", git = "https://github.com/aoheyra/aoNetwork" }
@@ -34,3 +43,7 @@ proptest = { version = "1.8", default-features = false, features = ["std"] }
 [[example]]
 name = "mesh_adapter"
 required-features = ["adapter"]
+
+[[example]]
+name = "sim_report"
+required-features = ["sim"]

@@ -7,6 +7,16 @@ change without notice until v0.1.0, and consumers pin by git tag
 
 ## Unreleased
 
+MSH-27 adds a deterministic SimWorld harness behind feature `sim`. It drives
+signed hellos, link events and the engine through the adapter across a 20-node
+line, a 50-node random waypoint network, a 100-node community network and a
+200-node chain with scripted contacts. `examples/sim_report` prints CSV or
+writes it to a path; `tests/sim_baseline.rs` and `.github/workflows/sim.yml`
+enforce directional regression bounds on delivery ratio, overhead, latency,
+duplicates, radio bytes and peak queue occupancy. The adapter gains
+`engine_mut` and `network_mut` so the harness can count outputs before they
+are applied. Published seeds and numbers are in the README.
+
 MSH-08 adds the baseline forwarding path for Direct. A received packet
 must re-derive its content-bound `msg_id` before any state changes, is
 recorded once in the seen-cache, is delivered when `dst` matches the
