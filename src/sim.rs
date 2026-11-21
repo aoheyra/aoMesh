@@ -356,10 +356,11 @@ pub struct Simulation {
     duplicate_deliveries: u64,
     transmissions: u64,
     send_failures: u64,
-    radio_bytes_start: u64,
+    radio_bytes_run: u64,
     peak_queued_bytes: usize,
     pending: Vec<BTreeMap<LinkId, u64>>,
     tx_last: Vec<BTreeMap<LinkId, u64>>,
+    radio_tx_last: Vec<BTreeMap<LinkId, u64>>,
     latencies: Vec<u64>,
     delivered_ids: Vec<BTreeSet<MessageId>>,
     delivered_by_origin: Vec<u64>,
@@ -501,10 +502,11 @@ impl Simulation {
             duplicate_deliveries: 0,
             transmissions: 0,
             send_failures: 0,
-            radio_bytes_start: 0,
+            radio_bytes_run: 0,
             peak_queued_bytes: 0,
             pending: vec![BTreeMap::new(); n],
             tx_last: vec![BTreeMap::new(); n],
+            radio_tx_last: vec![BTreeMap::new(); n],
             latencies: Vec::new(),
             delivered_ids,
             delivered_by_origin: vec![0; n],
@@ -532,25 +534,14 @@ impl Simulation {
         }
     }
 
-    fn total_radio_bytes(&self) -> u64 {
-        (0..self.nodes.len()).map(|i| self.node_tx_bytes(i)).sum()
-    }
-
-    fn node_tx_bytes(&self, node: usize) -> u64 {
-        self.nodes[node]
-            .adapter
-            .network()
-            .links()
-            .iter()
-            .map(|link| link.metrics.tx_bytes)
-            .sum()
-    }
-
     /// Bytes accepted by the network but not yet written to the radio.
     ///
     /// aoNetwork exposes per-link `tx_bytes` but not the queue itself, so the
     /// harness tracks enqueued bytes per link and retires them as the radio
     /// counter advances. A link that closes drops its remaining bytes.
+    /// Radio bytes are accumulated per tick from every up link: subtracting
+    /// two snapshots of only the currently up links would lose or invent
+    /// bytes whenever mobility closes and opens links during the run.
     fn sample_queues(&mut self) {
         for i in 0..self.nodes.len() {
             let up: Vec<LinkInfo> = self.nodes[i].adapter.network().links();
@@ -559,6 +550,12 @@ impl Simulation {
                 let last = self.tx_last[i].insert(link.link, tx).unwrap_or(0);
                 if let Some(pending) = self.pending[i].get_mut(&link.link) {
                     *pending = pending.saturating_sub(tx.saturating_sub(last));
+                }
+                if self.run_started {
+                    let radio_last = self.radio_tx_last[i].insert(link.link, tx).unwrap_or(0);
+                    self.radio_bytes_run = self
+                        .radio_bytes_run
+                        .saturating_add(tx.saturating_sub(radio_last));
                 }
             }
             let up_ids: BTreeSet<LinkId> = up.iter().map(|link| link.link).collect();
@@ -578,11 +575,14 @@ impl Simulation {
         for i in 0..self.nodes.len() {
             self.pending[i].clear();
             self.tx_last[i].clear();
+            self.radio_tx_last[i].clear();
             for link in self.nodes[i].adapter.network().links() {
                 self.tx_last[i].insert(link.link, link.metrics.tx_bytes);
+                self.radio_tx_last[i].insert(link.link, link.metrics.tx_bytes);
             }
         }
         self.peak_queued_bytes = 0;
+        self.radio_bytes_run = 0;
     }
 
     /// Advances the world, drives every node and samples queue occupancy.
@@ -818,7 +818,6 @@ impl Simulation {
             .sum();
         self.run_start_ms = self.world.now().as_millis() as u64;
         self.run_started = true;
-        self.radio_bytes_start = self.total_radio_bytes();
         self.reset_queue_baseline();
         let run_steps = (self.scenario.run.as_millis() / TICK.as_millis()) as usize;
         let steps = run_steps.max(1);
@@ -862,9 +861,7 @@ impl Simulation {
             transmissions: self.transmissions,
             receptions,
             send_failures: self.send_failures,
-            radio_bytes: self
-                .total_radio_bytes()
-                .saturating_sub(self.radio_bytes_start),
+            radio_bytes: self.radio_bytes_run,
             mean_latency_ms: mean,
             max_latency_ms: max,
             delivery_ratio: self.delivered as f64 / self.submitted as f64,

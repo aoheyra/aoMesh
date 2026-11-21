@@ -7,6 +7,16 @@ change without notice until v0.1.0, and consumers pin by git tag
 
 ## Unreleased
 
+The MSH-27 baseline fixture was regenerated against aoNetwork `492e148c`
+(Net 25 flow control). The refreshed sibling changed simulated link formation:
+waypoint and community delivery improved, waypoint overhead fell, community
+overhead rose from 328.5541 to 328.7067, and the exact link counts moved from
+182/424 to 180/412. Radio-byte accounting now accumulates per-tick `tx_bytes`
+deltas per link instead of subtracting two snapshots of only live links, so
+traffic on links that close during mobility is counted; the higher radio-byte
+figures are a measurement fix, not a routing regression. Repeated debug and
+release runs produced identical metrics. No aoMesh routing code changed.
+
 MSH-10 adds per-origin and per-neighbour token buckets with the ADR-0001 class
 rates and a ten-minute burst. Relays debit both buckets before sending copies;
 local delivery is unaffected. Invalid, unverified and over-budget traffic adds
