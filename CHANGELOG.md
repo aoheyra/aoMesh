@@ -7,6 +7,13 @@ change without notice until v0.1.0, and consumers pin by git tag
 
 ## Unreleased
 
+MSH-21 fixes expiry refresh caused solely by a deterministic link-id tie-break.
+Shortest-path observation injection is now opt-in for paired route-hint scenarios;
+ordinary scenarios retain their original directory schedules. Directory reports
+observe expiry events from ordinary engine ticks as well as dedicated observation
+steps. The original directory and route-hint simulator assertions are unchanged.
+
+
 MSH-19 adds bounded presence announcements. An ordinary signed `Presence`
 packet carries a fixed 150-byte body with the origin's card hash, capabilities,
 sequence and existing public identity, so every relay can verify the binding

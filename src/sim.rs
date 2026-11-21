@@ -229,6 +229,9 @@ pub struct Scenario {
     pub receipts: bool,
     /// MSH-21 route-hint mode. `Off` keeps every published row unchanged.
     pub route_hint: RouteHintMode,
+    /// Inject shortest-path host facts for the paired route-hint experiment.
+    /// Off by default so other scenarios retain their own observation schedule.
+    pub route_hint_facts: bool,
     /// Suppression bounds and timer parameters under test.
     pub suppression: SuppressionConfig,
     /// Whether links advertise and consume MSH-19 announcements.
@@ -484,6 +487,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             spray: false,
             receipts: false,
             route_hint: RouteHintMode::Off,
+            route_hint_facts: false,
             suppression: SuppressionConfig::default(),
             presence: false,
             presence_config: PresenceConfig::default(),
@@ -508,6 +512,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             spray: false,
             receipts: false,
             route_hint: RouteHintMode::Off,
+            route_hint_facts: false,
             suppression: SuppressionConfig::default(),
             presence: false,
             presence_config: PresenceConfig::default(),
@@ -532,6 +537,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             spray: false,
             receipts: false,
             route_hint: RouteHintMode::Off,
+            route_hint_facts: false,
             suppression: SuppressionConfig::default(),
             presence: false,
             presence_config: PresenceConfig::default(),
@@ -554,6 +560,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             spray: false,
             receipts: false,
             route_hint: RouteHintMode::Off,
+            route_hint_facts: false,
             suppression: SuppressionConfig::default(),
             presence: false,
             presence_config: PresenceConfig::default(),
@@ -591,6 +598,7 @@ pub fn flood_scenarios() -> Vec<Scenario> {
         spray: false,
         receipts: false,
         route_hint: RouteHintMode::Off,
+        route_hint_facts: false,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -627,6 +635,7 @@ pub fn suppression_scenarios() -> Vec<Scenario> {
         spray: false,
         receipts: false,
         route_hint: RouteHintMode::Off,
+        route_hint_facts: false,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -657,6 +666,7 @@ pub fn spray_scenarios() -> Vec<Scenario> {
         spray: false,
         receipts: false,
         route_hint: RouteHintMode::Off,
+        route_hint_facts: false,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -679,6 +689,7 @@ pub fn spray_scenarios() -> Vec<Scenario> {
         spray: false,
         receipts: false,
         route_hint: RouteHintMode::Off,
+        route_hint_facts: false,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -725,6 +736,7 @@ pub fn receipt_scenarios() -> Vec<Scenario> {
         spray: true,
         receipts: false,
         route_hint: RouteHintMode::Off,
+        route_hint_facts: false,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -747,6 +759,7 @@ pub fn receipt_scenarios() -> Vec<Scenario> {
         spray: true,
         receipts: false,
         route_hint: RouteHintMode::Off,
+        route_hint_facts: false,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -759,6 +772,7 @@ pub fn receipt_scenarios() -> Vec<Scenario> {
             name: "receipt-enabled-line-20",
             receipts: true,
             route_hint: RouteHintMode::Off,
+            route_hint_facts: false,
             ..line
         },
         scripted.clone(),
@@ -766,6 +780,7 @@ pub fn receipt_scenarios() -> Vec<Scenario> {
             name: "receipt-enabled-scripted-200",
             receipts: true,
             route_hint: RouteHintMode::Off,
+            route_hint_facts: false,
             ..scripted
         },
     ]
@@ -800,6 +815,7 @@ pub fn presence_scenarios() -> Vec<Scenario> {
         spray: false,
         receipts: false,
         route_hint: RouteHintMode::Off,
+        route_hint_facts: false,
         suppression: SuppressionConfig::default(),
         presence: true,
         presence_config: PresenceConfig {
@@ -841,6 +857,7 @@ pub fn telemetry_scenarios() -> Vec<Scenario> {
         spray: false,
         receipts: false,
         route_hint: RouteHintMode::Off,
+        route_hint_facts: false,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -870,6 +887,7 @@ pub fn telemetry_scenarios() -> Vec<Scenario> {
         spray: false,
         receipts: false,
         route_hint: RouteHintMode::Off,
+        route_hint_facts: false,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -903,6 +921,7 @@ pub fn directory_scenarios() -> Vec<Scenario> {
         spray: false,
         receipts: false,
         route_hint: RouteHintMode::Off,
+        route_hint_facts: false,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -945,6 +964,7 @@ pub fn route_hint_scenarios() -> Vec<Scenario> {
         spray: true,
         receipts: false,
         route_hint: RouteHintMode::Off,
+        route_hint_facts: true,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -967,6 +987,7 @@ pub fn route_hint_scenarios() -> Vec<Scenario> {
         spray: true,
         receipts: false,
         route_hint: RouteHintMode::Off,
+        route_hint_facts: true,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -1812,6 +1833,9 @@ impl Simulation {
     }
 
     fn count_outputs(&mut self, node: usize, now_ms: u64, outputs: &[MeshOutput]) {
+        // Every engine input can drain directory changes, including the
+        // ordinary pump Tick before directory_tick runs at this timestamp.
+        self.note_directory_changes(outputs, now_ms);
         for output in outputs {
             match output {
                 MeshOutput::Send { link, payload, .. } => {
@@ -1994,6 +2018,9 @@ impl Simulation {
     /// verified neighbour. No mesh packet is generated. Off-mode rows get the
     /// same facts, keeping the fresh-path denominator identical.
     fn inject_route_hints(&mut self, now_ms: u64) {
+        if !self.scenario.route_hint_facts {
+            return;
+        }
         self.hint_seq = self.hint_seq.saturating_add(1);
         for set in &mut self.injected_fresh {
             set.clear();

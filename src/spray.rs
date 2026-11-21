@@ -455,18 +455,24 @@ mod tests {
 
     #[test]
     fn hint_replaces_a_recipient_without_adding_a_transmission() {
-        let candidates = [(LINK_A, [3; 16]), (LINK_B, [4; 16]), (LINK_C, [5; 16])];
+        let hint_link = LinkId::new(4);
+        let candidates = [
+            (LINK_A, [3; 16]),
+            (LINK_B, [4; 16]),
+            (LINK_C, [5; 16]),
+            (hint_link, [6; 16]),
+        ];
         let mut baseline = tracker(8, 8);
         baseline.observe(0, id(1), PacketClass::Direct, [9; 16], 60, 8);
         let base = baseline.plan(0, id(1), None, candidates);
-        assert_eq!(base, vec![(LINK_A, 4), (LINK_B, 2)]);
+        assert_eq!(base, vec![(LINK_A, 4), (LINK_B, 2), (LINK_C, 1)]);
         let base_left = baseline.copies_left(id(1));
 
         let mut hinted = tracker(8, 8);
         hinted.observe(0, id(1), PacketClass::Direct, [9; 16], 60, 8);
-        let plan = hinted.plan_with_hint(0, id(1), None, candidates, Some(LINK_C));
+        let plan = hinted.plan_with_hint(0, id(1), None, candidates, Some(hint_link));
         assert_eq!(plan.len(), base.len());
-        assert_eq!(plan.last(), Some(&(LINK_C, 1)));
+        assert_eq!(plan.last(), Some(&(hint_link, 1)));
         assert_eq!(hinted.copies_left(id(1)), base_left);
     }
 

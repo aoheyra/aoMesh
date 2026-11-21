@@ -829,3 +829,9 @@ previous encounters plus local monotonic elapsed time determines expiry;
 remote timestamps are ignored. `expiry::age_at` carries consumed age between
 encounters with different local epochs. See [the expiry decision](docs/adr/lifetime-expiry.md)
 for the caller contract and restart/sync boundaries.
+
+Route-hint tie-breaking selects a deterministic ingress link without refreshing
+an announcement's lifetime: the same hop count and sequence remain the same fact.
+The paired route-hint simulator explicitly opts into host shortest-path facts;
+other scenarios retain their own observation schedules. Binary spray preserves
+8 = 4 + 2 + 1 + 1 tickets; a substitute changes a recipient, not the send count.
