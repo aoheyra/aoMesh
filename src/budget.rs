@@ -1,8 +1,11 @@
 //! Relay budgets and neighbour penalties (MSH-10).
 //!
 //! Two independent token buckets gate every admitted packet: one per claimed
-//! origin and one per sending link. Both use the per-class hourly budgets in
-//! ADR-0001, so Direct has the largest allowance and Telemetry the smallest.
+//! origin and one per (sending link, claimed origin) pair. Both use the
+//! per-class hourly budgets in ADR-0001, so Direct has the largest allowance
+//! and Telemetry the smallest. Keying the link bucket by origin prevents a
+//! flooding origin from consuming the allowance honest origins need on the
+//! same link.
 //! A packet is relayed only when both buckets have enough tokens; local
 //! delivery is never suppressed by a budget. Class buckets do not borrow from
 //! each other, which is what makes the class ordering in ADR-0001 meaningful
@@ -40,6 +43,21 @@ pub struct ClassRate {
     pub burst_seconds: u64,
 }
 
+/// Which bucket, if any, refused a relay (MSH-10).
+///
+/// The distinction matters for blame: an exhausted origin is that origin's
+/// fault and must not disconnect the neighbour that merely forwarded it. An
+/// exhausted sending link is local to that neighbour and feeds its penalty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetOutcome {
+    /// Both buckets accepted the packet; the relay may proceed.
+    Admitted,
+    /// The claimed origin has no allowance left.
+    OriginDenied,
+    /// The sending link has no allowance left.
+    NeighborDenied,
+}
+
 /// Bounds, rates and penalty tuning for [`BudgetTracker`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BudgetConfig {
@@ -52,6 +70,11 @@ pub struct BudgetConfig {
     pub max_origins: usize,
     /// Maximum distinct sending links tracked at once.
     pub max_neighbors: usize,
+    /// Maximum distinct origins tracked inside one sending link.
+    ///
+    /// Bounds the per-link bucket map independently of the global origin
+    /// table. An overfull link evicts its least-recently-used origin.
+    pub max_origins_per_neighbor: usize,
     /// Class rates in Direct, Broadcast, Presence, Telemetry order.
     pub rates: [ClassRate; 4],
     /// Penalty for a structurally invalid packet from a link.
@@ -74,6 +97,7 @@ impl Default for BudgetConfig {
             enforce: true,
             max_origins: 1024,
             max_neighbors: 32,
+            max_origins_per_neighbor: 64,
             rates: [
                 ClassRate {
                     bytes_per_hour: 1024 * 1024,
@@ -188,20 +212,42 @@ fn capacity(rate: ClassRate) -> u64 {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NeighborBudget {
-    buckets: ClassBuckets,
+    buckets: BTreeMap<NodeId, ClassBuckets>,
     penalty: u32,
     penalty_at_ms: u64,
     released: bool,
 }
 
 impl NeighborBudget {
-    fn new(now: u64, rates: &[ClassRate; 4]) -> Self {
+    fn new(now: u64) -> Self {
         Self {
-            buckets: ClassBuckets::new(now, rates),
+            buckets: BTreeMap::new(),
             penalty: 0,
             penalty_at_ms: now,
             released: false,
         }
+    }
+
+    fn buckets(
+        &mut self,
+        now: u64,
+        rates: &[ClassRate; 4],
+        origin: NodeId,
+        limit: usize,
+    ) -> &mut ClassBuckets {
+        if !self.buckets.contains_key(&origin) && self.buckets.len() >= limit {
+            let victim = self
+                .buckets
+                .iter()
+                .min_by_key(|(id, buckets)| (buckets.last_ms, **id))
+                .map(|(id, _)| *id);
+            if let Some(victim) = victim {
+                self.buckets.remove(&victim);
+            }
+        }
+        self.buckets
+            .entry(origin)
+            .or_insert_with(|| ClassBuckets::new(now, rates))
     }
 }
 
@@ -225,8 +271,11 @@ impl BudgetTracker {
         }
     }
 
-    /// Whether one received packet fits both the origin and neighbour
-    /// allowance. On success both buckets are debited exactly once.
+    /// Checks one packet against the origin and neighbour allowances.
+    ///
+    /// On [`BudgetOutcome::Admitted`] both buckets are debited exactly once.
+    /// A refused packet debits neither bucket: if the origin bucket accepted
+    /// but the neighbour bucket did not, the origin debit is refunded.
     pub fn admit(
         &mut self,
         now: u64,
@@ -234,12 +283,15 @@ impl BudgetTracker {
         origin: NodeId,
         class: PacketClass,
         bytes: usize,
-    ) -> bool {
+    ) -> BudgetOutcome {
         if !self.config.enforce {
-            return true;
+            return BudgetOutcome::Admitted;
         }
-        if self.config.max_origins == 0 || self.config.max_neighbors == 0 {
-            return false;
+        if self.config.max_origins == 0 {
+            return BudgetOutcome::OriginDenied;
+        }
+        if self.config.max_neighbors == 0 || self.config.max_origins_per_neighbor == 0 {
+            return BudgetOutcome::NeighborDenied;
         }
         if !self.origins.contains_key(&origin) && self.origins.len() >= self.config.max_origins {
             let victim = self
@@ -253,7 +305,7 @@ impl BudgetTracker {
         }
         if !self.neighbors.contains_key(&link) && self.neighbors.len() >= self.config.max_neighbors
         {
-            return false;
+            return BudgetOutcome::NeighborDenied;
         }
         let rates = self.config.rates;
         let index = rate_index(class);
@@ -265,22 +317,24 @@ impl BudgetTracker {
         let neighbor = self
             .neighbors
             .entry(link)
-            .or_insert_with(|| NeighborBudget::new(now, &rates));
-        neighbor.buckets.last_ms = now;
+            .or_insert_with(|| NeighborBudget::new(now));
+        let neighbor_buckets =
+            neighbor.buckets(now, &rates, origin, self.config.max_origins_per_neighbor);
+        neighbor_buckets.last_ms = now;
         let origin_ok = origin_buckets.try_take(now, &rates, index, cost);
         if !origin_ok {
-            return false;
+            return BudgetOutcome::OriginDenied;
         }
-        if !neighbor.buckets.try_take(now, &rates, index, cost) {
+        if !neighbor_buckets.try_take(now, &rates, index, cost) {
             // The origin was debited, so refund it: a denied packet must
             // not consume allowance the neighbour's bucket cannot cover.
             let refund = origin_buckets.slots[index];
             let mut restored = refund;
             restored.tokens = refund.tokens.saturating_add(cost).min(refund.capacity);
             origin_buckets.slots[index] = restored;
-            return false;
+            return BudgetOutcome::NeighborDenied;
         }
-        true
+        BudgetOutcome::Admitted
     }
 
     /// Adds `amount` to a link's penalty after decaying old score.
@@ -292,11 +346,10 @@ impl BudgetTracker {
         if !self.config.enforce || self.config.max_neighbors == 0 {
             return false;
         }
-        let rates = self.config.rates;
         let neighbor = self
             .neighbors
             .entry(link)
-            .or_insert_with(|| NeighborBudget::new(now, &rates));
+            .or_insert_with(|| NeighborBudget::new(now));
         if self.config.penalty_decay_ms > 0 && now > neighbor.penalty_at_ms {
             let steps = (now - neighbor.penalty_at_ms) / self.config.penalty_decay_ms;
             let decay = steps
@@ -356,6 +409,7 @@ mod tests {
             enforce: true,
             max_origins: 2,
             max_neighbors: 2,
+            max_origins_per_neighbor: 2,
             rates: [ClassRate {
                 bytes_per_hour: 3_600,
                 burst_seconds: 600,
@@ -383,35 +437,116 @@ mod tests {
     fn both_origin_and_neighbour_must_admit() {
         let config = small();
         let mut tracker = BudgetTracker::new(config);
-        assert!(tracker.admit(0, LINK_A, ORIGIN_A, PacketClass::Direct, 10));
+        assert_eq!(
+            tracker.admit(0, LINK_A, ORIGIN_A, PacketClass::Direct, 10),
+            BudgetOutcome::Admitted
+        );
         // Origin A is now over its burst; a different neighbour cannot
         // rescue it, so flooding is throttled network-wide.
         let mut flood = BudgetTracker::new(config);
-        assert!(flood.admit(0, LINK_A, ORIGIN_A, PacketClass::Direct, 600));
-        assert!(!flood.admit(0, LINK_B, ORIGIN_A, PacketClass::Direct, 1));
-        // The same neighbour flooding many origins is caught by its own
-        // bucket even when each origin still has tokens.
+        assert_eq!(
+            flood.admit(0, LINK_A, ORIGIN_A, PacketClass::Direct, 600),
+            BudgetOutcome::Admitted
+        );
+        assert_eq!(
+            flood.admit(0, LINK_B, ORIGIN_A, PacketClass::Direct, 1),
+            BudgetOutcome::OriginDenied
+        );
+        // An origin that saturates one link cannot retry through it, but
+        // a different origin has its own allowance on the same link.
         let mut neighbor = BudgetTracker::new(config);
-        assert!(neighbor.admit(0, LINK_A, ORIGIN_A, PacketClass::Direct, 600));
-        assert!(!neighbor.admit(0, LINK_A, ORIGIN_B, PacketClass::Direct, 1));
+        assert_eq!(
+            neighbor.admit(0, LINK_A, ORIGIN_A, PacketClass::Direct, 600),
+            BudgetOutcome::Admitted
+        );
+        assert_eq!(
+            neighbor.admit(0, LINK_A, ORIGIN_A, PacketClass::Direct, 1),
+            BudgetOutcome::OriginDenied
+        );
+        assert_eq!(
+            neighbor.admit(0, LINK_A, ORIGIN_B, PacketClass::Direct, 1),
+            BudgetOutcome::Admitted
+        );
+    }
+
+    #[test]
+    fn a_flooding_origin_does_not_starve_other_origins_on_one_link() {
+        let mut tracker = BudgetTracker::new(small());
+        for _ in 0..6 {
+            assert_eq!(
+                tracker.admit(0, LINK_A, ORIGIN_A, PacketClass::Direct, 100),
+                BudgetOutcome::Admitted
+            );
+        }
+        assert_eq!(
+            tracker.admit(0, LINK_A, ORIGIN_A, PacketClass::Direct, 1),
+            BudgetOutcome::OriginDenied
+        );
+        assert_eq!(
+            tracker.admit(0, LINK_A, ORIGIN_B, PacketClass::Direct, 100),
+            BudgetOutcome::Admitted
+        );
+    }
+
+    #[test]
+    fn per_neighbor_origin_buckets_are_bounded() {
+        let mut config = small();
+        config.max_origins = 3;
+        config.max_origins_per_neighbor = 1;
+        let mut tracker = BudgetTracker::new(config);
+        assert_eq!(
+            tracker.admit(10, LINK_A, ORIGIN_A, PacketClass::Direct, 100),
+            BudgetOutcome::Admitted
+        );
+        assert_eq!(
+            tracker.admit(20, LINK_A, ORIGIN_B, PacketClass::Direct, 100),
+            BudgetOutcome::Admitted
+        );
+        // B evicted A from this link's bounded map, so A gets a fresh bucket.
+        assert_eq!(
+            tracker.admit(30, LINK_A, ORIGIN_A, PacketClass::Direct, 100),
+            BudgetOutcome::Admitted
+        );
+        assert_eq!(tracker.origins(), 2);
+    }
+
+    #[test]
+    fn default_origin_per_neighbor_bound_matches_the_adr() {
+        assert_eq!(BudgetConfig::default().max_origins_per_neighbor, 64);
     }
 
     #[test]
     fn denied_packet_does_not_consume_the_other_bucket() {
         let config = small();
         let mut tracker = BudgetTracker::new(config);
-        assert!(tracker.admit(0, LINK_A, ORIGIN_A, PacketClass::Direct, 600));
-        assert!(!tracker.admit(0, LINK_B, ORIGIN_A, PacketClass::Direct, 1));
-        // Refunded origin can still send one small packet from a fresh link.
-        assert!(tracker.admit(0, LINK_B, ORIGIN_B, PacketClass::Direct, 1));
+        assert_eq!(
+            tracker.admit(0, LINK_A, ORIGIN_A, PacketClass::Direct, 600),
+            BudgetOutcome::Admitted
+        );
+        assert_eq!(
+            tracker.admit(0, LINK_B, ORIGIN_A, PacketClass::Direct, 1),
+            BudgetOutcome::OriginDenied
+        );
+        // An origin denial never touches the neighbour bucket, so a fresh
+        // origin on that link is still admitted.
+        assert_eq!(
+            tracker.admit(0, LINK_B, ORIGIN_B, PacketClass::Direct, 1),
+            BudgetOutcome::Admitted
+        );
     }
 
     #[test]
     fn clock_going_backwards_never_mints_tokens() {
         let config = small();
         let mut tracker = BudgetTracker::new(config);
-        assert!(tracker.admit(10_000, LINK_A, ORIGIN_A, PacketClass::Direct, 600));
-        assert!(!tracker.admit(0, LINK_B, ORIGIN_A, PacketClass::Direct, 1));
+        assert_eq!(
+            tracker.admit(10_000, LINK_A, ORIGIN_A, PacketClass::Direct, 600),
+            BudgetOutcome::Admitted
+        );
+        assert_eq!(
+            tracker.admit(0, LINK_B, ORIGIN_A, PacketClass::Direct, 1),
+            BudgetOutcome::OriginDenied
+        );
     }
 
     #[test]
@@ -419,12 +554,24 @@ mod tests {
         let mut config = small();
         config.max_origins = 2;
         let mut tracker = BudgetTracker::new(config);
-        assert!(tracker.admit(10, LINK_A, ORIGIN_A, PacketClass::Direct, 1));
-        assert!(tracker.admit(20, LINK_A, ORIGIN_B, PacketClass::Direct, 1));
+        assert_eq!(
+            tracker.admit(10, LINK_A, ORIGIN_A, PacketClass::Direct, 1),
+            BudgetOutcome::Admitted
+        );
+        assert_eq!(
+            tracker.admit(20, LINK_A, ORIGIN_B, PacketClass::Direct, 1),
+            BudgetOutcome::Admitted
+        );
         let third = NodeId::from_bytes([3; 16]);
-        assert!(tracker.admit(30, LINK_A, third, PacketClass::Direct, 1));
+        assert_eq!(
+            tracker.admit(30, LINK_A, third, PacketClass::Direct, 1),
+            BudgetOutcome::Admitted
+        );
         assert_eq!(tracker.origins(), 2);
-        assert!(tracker.admit(40, LINK_A, ORIGIN_A, PacketClass::Direct, 1));
+        assert_eq!(
+            tracker.admit(40, LINK_A, ORIGIN_A, PacketClass::Direct, 1),
+            BudgetOutcome::Admitted
+        );
     }
 
     #[test]
@@ -449,7 +596,10 @@ mod tests {
         config.max_origins = 0;
         config.max_neighbors = 0;
         let mut tracker = BudgetTracker::new(config);
-        assert!(tracker.admit(0, LINK_A, ORIGIN_A, PacketClass::Telemetry, 4096));
+        assert_eq!(
+            tracker.admit(0, LINK_A, ORIGIN_A, PacketClass::Telemetry, 4096),
+            BudgetOutcome::Admitted
+        );
         assert!(!tracker.penalize(0, LINK_A, 1_000));
     }
 
