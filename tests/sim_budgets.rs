@@ -1,6 +1,8 @@
 //! MSH-10 simulation evidence: a flooded origin is throttled while honest
 //! origins keep their delivery.
 
+#![cfg(all(feature = "sim", not(miri)))]
+
 use ao_mesh::sim::{flood_scenarios, run};
 
 #[test]

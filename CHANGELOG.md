@@ -7,18 +7,33 @@ change without notice until v0.1.0, and consumers pin by git tag
 
 ## Unreleased
 
-MSH-10 adds per-origin and per-neighbour token buckets with the ADR-0001 class
-rates and a ten-minute burst. Relays debit both buckets before sending copies;
-local delivery is unaffected. Invalid, unverified and over-budget traffic adds
-a decaying penalty, and a link crossing the threshold is released once with
-`DisconnectReason::AbuseDetected`. `MeshConfig` gains a `budgets: BudgetConfig`
+The MSH-27 baseline fixture was regenerated against aoNetwork `492e148c`
+(Net 25 flow control). The refreshed sibling changed simulated link formation:
+waypoint and community delivery improved, waypoint overhead fell, community
+overhead rose from 328.5541 to 328.7067, and the exact link counts moved from
+182/424 to 180/412. Radio-byte accounting now accumulates per-tick `tx_bytes`
+deltas per link instead of subtracting two snapshots of only live links, so
+traffic on links that close during mobility is counted; the higher radio-byte
+figures are a measurement fix, not a routing regression. Repeated debug and
+release runs produced identical metrics. No aoMesh routing code changed.
+
+MSH-10 adds per-origin and per-(sending link, origin) token buckets with the
+ADR-0001 class rates and a ten-minute burst. Relays debit both buckets before
+sending copies;
+local delivery is unaffected. Invalid, unverified and link-saturated traffic
+adds a decaying penalty, and a link crossing the threshold is released once with
+`DisconnectReason::AbuseDetected`. An exhausted origin is dropped without
+blaming the neighbour that carried it, because disconnecting that link would
+also drop honest traffic. `BudgetOutcome` makes the distinction explicit.
+`MeshConfig` gains a `budgets: BudgetConfig`
 field, `MeshEngine::budgets` exposes read-only state, and `PacketClass::all`
 lists classes in priority order. The simulator gains `Traffic::Flood`,
 per-origin delivery metrics, `flood_scenarios` and an `enforce` ablation
-switch. The fixed flood case shows the origin's delivery falling from 0.7867
-to 0.3067 while honest origins are not harmed by the throttle; details and
-seeds are in the README and ADR-0001. The four published MSH-27 baselines are
-unchanged.
+switch. On the refreshed aoNetwork baseline the fixed flood case shows the
+origin's delivery falling from 0.8133 to 0.3400 while honest delivery rises
+from 0.6833 to 0.7533 and stays near the 0.7825 no-flood control; details and
+seeds are in the README and ADR-0001. The flood scenarios are additive; the
+four refreshed baseline scenarios are not changed by this feature.
 
 MSH-27 adds a deterministic SimWorld harness behind feature `sim`. It drives
 signed hellos, link events and the engine through the adapter across a 20-node

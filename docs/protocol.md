@@ -200,7 +200,8 @@ keep their loop invariant.
 
 No wire field changes: budgets are a local forwarding decision. For every
 admitted packet the engine debits two token buckets, one keyed by the claimed
-origin and one by the sending link. Both refill from the caller-supplied `now`
+origin and one by the (sending link, claimed origin) pair, bounded per link by
+`max_origins_per_neighbor`. Both refill from the caller-supplied `now`
 at the ADR-0001 class rates (1 MiB/h Direct down to 32 KiB/h Telemetry) with a
 ten-minute full bucket. Classes have separate buckets and never borrow from
 each other, so a full Direct allowance cannot mask a Telemetry flood. A packet
@@ -208,8 +209,10 @@ that finds either bucket empty is still delivered locally when addressed to
 this node, but its relay copies are withheld.
 
 Malformed packets add 3 to the sending link's penalty, packets from a link with
-no verified identity add 2, and over-budget packets add 1. The score decays by
-1 per minute; at 12 the engine emits `MeshOutput::Release` with
+no verified identity add 2, and packets the sending link's own bucket cannot
+admit add 1. An exhausted origin is dropped with no link penalty: blaming the
+neighbour that carried it would disconnect links used by honest traffic. The
+score decays by 1 per minute; at 12 the engine emits `MeshOutput::Release` with
 `DisconnectReason::AbuseDetected` once until `LinkDown`. aoNetwork owns any
 blacklist and reconnection decision. The simulator's `enforce` switch disables
 both buckets only for ablation runs; it is never a production tuning knob.

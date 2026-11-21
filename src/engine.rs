@@ -1,6 +1,6 @@
 //! Sans-IO command dispatch with borrowed submissions and bounded neighbours.
 
-use crate::budget::BudgetTracker;
+use crate::budget::{BudgetOutcome, BudgetTracker};
 use crate::deliver;
 use crate::forward::{self, Action};
 use crate::neighbor::{MeshConfig, NeighborTable};
@@ -281,14 +281,19 @@ impl<R: RngCore> MeshEngine<R> {
                 // relay. A local delivery still happens; only its onward
                 // copies are withheld when either bucket is empty.
                 let origin = ao_idents::NodeId::from_bytes(packet.header.origin);
-                let admitted =
+                let outcome =
                     self.budgets
                         .admit(now, link, origin, packet.header.class, payload.len());
-                let release = if admitted {
-                    false
-                } else {
-                    self.budgets
-                        .penalize(now, link, self.config.budgets.penalty_excess)
+                // An exhausted origin blames that origin, not the neighbour
+                // that happened to carry the packet. Disconnecting such a
+                // link partitions honest traffic; only a saturated sending
+                // link is locally attributable and feeds its penalty.
+                let release = match outcome {
+                    BudgetOutcome::Admitted | BudgetOutcome::OriginDenied => false,
+                    BudgetOutcome::NeighborDenied => {
+                        self.budgets
+                            .penalize(now, link, self.config.budgets.penalty_excess)
+                    }
                 };
                 if release {
                     return Ok(Self::release_if_penalised(link, true));
@@ -343,7 +348,7 @@ impl<R: RngCore> MeshEngine<R> {
                             Ok(Vec::new())
                         }
                     },
-                    Action::Relay { bytes } if admitted => Ok(self
+                    Action::Relay { bytes } if outcome == BudgetOutcome::Admitted => Ok(self
                         .neighbors
                         .iter()
                         // Never send a packet back down the link it

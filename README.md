@@ -191,12 +191,18 @@ not. Decision record: [ADR-0005](docs/adr/0005-local-delivery-pipeline.md).
 ### Relay budgets and penalties (MSH-10)
 
 Every admitted packet debits two token buckets: one keyed by the packet's
-claimed origin and one keyed by the sending link. Both refill continuously in
-caller-supplied milliseconds and use the ADR-0001 hourly rates, so Direct has
-the largest allowance and Telemetry the smallest. Buckets are per class and
+claimed origin and one keyed by the (sending link, claimed origin) pair. Both
+refill continuously in caller-supplied milliseconds and use the ADR-0001 hourly
+rates, so Direct has the largest allowance and Telemetry the smallest. The
+per-link map is bounded by `BudgetConfig::max_origins_per_neighbor` (default 64)
+and evicts least-recently-used origins. Buckets are per class and
 never borrow from each other; a full Direct bucket cannot hide a Telemetry
 flood. Local delivery is never suppressed: only the onward relay copies are
-withheld when either bucket is empty. Origin state is bounded by
+withheld when either bucket is empty. The refusal is typed: an exhausted
+origin is that origin's fault and drops without blaming the neighbour that
+carried it, while an exhausted sending link feeds that link's penalty.
+Disconnecting a neighbour merely because an origin ran out of allowance would
+also drop honest traffic crossing that link. Origin state is bounded by
 `BudgetConfig::max_origins` (default 1024) and evicted least-recently-used
 first; neighbour state follows the neighbour table and is removed on
 `LinkDown`.
@@ -209,7 +215,7 @@ first; neighbour state follows the neighbour table and is removed on
 | Telemetry | 32 KiB/h, 10 min burst | Lowest class, shed first under pressure |
 | Invalid packet | +3 penalty | Structural garbage is a clear abuse signal |
 | Unverified sender | +2 penalty | The link may watch, but cannot act through this engine |
-| Over-budget packet | +1 penalty | Charged only when a relay is actually withheld |
+| Over-budget packet | +1 penalty | Only for a saturated sending link; an exhausted origin is dropped without blame |
 | Release threshold | 12, decay 1 per 60 s | A sustained offender is disconnected once; short mistakes fade |
 
 Crossing the threshold emits `MeshOutput::Release` with
@@ -220,12 +226,13 @@ production tuning knob.
 
 The fixed flood case in `tests/sim_budgets.rs` submits 300 oversized messages
 from one origin and 300 from honest nodes on a seeded 20-node random graph
-(seed `1297304003`). With budgets on, the flooder delivers 92 of 300 messages
-(0.3067) against 236 of 300 (0.7867) with budgets off, while honest origins
-deliver 208 of 300 (0.6933) against 199 of 300 (0.6633) with no budgets. A
-no-flood control run delivers 217 of 285 honest messages (0.7614), so the gap
-is first-transmission radio contention from the flooder, not a budget applied
-to honest traffic. The published four-scenario baseline is unchanged.
+(seed `1297304003`) against aoNetwork `492e148c`. With budgets on, the flooder
+delivers 102 of 300 messages (0.3400) against 244 of 300 (0.8133) with budgets
+off, while honest origins deliver 226 of 300 (0.7533) against 205 of 300
+(0.6833) with no budgets. A no-flood control run delivers 223 of 285 honest
+messages (0.7825), so the remaining gap is first-transmission radio contention
+from the flooder, not a budget applied to honest traffic. The refreshed
+four-scenario baseline is unchanged by this feature.
 
 ### Simulator harness and baseline (MSH-27)
 
@@ -259,15 +266,26 @@ Published baseline (Rust stable, release profile, fixed seeds):
 | Scenario | Nodes | Seed | Delivered / submitted | Delivery ratio | Overhead | Mean / max latency (ms) | Radio bytes | Peak queued bytes |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | `line-20` | 20 | 1297303584 | 20 / 20 | 1.0000 | 9.6500 | 730 / 1200 | 102065 | 550 |
-| `waypoint-50` | 50 | 1297303632 | 29 / 50 | 0.5800 | 135.8966 | 506 / 1200 | 1537858 | 11394 |
-| `community-100` | 100 | 1297303652 | 74 / 80 | 0.9250 | 328.5541 | 713 / 1200 | 10917151 | 32814 |
-| `scripted-200` | 200 | 1297303752 | 100 / 100 | 1.0000 | 34.5500 | 561 / 1200 | 1536915 | 6600 |
+| `waypoint-50` | 50 | 1297303632 | 31 / 50 | 0.6200 | 125.7742 | 551 / 1200 | 2080893 | 12375 |
+| `community-100` | 100 | 1297303652 | 75 / 80 | 0.9375 | 328.7067 | 676 / 1200 | 13031341 | 33290 |
+| `scripted-200` | 200 | 1297303752 | 100 / 100 | 1.0000 | 34.5500 | 561 / 1200 | 1850727 | 6600 |
 
 `send_failures` and duplicate deliveries are zero in every scenario. The
 mobile scenarios are deliberately lossy under TTL 8: random-waypoint contacts
 leave some destinations farther than eight hops, which is the baseline later
 spray-and-wait and sync work must beat. The topology and metric choices are
 recorded in [the simulator baseline decision](docs/adr/simulator-baseline.md).
+
+These values were regenerated against aoNetwork `492e148c` (Net 25 flow
+control), which changed simulated link formation. Waypoint and community
+delivery improved, waypoint overhead fell, and community overhead rose slightly
+from 328.5541 to 328.7067 per delivery. The exact settled link counts moved
+from 182/424 to 180/412. Radio-byte accounting was also fixed: the harness now
+sums per-tick `tx_bytes` deltas per link instead of subtracting two snapshots
+of only the currently up links, so bytes sent on links that close during
+mobility are no longer lost. That is why the radio-byte figures are higher than
+the previous fixture; it is not a routing regression. Repeated debug and
+release runs produced identical metrics. No aoMesh routing code changed.
 
 ## Targets and evidence
 

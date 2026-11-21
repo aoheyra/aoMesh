@@ -40,7 +40,7 @@ pub mod store;
 
 #[cfg(feature = "adapter")]
 pub use adapter::{AdapterEvent, NetworkAdapter};
-pub use budget::{BudgetConfig, BudgetTracker, ClassRate};
+pub use budget::{BudgetConfig, BudgetOutcome, BudgetTracker, ClassRate};
 pub use engine::{MeshEngine, MeshError, MeshInput, MeshOutput};
 pub use hello::{HelloError, MeshHello};
 pub use neighbor::{MeshConfig, Neighbor, NeighborTable};

@@ -4,7 +4,7 @@ mod common;
 use ao_idents::{Identity, ReplayConfig};
 use ao_mesh::{
     BudgetConfig, ClassRate, Header, MeshConfig, MeshEngine, MeshError, MeshHello, MeshInput,
-    MeshOutput, Packet, PacketClass, verify_origin,
+    MeshOutput, Packet, PacketClass, sign_packet, verify_origin,
 };
 use ao_network::{AppHello, Channel, DisconnectReason, Hello, LinkId, LocalTag};
 use rand::{SeedableRng, rngs::StdRng};
@@ -80,6 +80,16 @@ fn signed_with(class: PacketClass, mutate: impl FnOnce(&mut Header), payload: &[
 }
 fn signed(class: PacketClass, payload: &[u8]) -> Vec<u8> {
     signed_with(class, |_| {}, payload)
+}
+/// A relay-valid packet signed by an explicit identity, for budget tests
+/// that need distinct claimed origins on the same sender link.
+fn signed_by(identity: &Identity, class: PacketClass, payload: &[u8]) -> Vec<u8> {
+    let mut header = header(class, payload.len());
+    let signature = sign_packet(identity, &mut header, payload).unwrap();
+    Packet::new(header, signature, payload)
+        .unwrap()
+        .encode()
+        .to_vec()
 }
 /// One encoded packet whose payload is the plaintext sealed to this
 /// node, built with the MSH-09 recipe; `mutate` adjusts the header
@@ -415,7 +425,7 @@ fn malformed_and_oversized_data_are_counted_without_delivery_or_forwarding() {
 }
 
 #[test]
-fn an_excessive_origin_is_denied_and_its_sender_is_released() {
+fn an_excessive_origin_is_denied_without_blaming_its_sender() {
     let mut budgets = BudgetConfig::default();
     budgets.rates[0] = ClassRate {
         bytes_per_hour: 9_600,
@@ -476,8 +486,58 @@ fn an_excessive_origin_is_denied_and_its_sender_is_released() {
             },
         )
         .unwrap();
+    // The flooder is throttled, but the neighbour that carried its packets
+    // stays connected: disconnecting it would also drop honest traffic.
+    assert!(second_outputs.is_empty());
+    assert_eq!(e.budgets().penalty(sender), 0);
+}
+
+#[test]
+fn a_neighbor_limit_denial_is_still_penalised() {
+    let budgets = BudgetConfig {
+        max_origins_per_neighbor: 0,
+        penalty_excess: 1,
+        penalty_release_at: 1,
+        ..BudgetConfig::default()
+    };
+    let config = MeshConfig {
+        max_neighbors: 2,
+        budgets,
+        ..MeshConfig::default()
+    };
+    let mut e = MeshEngine::with_config(StdRng::seed_from_u64(9), config);
+    let sender = LinkId::new(1);
+    let other = LinkId::new(2);
+    e.handle(
+        0,
+        MeshInput::LinkUp {
+            link: sender,
+            remote_hello: hello(),
+        },
+    )
+    .unwrap();
+    e.handle(
+        0,
+        MeshInput::LinkUp {
+            link: other,
+            remote_hello: hello_of(&Identity::from_seed([8; 32])),
+        },
+    )
+    .unwrap();
+    let packet = signed_by(&Identity::from_seed([1; 32]), PacketClass::Direct, &[1; 64]);
+    let outputs = e
+        .handle(
+            0,
+            MeshInput::Data {
+                link: sender,
+                channel: Channel::Message,
+                payload: &packet,
+                identity: &LOCAL,
+            },
+        )
+        .unwrap();
     assert_eq!(
-        second_outputs,
+        outputs,
         vec![MeshOutput::Release {
             link: sender,
             reason: DisconnectReason::AbuseDetected,

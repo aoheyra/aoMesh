@@ -38,7 +38,9 @@ Each default becomes an engine config field with exactly these values; MSH-27 sw
 ## MSH-10 implementation
 
 The relay budget is implemented as two token buckets per admitted packet: one
-keyed by the claimed origin and one by the sending link. Both use the hourly
+keyed by the claimed origin and one by the (sending link, claimed origin) pair.
+The per-link map is capped at 64 origins by `max_origins_per_neighbor` and
+evicts least-recently-used entries. Both use the hourly
 rates above with a ten-minute full bucket, so an honest node can spend its
 allowance in a burst without accumulating an unlimited credit. Telemetry's
 32 KiB/hour is about 9 fixed-point units per millisecond, so integer refill
@@ -56,9 +58,21 @@ sustained rate, so the ADR table above is unchanged.
 Origin state is capped at 1024 entries and evicted least-recently-used first,
 with `NodeId` order as the tie-break; neighbour state follows the neighbour
 table exactly. Invalid packets add 3 penalty, packets from a link whose hello
-failed verification add 2, and packets a bucket could not admit add 1. Penalty
-decays by 1 per minute; reaching 12 emits one `Release` with
-`DisconnectReason::AbuseDetected`, and a later `LinkDown` forgets the score.
+failed verification add 2, and packets the sending link's own bucket cannot
+admit add 1. `BudgetTracker::admit` returns which bucket refused so the engine
+can drop an origin-limited packet without penalising the neighbour that carried
+it. Four options were measured after aoNetwork's NET-25 credit flow control
+changed link dynamics, always comparing honest delivery against the 0.6833
+unbounded-flood run. Blaming the sender for every refusal gave 0.3200 because
+releasing flooder-facing links partitioned the graph. Typing the refusal but
+keeping a shared link bucket improved that only to 0.4967, because the flooder
+still consumed the allowance honest origins needed on the same link. Splitting
+the link bucket per origin without typing the refusal gave 0.3367, because the
+link was still released. The combination of per-origin link buckets and no
+blame for an origin denial gives 0.7533 while still throttling the flooder.
+Penalty decays by 1 per minute;
+reaching 12 emits one `Release` with `DisconnectReason::AbuseDetected`, and a
+later `LinkDown` forgets the score.
 aoNetwork owns reconnection and any future blacklist decision, so no new wire
 field or sibling API is needed. MSH-09 authenticates local delivery, but a
 relay still keys the origin bucket from the claimed header value; the per-link
@@ -67,8 +81,12 @@ signatures for flooded classes are a separate concern.
 
 Measured on the MSH-27 simulator with the fixed flood case (seed `1297304003`,
 20-node random graph, 300 oversized messages from one origin and 300 from
-honest nodes): the flooder delivered 92 of 300 with budgets and 236 of 300
-with budgets disabled, while honest deliveries were 208 of 300 with budgets
-and 199 of 300 without. A no-flood control delivered 217 of 285 honest
-messages. The four published MSH-27 scenarios stayed inside their existing
-directional bounds. No default in the table changed.
+honest nodes, aoNetwork `492e148c`): the flooder delivered 102 of 300 with
+budgets and 244 of 300 with budgets disabled, while honest deliveries were 226
+of 300 with budgets and 205 of 300 without. A no-flood control delivered 223
+of 285 honest messages. The flood is cut to 41.8 percent of its unbounded
+delivery; honest delivery improves by 7 points over the unbounded flood and
+stays within 2.9 points of the no-flood control. The four refreshed MSH-27
+scenarios stayed inside their existing directional bounds. No rate default in
+the table changed; `max_origins_per_neighbor` was added as a bounded memory
+parameter, not a routing-rate change.
