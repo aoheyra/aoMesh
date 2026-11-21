@@ -2,7 +2,7 @@
 
 **The routing and store-and-forward engine of the aoheyra mesh.** A sans-IO Rust crate that decides what happens to a packet: forward it, hold it, suppress it, deliver it, or drop it, across a phone-to-phone mesh where links come and go.
 
-> **Status: pre-alpha, through MSH-30.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest, bounded anti-entropy sync, range-based reconciliation on meeting links, binary spray-and-wait for Direct traffic, signed delivery receipts with bounded store purging, relative-age lifetime ceilings, bounded presence announcements with trickle timing, a bounded ephemeral NodeDirectory with coalesced UI events, bounded reverse-path route hints derived from directory observations, bounded latest-wins telemetry with typed advisory coalescing, local public-channel subscriptions over signed Broadcast envelopes, resource-bounded decoders with nightly fuzz targets, versioned restart snapshots for seen-cache, immunity and spray state, and a versioned content-free diagnostics snapshot are implemented.
+> **Status: pre-alpha, through MSH-30.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest, bounded anti-entropy sync, range-based reconciliation on meeting links, binary spray-and-wait for Direct traffic, signed delivery receipts with bounded store purging, relative-age lifetime ceilings, bounded presence announcements with trickle timing, a bounded ephemeral NodeDirectory with coalesced UI events, bounded reverse-path route hints derived from directory observations, bounded latest-wins telemetry with typed advisory coalescing, local public-channel subscriptions over signed Broadcast envelopes, resource-bounded decoders with fuzz targets in [aoheyra-fuzz](https://github.com/aoheyra/aoheyra-fuzz), versioned restart snapshots for seen-cache, immunity and spray state, and a versioned content-free diagnostics snapshot are implemented.
 
 Cargo package name: `ao_mesh`.
 
@@ -513,11 +513,8 @@ cargo test --release --all-features --test sim_baseline
 cargo run --release --features sim --example presence_report
 cargo test --release --all-features --test sim_presence
 
-# Fuzzing (nightly; separate crate, no runtime dependencies)
-cd fuzz
-cargo +nightly fuzz run packet_decode -- -max_total_time=3600 -rss_limit_mb=2048 -timeout=10 -max_len=16384
-cargo +nightly fuzz run engine_input -- -max_total_time=3600 -rss_limit_mb=2048 -timeout=10 -max_len=16384
-cargo +nightly fuzz run sync_frames -- -max_total_time=3600 -rss_limit_mb=2048 -timeout=10 -max_len=16384
+# Fuzzing is centralised in aoheyra-fuzz; see its README for the target list and commands
+# https://github.com/aoheyra/aoheyra-fuzz
 ```
 
 MSH-16 adds a separate paired report; the four published rows above stay the
@@ -535,10 +532,10 @@ cargo run --release --features sim --example routehint_report
 cargo test --release --all-features --test sim_routehint
 ```
 
-Tests are `cargo test` only: no Miri, callgrind or one-hour fuzz campaigns
-locally. CI runs fmt, clippy, tests on three operating systems, `cargo doc`,
-cargo-deny, an MSRV build and miri on every pull request; the one-hour fuzz
-campaign is a separate nightly workflow (below).
+Tests are `cargo test` only: no Miri, callgrind or fuzz campaigns locally.
+CI runs fmt, clippy, tests on three operating systems, `cargo doc`,
+cargo-deny, an MSRV build and miri on every pull request. The weekly 90-minute
+fuzz campaign runs in [aoheyra-fuzz](https://github.com/aoheyra/aoheyra-fuzz).
 
 ### Sibling crates
 
@@ -980,14 +977,12 @@ and CPU-proxy ceilings for hostile packets, sync frames, summary streams,
 engine Data streams and store quotas. It is a single-test binary so no other
 test can pollute the counters.
 
-The `fuzz/` crate has three `libFuzzer` targets: `packet_decode`,
-`engine_input` and `sync_frames`. They use injected time and RNG, construct a
-verified neighbour without `unwrap`/`expect`, and treat malicious bytes as the
-input rather than setup failure. `.github/workflows/fuzz.yml` runs each target
-for one hour nightly and uploads crash artifacts on failure; no one-hour
-campaign is claimed locally. `libfuzzer-sys` (MIT/Apache-2.0, Rust-Fuzz, small
-binding crate) and `rand` 0.9 (MIT/Apache-2.0, already a dev-dependency) are
-dev-only; the core dependency set is unchanged.
+The three `libFuzzer` targets (`packet_decode`, `engine_input` and
+`sync_frames`) live in [aoheyra-fuzz](https://github.com/aoheyra/aoheyra-fuzz),
+together with their seeds, pinned revisions and weekly schedule. They use
+injected time and RNG, construct a verified neighbour without `unwrap`/`expect`,
+and treat malicious bytes as the input rather than setup failure. No fuzz
+crate or workflow is kept in this repository.
 ## Restart state (MSH-29)
 
 A restart snapshot is local, versioned host state rather than a protocol
