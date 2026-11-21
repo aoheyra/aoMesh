@@ -1,5 +1,6 @@
 //! Sans-IO command dispatch with borrowed submissions and bounded neighbours.
 
+use crate::budget::BudgetTracker;
 use crate::deliver;
 use crate::forward::{self, Action};
 use crate::neighbor::{MeshConfig, NeighborTable};
@@ -80,6 +81,8 @@ pub enum MeshOutput {
         payload: Vec<u8>,
     },
     /// Release a refused or penalised neighbour through the network facade.
+    /// A budget penalty uses `DisconnectReason::AbuseDetected`; aoNetwork
+    /// owns any later blacklist decision.
     Release {
         /// Link to close.
         link: LinkId,
@@ -149,9 +152,11 @@ pub struct MeshEngine<R: RngCore> {
     // relays immediately, so nothing reads it yet.
     #[allow(dead_code)]
     rng: R,
+    config: MeshConfig,
     neighbors: NeighborTable,
     seen: SeenCache,
     replay: ReplayGuard,
+    budgets: BudgetTracker,
 }
 impl<R: RngCore> MeshEngine<R> {
     /// Creates an engine with the default limits (`MeshConfig::default`).
@@ -159,17 +164,27 @@ impl<R: RngCore> MeshEngine<R> {
         Self::with_config(rng, MeshConfig::default())
     }
     /// Creates an engine with explicit limits.
-    pub fn with_config(rng: R, config: MeshConfig) -> Self {
+    pub fn with_config(rng: R, mut config: MeshConfig) -> Self {
+        // One neighbour bound owns both tables; a mismatch would let budget
+        // state outlive its link or refuse honest links silently.
+        config.budgets.max_neighbors = config.max_neighbors;
+        let budgets = BudgetTracker::new(config.budgets);
         Self {
             rng,
+            config,
             neighbors: NeighborTable::new(config.max_neighbors),
             seen: SeenCache::default(),
             replay: ReplayGuard::new(config.replay),
+            budgets,
         }
     }
     /// Read-only bookkeeping, not a list of authenticated identities.
     pub fn neighbors(&self) -> &NeighborTable {
         &self.neighbors
+    }
+    /// Read-only relay budget and penalty state (MSH-10).
+    pub fn budgets(&self) -> &BudgetTracker {
+        &self.budgets
     }
     /// Processes one input at caller-supplied milliseconds.
     ///
@@ -185,6 +200,9 @@ impl<R: RngCore> MeshEngine<R> {
     /// refusal counts against the link as `rejected_packets` and
     /// produces nothing. Any other fresh Direct packet relays to
     /// verified neighbours but the sender with `ttl` decremented.
+    /// MSH-10 gates onward relays on both the origin and sender token
+    /// buckets and releases a neighbour whose penalty crosses its
+    /// threshold; local delivery is never suppressed by a budget.
     /// Submission errors are typed and the caller still owns the input
     /// bytes.
     pub fn handle(&mut self, now: u64, input: MeshInput<'_>) -> Result<Vec<MeshOutput>, MeshError> {
@@ -212,6 +230,7 @@ impl<R: RngCore> MeshEngine<R> {
             }
             MeshInput::LinkDown { link, .. } => {
                 self.neighbors.remove(link);
+                self.budgets.link_down(link);
                 Ok(Vec::new())
             }
             MeshInput::Data {
@@ -220,25 +239,59 @@ impl<R: RngCore> MeshEngine<R> {
                 payload,
                 ..
             } => {
+                // An untracked link has no counters or penalty state; do not
+                // let arbitrary link ids create either.
+                if !self.neighbors.contains(link) {
+                    return Ok(Vec::new());
+                }
                 // Packet::decode parses the bounded header before inspecting or
                 // borrowing the payload, and allocates nothing on either path.
                 let packet = Packet::decode(payload);
                 self.neighbors
                     .received(now, link, payload.len(), packet.is_ok());
+                let verified = self
+                    .neighbors
+                    .get(link)
+                    .is_some_and(|neighbor| neighbor.node_id.is_some());
                 let packet = match packet {
                     Ok(packet) => packet,
-                    Err(_) => return Ok(Vec::new()),
+                    Err(_) => {
+                        return Ok(Self::release_if_penalised(
+                            link,
+                            self.budgets
+                                .penalize(now, link, self.config.budgets.penalty_invalid),
+                        ));
+                    }
                 };
                 // Admission through LinkUp is the gate, and ADR-0004 adds
                 // that an entry whose hello failed verification may not
                 // forward or deliver on that peer's behalf: its counters
                 // observe, nothing more.
-                if !self
-                    .neighbors
-                    .get(link)
-                    .is_some_and(|neighbor| neighbor.node_id.is_some())
-                {
+                if !verified {
+                    return Ok(Self::release_if_penalised(
+                        link,
+                        self.budgets
+                            .penalize(now, link, self.config.budgets.penalty_unverified),
+                    ));
+                }
+                if self.budgets.is_released(link) {
                     return Ok(Vec::new());
+                }
+                // Both the claimed origin and the sending link pay for a
+                // relay. A local delivery still happens; only its onward
+                // copies are withheld when either bucket is empty.
+                let origin = ao_idents::NodeId::from_bytes(packet.header.origin);
+                let admitted =
+                    self.budgets
+                        .admit(now, link, origin, packet.header.class, payload.len());
+                let release = if admitted {
+                    false
+                } else {
+                    self.budgets
+                        .penalize(now, link, self.config.budgets.penalty_excess)
+                };
+                if release {
+                    return Ok(Self::release_if_penalised(link, true));
                 }
                 match forward::on_data(identity.node_id(), &mut self.seen, now, packet) {
                     Action::Drop => Ok(Vec::new()),
@@ -247,6 +300,12 @@ impl<R: RngCore> MeshEngine<R> {
                         // link that carried it, unlike a duplicate or a
                         // packet whose ttl simply ran out.
                         self.neighbors.reject(link);
+                        if self
+                            .budgets
+                            .penalize(now, link, self.config.budgets.penalty_invalid)
+                        {
+                            return Ok(Self::release_if_penalised(link, true));
+                        }
                         Ok(Vec::new())
                     }
                     Action::Deliver {
@@ -275,10 +334,16 @@ impl<R: RngCore> MeshEngine<R> {
                         }
                         Err(_) => {
                             self.neighbors.reject(link);
+                            if self
+                                .budgets
+                                .penalize(now, link, self.config.budgets.penalty_invalid)
+                            {
+                                return Ok(Self::release_if_penalised(link, true));
+                            }
                             Ok(Vec::new())
                         }
                     },
-                    Action::Relay { bytes } => Ok(self
+                    Action::Relay { bytes } if admitted => Ok(self
                         .neighbors
                         .iter()
                         // Never send a packet back down the link it
@@ -290,6 +355,7 @@ impl<R: RngCore> MeshEngine<R> {
                             payload: bytes.clone(),
                         })
                         .collect()),
+                    Action::Relay { .. } => Ok(Vec::new()),
                 }
             }
             MeshInput::Submit {
@@ -332,6 +398,17 @@ impl<R: RngCore> MeshEngine<R> {
                     },
                 }])
             }
+        }
+    }
+
+    fn release_if_penalised(link: LinkId, release: bool) -> Vec<MeshOutput> {
+        if release {
+            vec![MeshOutput::Release {
+                link,
+                reason: DisconnectReason::AbuseDetected,
+            }]
+        } else {
+            Vec::new()
         }
     }
 }

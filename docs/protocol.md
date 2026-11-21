@@ -151,13 +151,14 @@ in the seen-cache is dropped, a Direct packet addressed to this node is
 delivered, and otherwise it relays to every verified neighbour except the
 sending link with `ttl` decremented (hop limit: submitted `ttl` N reaches N
 hops, and the destination delivers regardless of a worn `ttl`) and `hops`
-incremented, saturating at 255. Classes other than Direct, senders without a
-verified `node_id` (ADR-0004) and content whose bytes no longer match its
-`msg_id` are counted and dropped. A forged content address is additionally
-counted as a rejection on the sending link. The relay path itself verifies
-no origin signature; local delivery is authenticated by MSH-09 below and
-relay-side verification follows with MSH-10/MSH-11. Link-up authentication
-is MSH-07 (above).
+incremented, saturating at 255. Before producing relay copies, MSH-10 debits
+the origin and sending-link buckets; a local delivery still happens when the
+bucket is empty. Classes other than Direct, senders without a verified
+`node_id` (ADR-0004) and content whose bytes no longer match its `msg_id` are
+counted and dropped. A forged content address is additionally counted as a
+rejection on the sending link. The relay path itself verifies no origin
+signature; local delivery is authenticated by MSH-09 below. Link-up
+authentication is MSH-07 (above).
 
 ## Authenticated local delivery (MSH-09)
 
@@ -194,6 +195,24 @@ or stale timestamp produces no delivery and increments
 `Neighbor::rejected_packets` on the sending link. The seen-cache records a
 delivery only after acceptance; relays are recorded before forwarding to
 keep their loop invariant.
+
+## Relay budgets and neighbour penalties (MSH-10)
+
+No wire field changes: budgets are a local forwarding decision. For every
+admitted packet the engine debits two token buckets, one keyed by the claimed
+origin and one by the sending link. Both refill from the caller-supplied `now`
+at the ADR-0001 class rates (1 MiB/h Direct down to 32 KiB/h Telemetry) with a
+ten-minute full bucket. Classes have separate buckets and never borrow from
+each other, so a full Direct allowance cannot mask a Telemetry flood. A packet
+that finds either bucket empty is still delivered locally when addressed to
+this node, but its relay copies are withheld.
+
+Malformed packets add 3 to the sending link's penalty, packets from a link with
+no verified identity add 2, and over-budget packets add 1. The score decays by
+1 per minute; at 12 the engine emits `MeshOutput::Release` with
+`DisconnectReason::AbuseDetected` once until `LinkDown`. aoNetwork owns any
+blacklist and reconnection decision. The simulator's `enforce` switch disables
+both buckets only for ablation runs; it is never a production tuning knob.
 
 ## Simulation evidence (MSH-27)
 

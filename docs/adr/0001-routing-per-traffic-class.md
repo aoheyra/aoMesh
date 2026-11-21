@@ -34,3 +34,41 @@ Relays see the origin and destination of every packet in MVP, which lets them ra
 ## Sweeping
 
 Each default becomes an engine config field with exactly these values; MSH-27 sweeps TTL, copies and budgets against delivery and overhead thresholds in CI. Changing a default here is a routing change and needs simulator numbers (README, Contributing).
+
+## MSH-10 implementation
+
+The relay budget is implemented as two token buckets per admitted packet: one
+keyed by the claimed origin and one by the sending link. Both use the hourly
+rates above with a ten-minute full bucket, so an honest node can spend its
+allowance in a burst without accumulating an unlimited credit. Telemetry's
+32 KiB/hour is about 9 fixed-point units per millisecond, so integer refill
+does not round ordinary ticks down to zero. Refill is driven only by the
+caller's `now`; a backwards clock never mints tokens. Buckets are per class and
+do not borrow, which is how "Direct first, Telemetry last" becomes observable
+under pressure.
+
+Options considered for the burst were one minute (too little slack for a
+phone that just came back into range) and one hour (lets a flooder dump the
+whole allowance instantaneously). Ten minutes bounds a first burst while
+keeping the 2 KiB Direct budget around 174 KiB. The full hour is still the
+sustained rate, so the ADR table above is unchanged.
+
+Origin state is capped at 1024 entries and evicted least-recently-used first,
+with `NodeId` order as the tie-break; neighbour state follows the neighbour
+table exactly. Invalid packets add 3 penalty, packets from a link whose hello
+failed verification add 2, and packets a bucket could not admit add 1. Penalty
+decays by 1 per minute; reaching 12 emits one `Release` with
+`DisconnectReason::AbuseDetected`, and a later `LinkDown` forgets the score.
+aoNetwork owns reconnection and any future blacklist decision, so no new wire
+field or sibling API is needed. MSH-09 authenticates local delivery, but a
+relay still keys the origin bucket from the claimed header value; the per-link
+bucket limits any sender regardless of what it claims, and relay-side origin
+signatures for flooded classes are a separate concern.
+
+Measured on the MSH-27 simulator with the fixed flood case (seed `1297304003`,
+20-node random graph, 300 oversized messages from one origin and 300 from
+honest nodes): the flooder delivered 92 of 300 with budgets and 236 of 300
+with budgets disabled, while honest deliveries were 208 of 300 with budgets
+and 199 of 300 without. A no-flood control delivered 217 of 285 honest
+messages. The four published MSH-27 scenarios stayed inside their existing
+directional bounds. No default in the table changed.
