@@ -17,7 +17,7 @@ use ao_mesh::packet::MAX_PAYLOAD;
 use ao_mesh::store::{MemoryStore, MessageStore, StoreLimits, StoreMetadata, StoredMessage};
 use ao_mesh::{
     CAPS, Header, MAX_FRAME_BODY_BYTES, MAX_SUMMARY_ENTRIES, MeshEngine, MeshHello, MeshInput,
-    MessageId, Packet, PacketClass, StoreSummary, SYNC_MAGIC, SYNC_VERSION, SyncFrame, SyncFrameV2,
+    MessageId, Packet, PacketClass, SYNC_MAGIC, SYNC_VERSION, StoreSummary, SyncFrame, SyncFrameV2,
     derive_msg_id,
 };
 use ao_network::{AppHello, Channel, Hello, LinkId, LocalTag};
