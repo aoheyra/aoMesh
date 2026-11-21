@@ -131,3 +131,30 @@ Direct delivery ratio stays at 0.2000. Unique Broadcast receptions fall from
 so that diagnostic is reported alongside the acceptance numbers rather than
 hidden. The four published MSH-27 baselines are unchanged because they carry no
 flooded classes.
+
+## MSH-13 implementation
+
+The store owner supplies live message ids to `MeshInput::StoreSummary`; the
+engine never persists packets or interprets payloads. `StoreSummary` sorts and
+deduplicates ids, exposes eight-byte prefixes for MSH-14's summary exchange,
+and hashes the full ids plus the entry count with a domain separator into the
+four-byte beacon digest. Canonical ordering makes the digest independent of
+backend iteration order, and full-id hashing prevents a prefix collision from
+hiding a change.
+
+Three summary representations were considered. Full 16-byte ids are exact but
+make every contact exchange large. A Bloom filter is compact but reports false
+positives, which would make MSH-14 request unnecessary transfers. Sorted
+eight-byte prefixes are deterministic, small enough for the bounded 1024-entry
+store, and safe because MSH-14 confirms with full ids before transferring. The
+digest itself is only a change detector; a four-byte collision cannot be ruled
+out, so a matching digest ends the exchange and a differing one starts full
+comparison.
+
+The beacon waits 200 ms after a change is first observed. Zero delay publishes
+every store write and wastes airtime on batches; one second delays a link-up
+comparison enough to be noticeable. A change back to the published digest
+cancels the pending beacon, so transient churn does not flap the advertisement.
+A backwards clock is treated as time zero inside the debounce window and never
+mints an early publication. No wire field changes: aoNetwork's beacon already
+carries the opaque four-byte digest.

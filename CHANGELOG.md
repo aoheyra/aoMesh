@@ -48,6 +48,14 @@ mixed case transmissions fall from 5801 to 3316 (42.84%) with the Direct
 delivery ratio unchanged at 0.2000; the Broadcast-reception diagnostic and
 seeds are in the README and ADR-0001.
 
+MSH-13 adds a canonical store summary and a debounced four-byte beacon digest.
+`StoreSummary` ignores input order and duplicates, exposes eight-byte id
+prefixes and hashes every full id. `MeshInput::StoreSummary` lets the host
+supply live store ids without giving the engine a store; `MeshConfig` gains a
+`summary: SummaryConfig` field and the engine emits `SetBeacon` after a 200 ms
+change debounce. Tests show equal digests for identical stores and a different
+digest after one message changes. No wire format changes.
+
 MSH-27 adds a deterministic SimWorld harness behind feature `sim`. It drives
 signed hellos, link events and the engine through the adapter across a 20-node
 line, a 50-node random waypoint network, a 100-node community network and a

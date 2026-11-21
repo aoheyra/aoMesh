@@ -20,6 +20,8 @@
 //! relays with per-origin and per-neighbour token buckets and
 //! releases abusive links. MSH-11 suppresses Broadcast and Presence
 //! floods with seeded assessment delays and neighbour copy counters.
+//! MSH-13 canonicalises store ids into a compact summary and publishes a
+//! debounced four-byte digest through aoNetwork's beacon.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -39,6 +41,7 @@ pub mod sign;
 pub mod sim;
 pub mod store;
 pub mod suppress;
+pub mod sync;
 
 #[cfg(feature = "adapter")]
 pub use adapter::{AdapterEvent, NetworkAdapter};
@@ -52,6 +55,7 @@ pub use sign::{
     RelayOutcome, VerifyError, derive_msg_id, sign_packet, verify_for_relay, verify_origin,
 };
 pub use suppress::SuppressionConfig;
+pub use sync::{BeaconTracker, SHORT_ID_BYTES, StoreSummary, SummaryConfig};
 
 // A signed hello must fit the opaque blob aoNetwork allows (NET-04's
 // MAX_APP_HELLO); this fails at compile time if the layout ever grows.
