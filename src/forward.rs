@@ -11,8 +11,15 @@
 //! The `msg_id` derivation is re-checked before any state changes on
 //! purpose: without it a neighbour could claim an arbitrary key and
 //! poison the dedupe cache against a future legitimate message.
+//!
+//! A delivery candidate is deduplicated by peek (MSH-09): a repeat of
+//! an already-delivered message drops here, but the recording itself
+//! is written by the engine only after MSH-09's delivery pipeline
+//! accepts, so a forgery that fails authentication cannot consume the
+//! key the honest copy still needs. A relay records before it
+//! forwards, because its loop invariant needs the record first.
 
-use ao_idents::NodeId;
+use ao_idents::{NodeId, Signature};
 
 use crate::packet::{Header, Packet, PacketClass};
 use crate::seen::{Offer, SeenCache};
@@ -21,12 +28,19 @@ use crate::sign::derive_msg_id;
 /// What the engine does with one structurally valid inbound packet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Action {
-    /// Neither delivered nor relayed.
+    /// Neither delivered nor relayed: a normal policy drop (duplicate,
+    /// worn `ttl`, class gate). No neighbour penalty is due.
     Drop,
-    /// Addressed to this node: hand the header and payload to the host.
+    /// The packet claims a `msg_id` its own bytes do not derive:
+    /// structural forgery, counted against the sending neighbour.
+    Reject,
+    /// Addressed to this node: hand the header, signature and payload
+    /// to MSH-09's delivery pipeline.
     Deliver {
         /// The packet header, as received.
         header: Header,
+        /// The origin signature, for the pipeline's verification step.
+        signature: Signature,
         /// The opaque payload, copied out of the input buffer.
         payload: Vec<u8>,
     },
@@ -37,14 +51,15 @@ pub(crate) enum Action {
     },
 }
 
-/// Applies the MSH-08 rules to one decoded packet, recording a fresh
-/// Direct message in `seen` on the way.
+/// Applies the MSH-08 rules to one decoded packet.
 ///
-/// Delivery is structural only: the origin signature is verified in
-/// MSH-09, not here. `local_id` is the engine's own node; a packet for
-/// it delivers regardless of a worn `ttl`, while anything else relays
-/// only while at least one hop of `ttl` remains (ADR-0001: TTL is the
-/// hop limit).
+/// Delivery is structural only: `Action::Deliver` carries the signature
+/// so the engine can run MSH-09's pipeline before a host sees a
+/// delivery, and the engine records the message then, not here.
+/// `local_id` is the engine's own node; a packet for it delivers
+/// regardless of a worn `ttl`, while anything else relays only while
+/// at least one hop of `ttl` remains (ADR-0001: TTL is the hop limit).
+/// A relay records first: the dedupe record is what stops the loop.
 pub(crate) fn on_data(
     local_id: NodeId,
     seen: &mut SeenCache,
@@ -55,17 +70,27 @@ pub(crate) fn on_data(
         return Action::Drop;
     }
     // The claimed id must match the content before it can key dedupe.
+    // This is not a policy drop: the neighbour sent bytes that do not
+    // match their own content address, so the engine counts it against
+    // the link (MSH-09).
     if derive_msg_id(&packet.header, packet.payload) != packet.header.msg_id {
-        return Action::Drop;
+        return Action::Reject;
+    }
+    if packet.header.dst == Some(*local_id.as_bytes()) {
+        // Peek, do not record: the engine records only once MSH-09's
+        // pipeline accepts, so a failed forgery leaves the key free
+        // for the honest copy of the same content.
+        if seen.is_duplicate(now, &packet.header.msg_id) {
+            return Action::Drop;
+        }
+        return Action::Deliver {
+            header: packet.header,
+            signature: packet.signature,
+            payload: packet.payload.to_vec(),
+        };
     }
     if seen.check_and_insert(now, packet.header.class, packet.header.msg_id) == Offer::Duplicate {
         return Action::Drop;
-    }
-    if packet.header.dst == Some(*local_id.as_bytes()) {
-        return Action::Deliver {
-            header: packet.header,
-            payload: packet.payload.to_vec(),
-        };
     }
     if packet.header.ttl <= 1 {
         return Action::Drop;
@@ -117,24 +142,29 @@ mod tests {
     }
 
     #[test]
-    fn fresh_direct_for_this_node_delivers_exactly_once() {
+    fn fresh_direct_for_this_node_delivers_and_a_recorded_repeat_drops() {
         let bytes = wire(
             PacketClass::Direct,
             |h| h.dst = Some(*LOCAL.as_bytes()),
             b"hello",
         );
         let packet = decode(&bytes);
+        let expect = Action::Deliver {
+            header: packet.header,
+            signature: packet.signature,
+            payload: b"hello".to_vec(),
+        };
         let mut seen = SeenCache::default();
-        assert_eq!(
-            on_data(LOCAL, &mut seen, 0, packet),
-            Action::Deliver {
-                header: packet.header,
-                payload: b"hello".to_vec(),
-            }
-        );
-        // The second copy of the same message is a duplicate, so the
-        // host never sees it twice.
-        assert_eq!(on_data(LOCAL, &mut seen, 10, packet), Action::Drop);
+        assert_eq!(on_data(LOCAL, &mut seen, 0, packet), expect);
+        // Forwarding does not record a delivery itself: the engine
+        // writes the record only after MSH-09's pipeline accepts, so
+        // until that record exists the same packet is still fresh.
+        assert_eq!(on_data(LOCAL, &mut seen, 10, packet), expect);
+        assert_eq!(seen.len(), 0, "no record before acceptance");
+        // With the engine's record in place the repeat drops without
+        // a second delivery.
+        let _ = seen.check_and_insert(10, PacketClass::Direct, packet.header.msg_id);
+        assert_eq!(on_data(LOCAL, &mut seen, 20, packet), Action::Drop);
     }
 
     #[test]
@@ -215,12 +245,12 @@ mod tests {
         let mut tampered = bytes.clone();
         *tampered.last_mut().expect("payload byte") ^= 1;
         let mut seen = SeenCache::default();
-        // The claimed msg_id no longer matches the content: dropped
+        // The claimed msg_id no longer matches the content: rejected
         // before the cache is touched, so a flood of forgeries cannot
-        // evict real recordings.
+        // evict real recordings. The engine penalises this link.
         assert_eq!(
             on_data(LOCAL, &mut seen, 0, decode(&tampered)),
-            Action::Drop
+            Action::Reject
         );
         assert_eq!(seen.len(), 0);
         // The untouched copy still delivers: nothing was poisoned.

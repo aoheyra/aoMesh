@@ -1,10 +1,12 @@
 //! MSH-08 baseline forwarding on aoNetwork's SimWorld: a line, a ring
 //! and a seeded random graph, each checked for delivery and for the
-//! absence of loops.
+//! absence of loops. Payloads are sealed with the MSH-09 recipe so the
+//! destination's authenticated pipeline emits the delivery.
 #![cfg(feature = "adapter")]
+mod common;
 use ao_idents::Identity;
 use ao_mesh::{
-    AdapterEvent, Header, MeshEngine, MeshHello, MeshInput, MeshOutput, NetworkAdapter, PacketClass,
+    AdapterEvent, MeshEngine, MeshHello, MeshInput, MeshOutput, NetworkAdapter, PacketClass,
 };
 use ao_network::{
     AppHello, BeaconFlags, LocalTag, Network, NetworkConfig, SimConfig, SimNode, SimTransport,
@@ -29,7 +31,7 @@ fn node(world: &SimWorld, index: usize) -> Adapter {
     let own = identity(index);
     let radio = world.add_node(SimNode::default()).unwrap();
     let network = Network::new(NetworkConfig::default(), radio);
-    let engine = MeshEngine::new(StdRng::seed_from_u64(SEED), own.node_id());
+    let engine = MeshEngine::new(StdRng::seed_from_u64(SEED));
     let mut adapter = NetworkAdapter::new(engine, network);
     let signed = MeshHello::sign(&own, [0; 8], [0; 4]).unwrap();
     let applied = adapter.apply(
@@ -65,8 +67,9 @@ fn pump(
     for _ in 0..steps {
         world.advance(Duration::from_millis(10));
         for (i, node) in nodes.iter_mut().enumerate() {
+            let own = identity(i);
             while let Poll::Ready(result) =
-                node.poll_event(&mut cx, world.now(), world.now().as_millis() as u64)
+                node.poll_event(&mut cx, world.now(), world.now().as_millis() as u64, &own)
             {
                 for event in result.unwrap() {
                     events.push((i, event));
@@ -135,28 +138,26 @@ impl Graph {
 /// ADR-0001 Direct hop limit of 8.
 fn submit(g: &mut Graph, dst: usize) {
     let origin = identity(0);
-    let header = Header {
-        class: PacketClass::Direct,
-        dst: Some(*identity(dst).node_id().as_bytes()),
-        msg_id: [0; 16].into(),
-        origin: [0; 16],
-        created_ms: 2_000,
-        lifetime_s: 3_600,
-        payload_len: PAYLOAD.len() as u64,
-        ttl: 8,
-        hops: 0,
-    };
+    let now_ms = g.world.now().as_millis() as u64;
+    let (header, payload) = common::seal_for(
+        &origin,
+        &identity(dst),
+        now_ms,
+        PacketClass::Direct,
+        |h| h.ttl = 8,
+        PAYLOAD,
+    );
     let events = g
         .nodes
         .get_mut(0)
         .expect("graph is not empty")
         .handle(
             g.world.now(),
-            g.world.now().as_millis() as u64,
+            now_ms,
             MeshInput::Submit {
                 identity: &origin,
                 header,
-                payload: PAYLOAD,
+                payload: &payload,
                 via: None,
             },
         )

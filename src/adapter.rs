@@ -6,6 +6,7 @@
 //! explicit separate inputs; no wall-clock/monotonic conversion is guessed.
 
 use crate::{MeshEngine, MeshError, MeshInput, MeshOutput};
+use ao_idents::Identity;
 use ao_network::{LinkId, Network, NetworkEvent, SendError, Transport};
 use rand_core::RngCore;
 use std::future::poll_fn;
@@ -15,12 +16,14 @@ use std::time::Duration;
 /// Host-visible results of applying engine actions.
 #[derive(Debug)]
 pub enum AdapterEvent {
-    /// A local delivery under MSH-08's structural rules; MSH-09's
-    /// authentication gates it before a host may trust the payload.
+    /// A local delivery authenticated by MSH-09: the payload is the
+    /// opened plaintext after the seal, origin-signature and replay
+    /// checks accepted it.
     Deliver {
-        /// Packet header.
+        /// Packet header, as received; `payload_len` counts the sealed
+        /// wire payload, not this plaintext's length.
         header: crate::Header,
-        /// Opaque payload.
+        /// The opened application payload.
         payload: Vec<u8>,
     },
     /// Network admission failed; SendError retains the original payload.
@@ -120,11 +123,14 @@ impl<R: RngCore, T: Transport> NetworkAdapter<R, T> {
     }
     /// Pumps one network event into the engine. Ready with no host events still
     /// means one input was processed; Pending registers the transport waker.
+    /// `identity` is borrowed only when a Data event needs MSH-09's
+    /// pipeline; the engine retains no key.
     pub fn poll_event(
         &mut self,
         cx: &mut Context<'_>,
         network_now: Duration,
         mesh_now_ms: u64,
+        identity: &Identity,
     ) -> Poll<Result<Vec<AdapterEvent>, MeshError>> {
         let event = match self.network.poll_event(cx, network_now) {
             Poll::Pending => return Poll::Pending,
@@ -147,6 +153,7 @@ impl<R: RngCore, T: Transport> NetworkAdapter<R, T> {
                 link: *link,
                 channel: *channel,
                 payload,
+                identity,
             },
             // Future network events are observable progress but have no engine effect yet.
             _ => return Poll::Ready(Ok(Vec::new())),
@@ -155,11 +162,13 @@ impl<R: RngCore, T: Transport> NetworkAdapter<R, T> {
     }
     /// Future wrapper for a single polling interval. Timestamps are fixed for
     /// its lifetime: cancel it at next_deadline and recreate with fresh time.
+    /// `identity` has the same meaning as in [`Self::poll_event`].
     pub async fn next_event(
         &mut self,
         network_now: Duration,
         mesh_now_ms: u64,
+        identity: &Identity,
     ) -> Result<Vec<AdapterEvent>, MeshError> {
-        poll_fn(|cx| self.poll_event(cx, network_now, mesh_now_ms)).await
+        poll_fn(|cx| self.poll_event(cx, network_now, mesh_now_ms, identity)).await
     }
 }

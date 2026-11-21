@@ -2,7 +2,7 @@
 
 **The routing and store-and-forward engine of the aoheyra mesh.** A sans-IO Rust crate that decides what happens to a packet: forward it, hold it, suppress it, deliver it, or drop it, across a phone-to-phone mesh where links come and go.
 
-> **Status: pre-alpha, through MSH-08.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter and baseline Direct forwarding (dedupe, TTL, local delivery, relay to verified neighbours) are implemented. Verified local delivery (MSH-09) is not implemented.
+> **Status: pre-alpha, through MSH-09.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours) and authenticated local delivery (seal, origin binding, signature and replay guard) are implemented. Relay budgets (MSH-10) and broadcast suppression (MSH-11) are not implemented yet.
 
 Cargo package name: `ao_mesh`.
 
@@ -82,8 +82,9 @@ Lifetimes, TTLs, copy counts and budgets are **defaults with documented reasons*
 
 ### Engine and adapter (MSH-06)
 
-`MeshEngine::new(rng, local_id)` uses `MeshConfig::default()` (32 neighbour entries).
-`with_config` accepts an explicit bound; zero refuses all new links. Excess
+`MeshEngine::new(rng)` uses `MeshConfig::default()` (32 neighbour entries and
+the MSH-09 replay guard: 1024 ids per sender, 24 h tolerance, 64 senders).
+`with_config` accepts explicit bounds; zero neighbours refuses all new links. Excess
 links emit `Release`, duplicate link-up events preserve counters, and link-down
 removes the entry. These are bookkeeping limits, not radio topology policy.
 Link-up verifies the peer's signed MeshHello, so each entry carries a verified
@@ -93,21 +94,26 @@ Link-up verifies the peer's signed MeshHello, so each entry carries a verified
 no keys, validates lengths before signing, and emits `Send` to a selected
 admitted link or `Broadcast` to all up links. Telemetry uses the Telemetry
 channel; other packet classes use Message. Packet and signing failures return
-typed `MeshError`s while the caller retains its payload. Incoming Data is
-parsed without copying and counted: a fresh Direct packet whose `dst` is the
-engine's node id is delivered, any other fresh Direct packet relays to
-verified neighbours except the sender with `ttl` decremented, and everything
-else (other classes, unverified senders, repeats, content that no longer
-matches its `msg_id`) is dropped. Structural validity still never implies
-authentication: MSH-09 gates delivery on origin signature, sealed payload
-and replay checks.
+typed `MeshError`s while the caller retains its payload. Incoming Data also
+borrows the local `Identity`; the engine keeps no keys. It is parsed without
+copying and counted: a fresh Direct packet whose `dst` is that identity's
+node id becomes a delivery candidate, any other fresh Direct packet relays
+to verified neighbours except the sender with `ttl` decremented, and
+everything else (other classes, unverified senders, repeats, content that no
+longer matches its `msg_id`) is dropped. A candidate only becomes
+`Deliver` after its sealed payload opens against the local identity, the
+seal's sender matches `origin`, the origin signature verifies and the replay
+guard accepts. Refusals and forged content addresses are counted against the
+sending neighbour.
 
 With feature `adapter`, `NetworkAdapter` owns the facade and engine in one
 caller task. All seven output variants map to commands or host events;
 `SendFailed` returns the link and original payload through `SendError`.
 `poll_event` and its `next_event` future need no runtime dependency and work
-in a Tokio-owned task. The host supplies separate monotonic network durations
-and mesh milliseconds, arranges wakeups by `next_deadline()`, and recreates
+in a Tokio-owned task. Each pump takes the local `Identity` by borrow so
+MSH-09 can open deliveries; the engine retains no key. The host supplies
+separate monotonic network durations and mesh milliseconds, arranges wakeups
+by `next_deadline()`, and recreates
 `next_event` with fresh times after a timer wakeup. Tick is explicit; no mesh
 timers are scheduled yet.
 
@@ -127,7 +133,7 @@ end-to-end encryption or application delivery. See the [I/O decision](docs/adr/e
 - `ttl` and `hops` are **hop-mutable** and are *not* covered by the origin signature; everything else is. The signature sits after the hop fields, so verification survives relay hops.
 - Header-only parsing allows fast reject without allocating the payload; there is a hard payload cap.
 - `msg_id` derives from the immutable header and the payload hash (MSH-04): a content address, so one message has exactly one dedup key for MSH-05's seen-cache.
-- Relays verify the origin signature for Broadcast and Presence; Direct packets are verified by the recipient, and by relays only within a CPU budget. Telemetry is not verified by relays. The verification calls shipped in MSH-04; MSH-08's baseline relay and delivery are structural only, MSH-09 starts the recipient's checks, and relay-side checks follow with MSH-10/MSH-11.
+- Relays verify the origin signature for Broadcast and Presence; Direct packets are verified by the recipient, and by relays only within a CPU budget. Telemetry is not verified by relays. The verification calls shipped in MSH-04; MSH-09 runs the recipient's checks for local delivery, and relay-side checks follow with MSH-10/MSH-11.
 
 ### Seen-cache (MSH-05)
 
@@ -156,17 +162,30 @@ rule: [`docs/protocol.md`](docs/protocol.md), decision record
 ### Baseline forwarding (MSH-08)
 
 A received Direct packet must re-derive its content-bound `msg_id` before it
-touches any state, is recorded once in the seen-cache, and is delivered when
-`dst` is the engine's `NodeId`. Any other fresh copy relays to every verified
-neighbour except the sending link with `ttl` decremented (TTL is the hop
-limit: a submission with `ttl` N reaches N hops, and the destination delivers
-even on a worn `ttl`) and `hops` incremented, saturating at 255. Submissions
-are recorded too, so a node never re-relays its own message. Other classes,
-unverified senders and duplicates are counted and dropped (MSH-11, MSH-19
-and MSH-22 own the other classes; ADR-0004 forbids acting on an unverified
-link). No origin signature is checked on this path: MSH-09 authenticates
-local delivery. The line, ring and seeded random-graph cases in
-`tests/forwarding.rs` pin delivery and the absence of loops.
+touches any state. A forged id is rejected and counted against the link. A
+relay copy is recorded once in the seen-cache, then forwarded to every
+verified neighbour except the sending link with `ttl` decremented (TTL is the
+hop limit: a submission with `ttl` N reaches N hops, and the destination
+delivers even on a worn `ttl`) and `hops` incremented, saturating at 255.
+Submissions are recorded too, so a node never re-relays its own message.
+Other classes, unverified senders and duplicates are counted and dropped
+(MSH-11, MSH-19 and MSH-22 own the other classes; ADR-0004 forbids acting on
+an unverified link). The line, ring and seeded random-graph cases in
+`tests/forwarding.rs` pin delivery and the absence of loops with sealed
+payloads, so the destination's MSH-09 pipeline emits the delivery.
+
+### Authenticated local delivery (MSH-09)
+
+A Direct packet addressed to this node carries a sealed payload. The sender
+seals the plaintext to the recipient under the header's content address,
+sets `payload_len` to the encoded seal length and signs the packet. The
+recipient opens the seal against the borrowed local identity, requires the
+seal's authenticated sender to equal `origin`, verifies the origin signature
+and content id, then runs the replay guard before emitting `Deliver` with the
+opened plaintext. The header's `payload_len` stays the sealed wire length.
+Failed checks and forged content addresses increment
+`Neighbor::rejected_packets` and never produce a delivery; policy drops do
+not. Decision record: [ADR-0005](docs/adr/0005-local-delivery-pipeline.md).
 
 ### Simulator harness and baseline (MSH-27)
 

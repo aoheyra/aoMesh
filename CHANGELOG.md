@@ -16,6 +16,23 @@ enforce directional regression bounds on delivery ratio, overhead, latency,
 duplicates, radio bytes and peak queue occupancy. The adapter gains
 `engine_mut` and `network_mut` so the harness can count outputs before they
 are applied. Published seeds and numbers are in the README.
+MSH-09 authenticates local delivery. A Direct packet addressed to this node
+must carry an aoIdents sealed payload bound to the immutable header content
+address; the engine opens it against a borrowed local identity, requires the
+seal's sender to equal `origin`, verifies the origin signature and content
+`msg_id`, and accepts the message through a bounded replay guard before
+emitting `Deliver` with the opened plaintext. Tampered, misdirected, forged
+and replayed candidates produce nothing and are counted on the sending link,
+as are forged content addresses; policy drops are not penalised. Decision
+record: ADR-0005. Tests cover every pipeline step at unit level and
+authenticated delivery, duplicates, tampering and penalties at engine level;
+the simulator forwarding cases now deliver through this pipeline.
+
+Breaking unreleased API change: `MeshEngine::new` and `with_config` no longer
+take a local `NodeId`; `MeshInput::Data` takes a borrowed `identity`;
+`NetworkAdapter::poll_event` and `next_event` take a borrowed `identity` per
+pump; `Neighbor` gained `rejected_packets`; `MeshConfig` gained `replay`.
+`MeshOutput::Deliver.payload` is now the opened plaintext, not opaque bytes.
 
 MSH-08 adds the baseline forwarding path for Direct. A received packet
 must re-derive its content-bound `msg_id` before any state changes, is
@@ -26,10 +43,8 @@ submission with `ttl` N reaches N hops) and `hops` incremented,
 saturating at 255. Submissions are recorded too, so no node re-relays
 its own message; other classes, unverified senders and duplicates are
 counted and dropped (ADR-0004, and MSH-11/19/22 own the other
-classes). Delivery is structural: MSH-09 authenticates it. Tests pin
-delivery without loops on a line, a ring and a seeded random graph.
-Breaking unreleased API change: `MeshEngine::new` and
-`MeshEngine::with_config` take the local `NodeId` after the RNG.
+classes). Delivery was structural until MSH-09; see the entry above. Tests
+pin delivery without loops on a line, a ring and a seeded random graph.
 
 MSH-07 adds the signed MeshHello: the `hello` module builds, encodes,
 verifies and negotiates a 161-byte fixed layout covering `node_id`,

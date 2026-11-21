@@ -1,21 +1,27 @@
 //! Engine dispatch through the public API, including untrusted input bounds.
-use ao_idents::{Identity, NodeId};
+mod common;
+
+use ao_idents::{Identity, ReplayConfig};
 use ao_mesh::{
     Header, MeshConfig, MeshEngine, MeshError, MeshHello, MeshInput, MeshOutput, Packet,
     PacketClass, verify_origin,
 };
 use ao_network::{AppHello, Channel, DisconnectReason, Hello, LinkId, LocalTag};
 use rand::{SeedableRng, rngs::StdRng};
+use std::sync::LazyLock;
 
-/// The node every test engine delivers to; deliberately not `[9; 16]`,
-/// the destination `header()` stamps.
-const LOCAL: NodeId = NodeId::from_bytes([3; 16]);
+/// The node every test engine delivers to: a real identity, so the
+/// sealed delivery tests address and open against the same key pair.
+/// Seed `[3; 32]`, deliberately neither the `[9; 16]` destination
+/// `header()` stamps nor the `[1; 32]` sender the helpers build.
+static LOCAL: LazyLock<Identity> = LazyLock::new(|| Identity::from_seed([3; 32]));
+
 fn engine(limit: usize) -> MeshEngine<StdRng> {
     MeshEngine::with_config(
         StdRng::seed_from_u64(0x6006),
-        LOCAL,
         MeshConfig {
             max_neighbors: limit,
+            ..MeshConfig::default()
         },
     )
 }
@@ -75,9 +81,40 @@ fn signed_with(class: PacketClass, mutate: impl FnOnce(&mut Header), payload: &[
 fn signed(class: PacketClass, payload: &[u8]) -> Vec<u8> {
     signed_with(class, |_| {}, payload)
 }
+/// One encoded packet whose payload is the plaintext sealed to this
+/// node, built with the MSH-09 recipe; `mutate` adjusts the header
+/// before the seal binds it.
+fn sealed_with(class: PacketClass, mutate: impl FnOnce(&mut Header), plaintext: &[u8]) -> Vec<u8> {
+    common::sealed(
+        &Identity::from_seed([1; 32]),
+        &LOCAL,
+        100,
+        class,
+        mutate,
+        plaintext,
+    )
+}
+/// Where in the wire the 64-byte origin signature starts: after the
+/// header, before the payload.
+fn signature_offset(wire: &[u8], payload_len: usize) -> usize {
+    wire.len() - payload_len - ao_mesh::SIGNATURE_LEN
+}
+/// Breaks the origin signature without changing either the sealed
+/// payload or its content address: the seal and `msg_id` still decode,
+/// so the packet reaches MSH-09's verification step.
+fn tamper_signature(wire: &mut [u8], payload_len: usize) {
+    let at = signature_offset(wire, payload_len);
+    wire[at] ^= 1;
+}
 #[test]
 fn default_bound_and_every_input_change_only_their_owned_state() {
     assert_eq!(MeshConfig::default().max_neighbors, 32);
+    // The replay defaults are the documented bounds: 1024 ids per
+    // sender for 24 h (ADR-0001's Direct lifetime) across 64 senders.
+    assert_eq!(
+        MeshConfig::default().replay,
+        ReplayConfig::new(1_024, 86_400_000, 64).expect("documented bounds are valid")
+    );
     let mut e = engine(2);
     let link = LinkId::new(1);
     assert!(
@@ -101,7 +138,8 @@ fn default_bound_and_every_input_change_only_their_owned_state() {
             MeshInput::Data {
                 link,
                 channel: Channel::Message,
-                payload: &packet
+                payload: &packet,
+                identity: &LOCAL,
             }
         )
         .unwrap()
@@ -109,6 +147,7 @@ fn default_bound_and_every_input_change_only_their_owned_state() {
     );
     let n = e.neighbors().get(link).unwrap();
     assert_eq!((n.received_packets, n.malformed_packets), (1, 0));
+    assert_eq!(n.rejected_packets, 0);
     assert_eq!(n.received_bytes, packet.len() as u64);
     assert_eq!(n.last_rx_ms, Some(20));
     assert!(e.handle(30, MeshInput::Tick).unwrap().is_empty());
@@ -325,7 +364,8 @@ fn malformed_and_oversized_data_are_counted_without_delivery_or_forwarding() {
                 MeshInput::Data {
                     link,
                     channel: Channel::Message,
-                    payload: &wire[..end]
+                    payload: &wire[..end],
+                    identity: &LOCAL,
                 }
             )
             .unwrap()
@@ -338,7 +378,8 @@ fn malformed_and_oversized_data_are_counted_without_delivery_or_forwarding() {
             MeshInput::Data {
                 link,
                 channel: Channel::Bulk,
-                payload: &[0; 16384]
+                payload: &[0; 16384],
+                identity: &LOCAL,
             }
         )
         .unwrap()
@@ -354,7 +395,8 @@ fn malformed_and_oversized_data_are_counted_without_delivery_or_forwarding() {
             MeshInput::Data {
                 link: LinkId::new(99),
                 channel: Channel::Message,
-                payload: &wire
+                payload: &wire,
+                identity: &LOCAL,
             }
         )
         .unwrap()
@@ -374,8 +416,14 @@ fn structural_validity_never_means_authenticated_delivery() {
         },
     )
     .unwrap();
-    let mut wire = signed(PacketClass::Direct, b"tamper");
-    *wire.last_mut().unwrap() ^= 1;
+    let plaintext = b"tamper";
+    let mut wire = sealed_with(
+        PacketClass::Direct,
+        |h| h.dst = Some(*LOCAL.node_id().as_bytes()),
+        plaintext,
+    );
+    let sealed_len = Packet::decode(&wire).unwrap().header.payload_len as usize;
+    tamper_signature(&mut wire, sealed_len);
     assert!(Packet::decode(&wire).is_ok());
     assert!(
         e.handle(
@@ -383,13 +431,77 @@ fn structural_validity_never_means_authenticated_delivery() {
             MeshInput::Data {
                 link,
                 channel: Channel::Message,
-                payload: &wire
+                payload: &wire,
+                identity: &LOCAL,
             }
         )
         .unwrap()
         .is_empty()
     );
-    assert_eq!(e.neighbors().get(link).unwrap().received_packets, 1);
+    let neighbor = e.neighbors().get(link).unwrap();
+    assert_eq!(neighbor.received_packets, 1);
+    assert_eq!(neighbor.rejected_packets, 1, "the sender is penalised");
+}
+
+#[test]
+fn a_seal_for_another_recipient_is_not_delivered_and_is_counted() {
+    let mut e = engine(1);
+    let link = LinkId::new(1);
+    e.handle(
+        0,
+        MeshInput::LinkUp {
+            link,
+            remote_hello: hello(),
+        },
+    )
+    .unwrap();
+    // Addressed to us, but encrypted for a different node. The header's
+    // content address is intact, so only the seal can refuse it.
+    let other = Identity::from_seed([4; 32]);
+    let wire = common::sealed(
+        &Identity::from_seed([1; 32]),
+        &other,
+        100,
+        PacketClass::Direct,
+        |h| h.dst = Some(*LOCAL.node_id().as_bytes()),
+        b"not for you",
+    );
+    assert!(
+        e.handle(
+            1,
+            MeshInput::Data {
+                link,
+                channel: Channel::Message,
+                payload: &wire,
+                identity: &LOCAL,
+            }
+        )
+        .unwrap()
+        .is_empty()
+    );
+    assert_eq!(e.neighbors().get(link).unwrap().rejected_packets, 1);
+    // A subsequent honest delivery on the same link still works: the
+    // refusal left no state that could block it.
+    let honest = sealed_with(
+        PacketClass::Direct,
+        |h| h.dst = Some(*LOCAL.node_id().as_bytes()),
+        b"not for you",
+    );
+    let out = e
+        .handle(
+            2,
+            MeshInput::Data {
+                link,
+                channel: Channel::Message,
+                payload: &honest,
+                identity: &LOCAL,
+            },
+        )
+        .unwrap();
+    assert!(
+        matches!(out.as_slice(), [MeshOutput::Deliver { .. }]),
+        "{out:?}"
+    );
 }
 #[test]
 fn link_up_records_the_verified_node_id_from_the_hello() {
@@ -475,9 +587,9 @@ fn fresh_direct_for_the_local_node_delivers_exactly_once() {
         },
     )
     .unwrap();
-    let wire = signed_with(
+    let wire = sealed_with(
         PacketClass::Direct,
-        |h| h.dst = Some(*LOCAL.as_bytes()),
+        |h| h.dst = Some(*LOCAL.node_id().as_bytes()),
         b"hello",
     );
     let out = e
@@ -487,6 +599,7 @@ fn fresh_direct_for_the_local_node_delivers_exactly_once() {
                 link,
                 channel: Channel::Message,
                 payload: &wire,
+                identity: &LOCAL,
             },
         )
         .unwrap();
@@ -495,7 +608,7 @@ fn fresh_direct_for_the_local_node_delivers_exactly_once() {
     };
     assert_eq!(payload.as_slice(), b"hello");
     assert_eq!(header.class, PacketClass::Direct);
-    assert_eq!(header.dst, Some(*LOCAL.as_bytes()));
+    assert_eq!(header.dst, Some(*LOCAL.node_id().as_bytes()));
     // The same message arriving again is a duplicate, not a delivery.
     assert!(
         e.handle(
@@ -504,6 +617,7 @@ fn fresh_direct_for_the_local_node_delivers_exactly_once() {
                 link,
                 channel: Channel::Message,
                 payload: &wire,
+                identity: &LOCAL,
             },
         )
         .unwrap()
@@ -533,6 +647,7 @@ fn relay_skips_the_sending_link_and_decrements_ttl() {
                 link: LinkId::new(1),
                 channel: Channel::Message,
                 payload: &wire,
+                identity: &LOCAL,
             },
         )
         .unwrap();
@@ -594,6 +709,7 @@ fn exhausted_ttl_stops_relaying_but_the_local_destination_still_delivers() {
                     link,
                     channel: Channel::Message,
                     payload: &wire,
+                    identity: &LOCAL,
                 },
             )
             .unwrap()
@@ -602,10 +718,10 @@ fn exhausted_ttl_stops_relaying_but_the_local_destination_still_delivers() {
         );
     }
     // A worn ttl never blocks delivery at the destination itself.
-    let wire = signed_with(
+    let wire = sealed_with(
         PacketClass::Direct,
         |h| {
-            h.dst = Some(*LOCAL.as_bytes());
+            h.dst = Some(*LOCAL.node_id().as_bytes());
             h.ttl = 0;
         },
         b"last hop",
@@ -617,6 +733,7 @@ fn exhausted_ttl_stops_relaying_but_the_local_destination_still_delivers() {
                 link,
                 channel: Channel::Message,
                 payload: &wire,
+                identity: &LOCAL,
             },
         )
         .unwrap();
@@ -646,6 +763,7 @@ fn hostile_hops_saturate_instead_of_panicking() {
                 link: LinkId::new(1),
                 channel: Channel::Message,
                 payload: &wire,
+                identity: &LOCAL,
             },
         )
         .unwrap();
@@ -674,7 +792,11 @@ fn non_direct_classes_are_neither_delivered_nor_relayed() {
     ] {
         // Hostile: a flooded class claiming this node as its
         // destination, arriving where a relay target exists.
-        let wire = signed_with(class, |h| h.dst = Some(*LOCAL.as_bytes()), b"flooded");
+        let wire = signed_with(
+            class,
+            |h| h.dst = Some(*LOCAL.node_id().as_bytes()),
+            b"flooded",
+        );
         assert!(
             e.handle(
                 1,
@@ -682,6 +804,7 @@ fn non_direct_classes_are_neither_delivered_nor_relayed() {
                     link: LinkId::new(1),
                     channel: Channel::Message,
                     payload: &wire,
+                    identity: &LOCAL,
                 },
             )
             .unwrap()
@@ -702,9 +825,9 @@ fn content_tampering_never_reaches_delivery() {
         },
     )
     .unwrap();
-    let mut wire = signed_with(
+    let mut wire = sealed_with(
         PacketClass::Direct,
-        |h| h.dst = Some(*LOCAL.as_bytes()),
+        |h| h.dst = Some(*LOCAL.node_id().as_bytes()),
         b"secret",
     );
     *wire.last_mut().unwrap() ^= 1;
@@ -716,17 +839,20 @@ fn content_tampering_never_reaches_delivery() {
                 link,
                 channel: Channel::Message,
                 payload: &wire,
+                identity: &LOCAL,
             },
         )
         .unwrap()
         .is_empty()
     );
-    assert_eq!(e.neighbors().get(link).unwrap().received_packets, 1);
+    let neighbor = e.neighbors().get(link).unwrap();
+    assert_eq!(neighbor.received_packets, 1);
+    assert_eq!(neighbor.rejected_packets, 1, "forged content address");
     // The forgery touched no dedupe record, so the intact copy of the
     // same content still delivers.
-    let intact = signed_with(
+    let intact = sealed_with(
         PacketClass::Direct,
-        |h| h.dst = Some(*LOCAL.as_bytes()),
+        |h| h.dst = Some(*LOCAL.node_id().as_bytes()),
         b"secret",
     );
     assert!(matches!(
@@ -736,6 +862,7 @@ fn content_tampering_never_reaches_delivery() {
                 link,
                 channel: Channel::Message,
                 payload: &intact,
+                identity: &LOCAL,
             },
         )
         .unwrap()
@@ -778,7 +905,7 @@ fn unverified_senders_neither_forward_nor_receive() {
     // counted, never delivered (ADR-0004).
     let for_us = signed_with(
         PacketClass::Direct,
-        |h| h.dst = Some(*LOCAL.as_bytes()),
+        |h| h.dst = Some(*LOCAL.node_id().as_bytes()),
         b"hostile",
     );
     assert!(
@@ -788,6 +915,7 @@ fn unverified_senders_neither_forward_nor_receive() {
                 link: LinkId::new(1),
                 channel: Channel::Message,
                 payload: &for_us,
+                identity: &LOCAL,
             },
         )
         .unwrap()
@@ -806,6 +934,7 @@ fn unverified_senders_neither_forward_nor_receive() {
                 link: LinkId::new(1),
                 channel: Channel::Message,
                 payload: &elsewhere,
+                identity: &LOCAL,
             },
         )
         .unwrap()
@@ -821,6 +950,7 @@ fn unverified_senders_neither_forward_nor_receive() {
                 link: LinkId::new(2),
                 channel: Channel::Message,
                 payload: &elsewhere,
+                identity: &LOCAL,
             },
         )
         .unwrap();
@@ -868,6 +998,7 @@ fn the_origin_never_rerelays_a_copy_of_its_own_submission() {
                 link: LinkId::new(2),
                 channel: Channel::Message,
                 payload: payload.as_slice(),
+                identity: &LOCAL,
             },
         )
         .unwrap()

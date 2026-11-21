@@ -6,21 +6,24 @@
 //! feature and needs no runtime dependency.
 //!
 //! The engine deals in packet classes and opaque payload bytes; it never
-//! interprets the app schema (that belongs to `aoheyra`) and never does
-//! identity work (that belongs to `ao_idents`).
+//! interprets the app schema (that belongs to `aoheyra`) and never
+//! implements identity or crypto work (that belongs to `ao_idents`).
 //!
 //! MSH-06 adds signed submissions, bounded neighbour bookkeeping and the
 //! optional network adapter. MSH-07 verifies the signed `MeshHello` on
 //! link-up, so every admitted neighbour carries a derived `NodeId`.
 //! MSH-08 relays Direct packets to every verified neighbour but the
-//! sender and delivers packets addressed to this node; MSH-09
-//! authenticates that delivery.
+//! sender and hands packets addressed to this node to MSH-09, which
+//! opens the sealed payload against the local identity, binds the
+//! seal's sender to `origin`, verifies the origin signature and runs
+//! the replay guard before a `Deliver` is emitted.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 #[cfg(feature = "adapter")]
 pub mod adapter;
+mod deliver;
 pub mod engine;
 mod forward;
 pub mod hello;
