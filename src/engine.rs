@@ -1193,7 +1193,7 @@ impl<R: RngCore> MeshEngine<R> {
                         let threshold = self
                             .config
                             .suppression
-                            .copy_threshold(degree, &mut self.rng);
+                            .copy_threshold_for(class, degree, &mut self.rng);
                         let deadline_ms = now.saturating_add(
                             self.config
                                 .suppression
@@ -1547,7 +1547,7 @@ impl<R: RngCore> MeshEngine<R> {
         let threshold = self
             .config
             .suppression
-            .copy_threshold(degree, &mut self.rng);
+            .copy_threshold_for(class, degree, &mut self.rng);
         let deadline_ms = now.saturating_add(
             self.config
                 .suppression

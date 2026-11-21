@@ -317,17 +317,19 @@ Broadcast and Presence do not relay on sight. A fresh content id waits a
 seeded assessment window while distinct sending links are counted; if the
 degree-scaled copy threshold is reached, the relay is cancelled and the id is
 recorded. Otherwise one relay is sent when the timer fires, with `ttl` capped
-at the ADR-0001 class value. The effective threshold is always at least two
-distinct sending links: a single copy proves only that this node heard the
-packet, and cancelling on it extinguished floods on degree-one paths. State is bounded by
-`SuppressionConfig::max_entries` (default 1024) and evicted by earliest
-deadline. `Direct` and `Telemetry` keep their existing paths and no wire field
-changes.
+at the ADR-0001 class value. A chain relay with at most one other link keeps a
+two-link floor, so one copy cannot extinguish a flood on a degree-one path;
+dense Broadcast nodes use the calibrated degree-scaled threshold again.
+Presence keeps the two-link floor at every degree because a signed
+announcement on one capability-gated link does not prove the peer's other
+links learned it. State is bounded by `SuppressionConfig::max_entries`
+(default 1024) and evicted by earliest deadline. `Direct` and `Telemetry`
+keep their existing paths and no wire field changes.
 
 | Setting | Default | Why |
 |---|---|---|
 | Reference degree / copies | 4 / 3 | 50-node sweep: cancels 45% of transmissions without moving Direct delivery |
-| Copy bounds | 1 to 6 configured, 2 effective | Keeps sparse graphs forwarding; one copy cannot prove neighbours heard a flood |
+| Copy bounds | 1 to 6 configured; 2 on chains and Presence | Keeps degree-one paths forwarding; dense Broadcast floods keep the calibrated threshold |
 | Base delay | 60-140 ms, seeded | Long enough for neighbour copies, short enough for a contact |
 | Final delay | 20-600 ms, shrinking with degree | Dense groups decide sooner |
 | Class TTL | Direct 8, Broadcast 6, Presence 3, Telemetry 3 | ADR-0001 table, clamped on submission too |

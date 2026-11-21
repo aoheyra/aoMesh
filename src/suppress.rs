@@ -6,7 +6,10 @@
 //! this node enough chances to hear the message and its own relay is cancelled;
 //! otherwise it forwards once when the timer fires. `k` grows and the delay
 //! shrinks with the observed degree, which is what keeps dense graphs from
-//! retransmitting the same flood to everybody.
+//! retransmitting the same flood to everybody. A chain relay (at most one
+//! other link) and every Presence announcement keep a two-link floor: one
+//! copy cannot prove that a sparse path or a capability-gated peer's other
+//! links learned the content.
 //!
 //! State is keyed by the content-bound `MessageId`, bounded by configuration,
 //! and evicted by earliest deadline. Time and randomness are caller-supplied,
@@ -40,11 +43,13 @@ pub struct SuppressionConfig {
     pub degree_ref: usize,
     /// Copy threshold at `degree_ref`.
     pub k_at_degree_ref: usize,
-    /// Configured lower bound for the degree-scaled copy threshold.
+    /// Lower bound for the degree-scaled copy threshold.
     ///
-    /// The suppression table always requires at least two distinct sending
-    /// links, because one copy cannot prove the flood reached this node's
-    /// neighbours.
+    /// Broadcast and channel floods use this bound as configured (default
+    /// one) once the node has at least two other links. Chain relays and
+    /// Presence announcements are additionally floored at two by
+    /// [`Self::copy_threshold_for`], so one copy never extinguishes a flood
+    /// on a degree-one path or an announcement on a capability-gated link.
     pub min_k: usize,
     /// Upper bound for the degree-scaled copy threshold.
     pub max_k: usize,
@@ -117,6 +122,34 @@ impl SuppressionConfig {
         let min = self.min_k.max(1) as u128;
         let max = self.max_k.max(min as usize) as u128;
         (whole + extra).clamp(min, max) as usize
+    }
+
+    /// Distinct copies needed before `class` cancels its relay.
+    ///
+    /// Broadcast and channel floods keep the degree-scaled threshold that
+    /// MSH-11 calibrated once the node has at least two other links. A node
+    /// with one other link is a chain relay: a single copy proves nothing
+    /// about that link, so the two-link floor from MSH-19 is kept there and
+    /// the flood continues down the chain. Presence announcements need the
+    /// floor at every degree because their trickle refresh reaches
+    /// capability-gated links one at a time.
+    ///
+    /// Direct and Telemetry never enter the suppression table, but return the
+    /// same threshold as a dense Broadcast for callers that share this
+    /// calculation.
+    #[must_use]
+    pub fn copy_threshold_for<R: RngCore>(
+        &self,
+        class: PacketClass,
+        degree: usize,
+        rng: &mut R,
+    ) -> usize {
+        let threshold = self.copy_threshold(degree, rng);
+        match class {
+            PacketClass::Presence => threshold.max(2),
+            PacketClass::Broadcast if degree <= 1 => threshold.max(2),
+            PacketClass::Direct | PacketClass::Broadcast | PacketClass::Telemetry => threshold,
+        }
     }
 
     /// Seeded assessment delay for `degree`, shrinking as degree grows.
@@ -304,12 +337,6 @@ impl SuppressionTable {
                 self.entries.remove(&victim);
             }
         }
-        // One copy proves only that this node heard the packet. Cancelling on
-        // it would let suppression extinguish a flood at the first hop,
-        // especially on a line or a small-degree graph. Every degree-scaled
-        // threshold is therefore floored at two distinct sending links; if no
-        // second copy arrives, `take_due` relays when the timer fires.
-        let threshold = threshold.max(2);
         let mut senders = BTreeSet::new();
         senders.insert(sender);
         if senders.len() >= threshold {
@@ -461,15 +488,43 @@ mod tests {
     }
 
     #[test]
-    fn a_single_copy_is_never_enough_to_cancel_a_flood() {
-        let mut table = SuppressionTable::new(config());
+    fn two_link_floor_is_limited_to_chains_and_presence() {
+        let config = SuppressionConfig {
+            k_at_degree_ref: 2,
+            degree_ref: 8,
+            ..config()
+        };
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
         assert_eq!(
-            table.observe(sight(0, ID, LINK_A, 1, 100, vec![1])),
-            Observe::Pending,
-            "a degree-one neighbour must not extinguish the flood"
+            config.copy_threshold_for(PacketClass::Broadcast, 1, &mut rng),
+            2,
+            "a chain relay must not cancel on one copy"
         );
         assert_eq!(
-            table.observe(sight(1, ID, LINK_B, 1, 100, vec![1])),
+            config.copy_threshold_for(PacketClass::Broadcast, 2, &mut rng),
+            1,
+            "a node with two other links uses the calibrated threshold"
+        );
+        assert_eq!(
+            config.copy_threshold_for(PacketClass::Presence, 2, &mut rng),
+            2,
+            "announcements keep the floor at every degree"
+        );
+
+        let mut table = SuppressionTable::new(config);
+        assert_eq!(
+            table.observe(sight(0, ID, LINK_A, 1, 100, vec![1])),
+            Observe::Suppressed,
+            "Broadcast keeps the calibrated one-copy cancellation"
+        );
+        let announcement = MessageId::from_bytes([5; 16]);
+        assert_eq!(
+            table.observe(sight(0, announcement, LINK_A, 2, 100, vec![2])),
+            Observe::Pending,
+            "one link cannot cancel a Presence announcement"
+        );
+        assert_eq!(
+            table.observe(sight(1, announcement, LINK_B, 2, 100, vec![2])),
             Observe::Suppressed
         );
     }
@@ -562,16 +617,11 @@ mod tests {
         );
         assert_eq!(table.take_due(10).len(), 1);
         assert_eq!(table.suppressed_relays(), 1);
-        // The MSH-19 floor requires a second distinct link even when the
-        // requested threshold is one; the genuine cancellation still counts.
-        let floored = MessageId::from_bytes([5; 16]);
+        // A one-copy Broadcast cancellation counts once, without waiting for
+        // a second distinct link.
+        let single = MessageId::from_bytes([5; 16]);
         assert_eq!(
-            table.observe(sight(0, floored, LINK_A, 1, 100, vec![3])),
-            Observe::Pending
-        );
-        assert_eq!(table.suppressed_relays(), 1);
-        assert_eq!(
-            table.observe(sight(1, floored, LINK_B, 1, 100, vec![3])),
+            table.observe(sight(0, single, LINK_A, 1, 100, vec![3])),
             Observe::Suppressed
         );
         assert_eq!(table.suppressed_relays(), 2);
