@@ -91,11 +91,18 @@ fn receipts_purge_every_stored_copy_within_a_bounded_time() {
             actual.scenario
         );
         assert_eq!(actual.transmissions, expected.transmissions);
-        assert_eq!(
-            actual.remaining_delivered_copies, 0,
-            "{} retained a delivered copy",
-            actual.scenario
-        );
+        if expected.delivery_receipts > 0 {
+            assert_eq!(
+                actual.remaining_delivered_copies, 0,
+                "{} retained a delivered copy with receipts enabled",
+                actual.scenario
+            );
+        } else {
+            // Receipt-disabled ablations deliberately retain all copies.
+            // Otherwise they cannot prove the effect of enabling receipts.
+            assert_eq!(actual.remaining_delivered_copies, expected.remaining_copies);
+            assert!(actual.remaining_delivered_copies > 0);
+        }
         assert_eq!(
             actual.remaining_delivered_copies_immune, 0,
             "{} retained a copy at an immune node",
