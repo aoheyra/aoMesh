@@ -158,3 +158,50 @@ cancels the pending beacon, so transient churn does not flap the advertisement.
 A backwards clock is treated as time zero inside the debounce window and never
 mints an early publication. No wire field changes: aoNetwork's beacon already
 carries the opaque four-byte digest.
+
+## MSH-14 implementation
+
+A meeting link whose MeshHello negotiates `CAP_SYNC_V1` starts a bounded
+anti-entropy exchange over aoNetwork's Bulk channel. The engine compares the
+peer's four-byte digest with its cached `StoreSummary`, exchanges sorted
+eight-byte prefixes, and asks the host to resolve missing prefixes through
+`MeshOutput::SyncNeed` / `MeshInput::SyncItems`. Incoming `SyncItem` packets are
+checked for bounded decode, a content address that matches the claimed id, and
+a storable class; the store owner still verifies signatures and decides
+insertion. Telemetry is never synced.
+
+Three transfer designs were compared. An engine-owned store would unify the
+API but duplicate aoheyra's SQLite backend and break the sans-IO boundary
+MSH-12 established. A pure push of the whole store is simple but wastes
+airtime when digests differ by one item. A summary-driven request/offer
+exchange keeps the engine store-free and transfers only the symmetric
+difference; its extra round trip is acceptable because a contact is already
+open and the exchange is bounded. The host therefore supplies encoded items
+through `SyncItems` and inserts received items itself.
+
+The frame format was chosen over full-id vectors and Bloom filters for the
+same reasons as MSH-13: full ids are exact but too large, Bloom filters create
+false requests, and prefixes are deterministic and bounded. A five-byte header
+(magic `0x53`, version `1`, tag, two-byte length) keeps the decoder small. The
+wire limit is 15 KiB per frame so the default 16 KiB Bulk frame still fits, and
+256 KiB per contact bounds the work a hostile or merely large peer can demand.
+A summary with more than 1024 entries is rejected before allocation.
+
+Release uses a two-phase `Done` handshake. An early design released as soon as
+the local side had sent its items and received the ones it expected, but the
+simulator showed the peer still had queued frames when aoNetwork closed the
+link: two of three items were lost. Requiring `Done` from both sides before
+`ReleaseOpportunistic` fixed the loss without adding retries or delays. An
+equal digest ends the exchange with no release: a simulator run that released
+those links cut waypoint delivery from 31/50 to 27/50 by closing links that
+were still useful for ordinary forwarding. The 20-second deadline is a
+fallback for a stalled peer; it releases once, and a
+link drop clears the session so the next encounter restarts from a fresh
+digest. Peers without the capability bit stay on the MSH-13 beacon path, so
+this is an additive wire change: no packet or hello layout moved.
+
+Acceptance uses aoNetwork `SimWorld` seed `0x5147_2026` with four stable filler
+links before the target node appears. Over a 20-second meeting the two stores
+converge on the same four live ids (3 seeded locally, 1 from the peer) and the
+opportunistic contact is closed. `tests/sync_v1.rs` covers frame bounds, the
+per-contact byte budget, link-drop recovery and the release handshake.

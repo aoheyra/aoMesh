@@ -6,7 +6,9 @@ use crate::forward::{self, Action};
 use crate::neighbor::{MeshConfig, NeighborTable};
 use crate::seen::{Offer, SeenCache};
 use crate::suppress::{self, Sighting, SuppressionTable};
-use crate::sync::{BeaconTracker, StoreSummary};
+use crate::sync::{
+    BeaconTracker, SHORT_ID_BYTES, StoreSummary, SyncAction, SyncFrame, SyncOffer, SyncTracker,
+};
 use crate::{Header, MessageId, Packet, PacketError, sign_packet};
 use ao_idents::{IdentError, Identity, ReplayGuard, Signature};
 use ao_network::{AppHello, BeaconFlags, Channel, DisconnectReason, Hello, LinkId, LocalTag};
@@ -54,7 +56,15 @@ pub enum MeshInput<'a> {
         /// Live message ids from [`crate::store::MessageStore::summary`].
         ids: &'a [MessageId],
     },
-    /// Time-driven step; fires completed MSH-11 assessment timers.
+    /// Host-encoded packets for prefixes requested by a sync contact
+    /// (MSH-14). The host owns the store; only the borrowed bytes are read.
+    SyncItems {
+        /// The contact's link.
+        link: LinkId,
+        /// One item per requested prefix, in host order.
+        items: &'a [SyncOffer<'a>],
+    },
+    /// Time-driven step; fires MSH-11 timers and MSH-14 contact deadlines.
     Tick,
     /// Originate a packet. This does not encrypt or deliver its payload.
     Submit {
@@ -127,6 +137,29 @@ pub enum MeshOutput {
         /// Advertisement flags.
         flags: BeaconFlags,
     },
+    /// Ask the host to resolve short ids to encoded store packets.
+    /// This is a host action, not a network send.
+    SyncNeed {
+        /// The contact's link.
+        link: LinkId,
+        /// Prefixes the peer is missing.
+        prefixes: Vec<[u8; SHORT_ID_BYTES]>,
+    },
+    /// An item from a peer, ready for the host to insert in its store.
+    /// The engine checked bounds and the content address, not the origin
+    /// signature: final authenticity remains the store owner's job.
+    SyncItem {
+        /// Full content address parsed from the packet.
+        id: MessageId,
+        /// Complete encoded mesh packet.
+        wire: Vec<u8>,
+    },
+    /// End an MSH-14 contact. The adapter uses aoNetwork's `release`, which
+    /// only closes opportunistic links and leaves stable ones alone.
+    ReleaseOpportunistic {
+        /// Link to release.
+        link: LinkId,
+    },
 }
 
 /// Submission failure; no packet is emitted on error.
@@ -167,6 +200,7 @@ pub struct MeshEngine<R: RngCore> {
     budgets: BudgetTracker,
     suppression: SuppressionTable,
     beacon: BeaconTracker,
+    sync: SyncTracker,
 }
 impl<R: RngCore> MeshEngine<R> {
     /// Creates an engine with the default limits (`MeshConfig::default`).
@@ -188,6 +222,7 @@ impl<R: RngCore> MeshEngine<R> {
             budgets,
             suppression: SuppressionTable::new(config.suppression),
             beacon: BeaconTracker::new(config.summary),
+            sync: SyncTracker::new(config.sync),
         }
     }
     /// Read-only bookkeeping, not a list of authenticated identities.
@@ -201,6 +236,10 @@ impl<R: RngCore> MeshEngine<R> {
     /// Digest currently advertised in the beacon, if one was published.
     pub fn published_store_digest(&self) -> Option<[u8; 4]> {
         self.beacon.published_digest()
+    }
+    /// Read-only anti-entropy state (MSH-14).
+    pub fn sync(&self) -> &SyncTracker {
+        &self.sync
     }
     /// Processes one input at caller-supplied milliseconds.
     ///
@@ -229,6 +268,7 @@ impl<R: RngCore> MeshEngine<R> {
         match input {
             MeshInput::StoreSummary { ids } => {
                 let digest = StoreSummary::from_ids(ids).digest();
+                self.sync.set_local(ids);
                 Ok(self
                     .beacon
                     .observe(now, digest)
@@ -244,7 +284,19 @@ impl<R: RngCore> MeshEngine<R> {
                     .into_iter()
                     .collect())
             }
-            MeshInput::Tick => Ok(self.drain_due(now)),
+            MeshInput::SyncItems { link, items } => {
+                if !self.neighbors.contains(link) {
+                    return Ok(Vec::new());
+                }
+                let actions = self.sync.on_offers(link, items);
+                Ok(self.apply_sync_actions(actions))
+            }
+            MeshInput::Tick => {
+                let mut outputs = self.drain_due(now);
+                let actions = self.sync.expire(now);
+                outputs.extend(self.apply_sync_actions(actions));
+                Ok(outputs)
+            }
             MeshInput::LinkUp { link, remote_hello } => {
                 if self.neighbors.contains(link) {
                     // A repeated LinkUp keeps the existing entry, counters
@@ -260,26 +312,71 @@ impl<R: RngCore> MeshEngine<R> {
                 // A failed introduction is dropped, not penalised here:
                 // the entry observes the peer and MSH-10's penalties
                 // decide its fate (ADR-0004).
-                let node_id =
-                    crate::hello::verified_node_id(remote_hello.app_hello.as_bytes()).ok();
+                let hello = crate::hello::verified_hello(remote_hello.app_hello.as_bytes()).ok();
+                let node_id = hello.map(|hello| hello.node_id);
                 self.neighbors.insert(now, link, remote_hello, node_id);
-                Ok(Vec::new())
+                let cap_sync_v1 = hello.is_some_and(|hello| {
+                    hello
+                        .negotiate(crate::hello::PROTO, crate::hello::CAPS)
+                        .is_ok_and(|(_, caps)| caps & crate::hello::CAP_SYNC_V1 != 0)
+                });
+                if !cap_sync_v1 {
+                    return Ok(Vec::new());
+                }
+                let remote_digest = hello.map_or([0; 4], |hello| hello.store_digest);
+                let actions = self.sync.start(now, link, remote_digest);
+                Ok(self.apply_sync_actions(actions))
             }
             MeshInput::LinkDown { link, .. } => {
                 self.neighbors.remove(link);
                 self.budgets.link_down(link);
+                self.sync.link_down(link);
                 Ok(Vec::new())
             }
             MeshInput::Data {
                 link,
+                channel,
                 identity,
                 payload,
-                ..
             } => {
                 // An untracked link has no counters or penalty state; do not
                 // let arbitrary link ids create either.
                 if !self.neighbors.contains(link) {
                     return Ok(Vec::new());
+                }
+                if channel == Channel::Bulk {
+                    match SyncFrame::decode(payload) {
+                        Ok(Some(frame)) => {
+                            let verified = self
+                                .neighbors
+                                .get(link)
+                                .is_some_and(|neighbor| neighbor.node_id.is_some());
+                            if !verified {
+                                return Ok(Self::release_if_penalised(
+                                    link,
+                                    self.budgets.penalize(
+                                        now,
+                                        link,
+                                        self.config.budgets.penalty_unverified,
+                                    ),
+                                ));
+                            }
+                            let actions = self.sync.on_frame(now, link, frame);
+                            return Ok(self.apply_sync_actions(actions));
+                        }
+                        Ok(None) => {}
+                        Err(_) => {
+                            self.neighbors.reject(link);
+                            return Ok(Self::release_if_penalised(
+                                link,
+                                self.budgets.penalize(
+                                    now,
+                                    link,
+                                    self.config.budgets.penalty_invalid,
+                                ),
+                            ));
+                        }
+                    }
                 }
                 // Packet::decode parses the bounded header before inspecting or
                 // borrowing the payload, and allocates nothing on either path.
@@ -527,6 +624,34 @@ impl<R: RngCore> MeshEngine<R> {
         for entry in due {
             let _ = self.seen.check_and_insert(now, entry.class, entry.msg_id);
             outputs.extend(self.send_to_links(entry.bytes, &entry.senders));
+        }
+        outputs
+    }
+
+    /// Translates sync state changes into host actions and Bulk sends.
+    /// A frame that cannot fit the two-byte length field is simply not
+    /// emitted; every tracker-produced frame is already bounded by config.
+    fn apply_sync_actions(&self, actions: Vec<SyncAction>) -> Vec<MeshOutput> {
+        let mut outputs = Vec::new();
+        for action in actions {
+            match action {
+                SyncAction::Send { link, frame } => {
+                    if let Some(payload) = frame.encode() {
+                        outputs.push(MeshOutput::Send {
+                            link,
+                            channel: Channel::Bulk,
+                            payload,
+                        });
+                    }
+                }
+                SyncAction::Need { link, prefixes } => {
+                    outputs.push(MeshOutput::SyncNeed { link, prefixes })
+                }
+                SyncAction::Item { id, wire } => outputs.push(MeshOutput::SyncItem { id, wire }),
+                SyncAction::Release { link } => {
+                    outputs.push(MeshOutput::ReleaseOpportunistic { link })
+                }
+            }
         }
         outputs
     }

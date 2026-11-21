@@ -186,6 +186,9 @@ fn assert_delivered_once(events: &[(usize, AdapterEvent)], dst: usize) {
             AdapterEvent::SendFailed { link, error } => {
                 panic!("send failed on {link:?}: {error:?}")
             }
+            AdapterEvent::SyncNeed { .. } | AdapterEvent::SyncItem { .. } => {
+                panic!("unexpected sync event in a forwarding test: {event:?}")
+            }
         }
     }
     assert_eq!(delivered, [(dst, PAYLOAD)], "one delivery, at dst");
