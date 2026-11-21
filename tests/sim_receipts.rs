@@ -89,11 +89,19 @@ fn receipts_purge_every_stored_copy_within_a_bounded_time() {
             actual.scenario
         );
         assert_eq!(actual.transmissions, expected.transmissions);
-        assert_eq!(
-            actual.remaining_delivered_copies, 0,
-            "{} retained a delivered copy",
-            actual.scenario
-        );
+        if expected.delivery_receipts > 0 {
+            assert_eq!(
+                actual.remaining_delivered_copies, 0,
+                "{} retained a delivered copy",
+                actual.scenario
+            );
+        } else {
+            assert_eq!(
+                actual.remaining_delivered_copies, actual.remaining_copies,
+                "{} ablation should retain its delivered copies",
+                actual.scenario
+            );
+        }
         assert_eq!(
             actual.remaining_delivered_copies_immune, 0,
             "{} retained a copy at an immune node",
