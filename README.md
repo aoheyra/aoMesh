@@ -2,7 +2,7 @@
 
 **The routing and store-and-forward engine of the aoheyra mesh.** A sans-IO Rust crate that decides what happens to a packet: forward it, hold it, suppress it, deliver it, or drop it, across a phone-to-phone mesh where links come and go.
 
-> **Status: pre-alpha, through MSH-11.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, and counter-based Broadcast/Presence suppression with seeded assessment delays are implemented.
+> **Status: pre-alpha, through MSH-13.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries and the debounced beacon digest are implemented.
 
 Cargo package name: `ao_mesh`.
 
@@ -84,7 +84,8 @@ Lifetimes, TTLs, copy counts and budgets are **defaults with documented reasons*
 
 `MeshEngine::new(rng)` uses `MeshConfig::default()`: 32 neighbour entries, the
 MSH-09 replay guard (1024 ids per sender, 24 h tolerance, 64 senders), the
-budget fields below and the MSH-11 suppression fields below. `with_config`
+budget fields below, the MSH-11 suppression fields and the MSH-13 summary
+fields below. `with_config`
 accepts explicit bounds; zero neighbours
 refuses all new links. Excess links emit `Release`, duplicate link-up events
 preserve counters, and link-down removes the entry. These are bookkeeping
@@ -395,3 +396,28 @@ opaque wire bytes and local metadata, never keys or application data models.
 See [the storage decision](docs/adr/message-store.md) for limits and ordering.
 The app's SQLite backend must run `store::conformance::check` against a fresh
 backend factory. SQLite itself and engine integration are separate tasks.
+
+## Store summary and beacon digest (MSH-13)
+
+`sync::StoreSummary` canonicalises the store's live message ids: input order and
+duplicates are ignored, the exposed vector holds eight-byte prefixes, and the
+four-byte digest hashes every full id plus the entry count. Two stores with the
+same live content therefore produce equal digests; adding, removing or replacing
+one message changes it with overwhelming probability. The digest is a change
+detector, not a set proof: MSH-14 confirms differences with a full summary
+exchange.
+
+| Setting | Default | Why |
+|---|---|---|
+| Short id bytes | 8 | Compact enough for a bounded store, low collision risk |
+| Beacon debounce | 200 ms | Coalesces a write burst without delaying a link-up comparison |
+| Beacon hint | `[0; 8]` | Opaque to the mesh; the app may replace it |
+
+The host remains the store owner. It submits `MeshInput::StoreSummary` with the
+ids returned by `MessageStore::summary(now)`. The engine debounces changes for
+`SummaryConfig::debounce_ms` (default 200 ms) and emits one `MeshOutput::SetBeacon`
+with the digest and the configured opaque hint. Reverting to the published value
+cancels a pending change, and a backwards clock never shortens the window. No
+wire format changes: aoNetwork's beacon already carries the four-byte digest.
+`tests/sync_summary.rs` proves the equality/change property with two
+`MemoryStore` instances and the beacon behaviour through the engine.

@@ -246,6 +246,24 @@ signing. `SuppressionConfig::enabled` is a simulator ablation switch only.
 The pending table never holds payload bytes borrowed from a neighbour: the
 relay bytes are encoded once when the first copy arrives.
 
+## Store summary and beacon digest (MSH-13)
+
+Before anti-entropy starts, a node compares a four-byte summary digest with
+neighbours. `StoreSummary` sorts and deduplicates the live `MessageId`s, exposes
+eight-byte prefixes as the compact vector MSH-14 will exchange, and hashes the
+full ids plus the count into the beacon digest. Identical live sets give equal
+digests; one differing id changes it with overwhelming probability. The digest
+is a change detector, not a proof of equality, so MSH-14 still compares full
+summaries before transferring packets.
+
+The engine does not own or open the store. The host submits
+`MeshInput::StoreSummary` with ids from `MessageStore::summary(now)`. A changed
+digest waits `SummaryConfig::debounce_ms` (200 ms by default) before one
+`SetBeacon` output is emitted; a change back to the published value cancels the
+pending beacon, and a backwards clock cannot shorten the wait. The hint bytes
+are opaque to the mesh, and the four-byte digest uses the beacon field already
+defined by aoNetwork, so no packet or hello layout changes.
+
 ## Simulation evidence (MSH-27)
 
 No wire format changes. Feature `sim` drives the codec and engine over aoNetwork's
