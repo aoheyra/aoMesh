@@ -1,0 +1,37 @@
+[package]
+name = "ao_mesh_fuzz"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Dev-only fuzz crate. None of these dependencies enter the sans-IO core:
+# libfuzzer-sys is the libFuzzer binding, rand seeds the deterministic engine,
+# and the two siblings are the exact types the engine takes at its boundary.
+[dependencies]
+libfuzzer-sys = "0.4"
+rand = "0.9"
+ao_mesh = { path = ".." }
+ao_idents = { version = "0.1.0", git = "https://github.com/aoheyra/aoIdents" }
+ao_network = { version = "0.1.0", git = "https://github.com/aoheyra/aoNetwork" }
+
+[[bin]]
+name = "packet_decode"
+path = "fuzz_targets/packet_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "engine_input"
+path = "fuzz_targets/engine_input.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "sync_frames"
+path = "fuzz_targets/sync_frames.rs"
+test = false
+doc = false

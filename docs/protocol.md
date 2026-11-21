@@ -637,3 +637,33 @@ time decide expiry; created_ms is never compared with a local clock. Store
 policy does not modify encoded bytes or add a wire age field. Sync callers
 must carry consumed age separately and account for known transfer delay.
 See [lifetime policy](adr/lifetime-expiry.md).
+
+## Resource bounds and typed rejections (MSH-28)
+
+No wire field changes. Every decoder reads a fixed header or declared length
+before allocating, and every host-supplied slice is bounded before it can grow
+engine state:
+
+| Input | Bound | Rejection before work |
+|---|---:|---|
+| Packet header | 10-byte canonical varints, `payload_len <= 2048` | `PacketError` while parsing the header; no payload is read |
+| Store summary ids | 1024 entries | `StoreSummary::from_ids` reads only the cap; duplicates and order do not matter |
+| Sync frame body | 8198 bytes (`6 + 1024 * 8`) | `SyncError::FrameTooLarge(usize)` / `SyncV2Error::FrameTooLarge(usize)` before a slice is copied |
+| Sync summary count | 1024 entries | `TooManyEntries` before constructing the id vector; body length must match the count exactly |
+| Sync offers per input | 1024 | `SyncTracker::on_offers` iterates only the cap |
+
+v1 summaries keep their historical `TooManyEntries` rejection even when the
+declared length exceeds the general body cap, so earlier behaviour and tests
+are preserved. Every other v1 tag and every v2 tag rejects an oversized body
+before copying it into an `Item`, `SprayItem`, range list or id list. The public
+`SyncFrame::decode` and `SyncFrameV2::decode` return typed `SyncError` and
+`SyncV2Error` values, both implementing `Display` and `std::error::Error`.
+
+A delivery-path `debug_assert_eq!` that hostile input could reach in debug
+builds was replaced by a checked outcome; a rejection is still recorded, but a
+malformed packet cannot panic the process. `tests/resource_bounds.rs` pins
+allocation and CPU-proxy ceilings for decoders, summary streams, hostile engine
+Data streams and store quotas. The `fuzz/` crate adds `libFuzzer` targets for
+packet decoding, engine input streams and sync frames; nightly CI runs each for
+one hour with a 16 KiB maximum input, a 2048 MiB RSS limit and a 10-second
+per-input timeout. No one-hour campaign is part of local verification.

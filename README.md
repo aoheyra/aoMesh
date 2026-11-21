@@ -2,7 +2,7 @@
 
 **The routing and store-and-forward engine of the aoheyra mesh.** A sans-IO Rust crate that decides what happens to a packet: forward it, hold it, suppress it, deliver it, or drop it, across a phone-to-phone mesh where links come and go.
 
-> **Status: pre-alpha, through MSH-23.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest, bounded anti-entropy sync, range-based reconciliation on meeting links, binary spray-and-wait for Direct traffic, signed delivery receipts with bounded store purging, relative-age lifetime ceilings, bounded presence announcements with trickle timing, a bounded ephemeral NodeDirectory with coalesced UI events, bounded reverse-path route hints derived from directory observations, the latest-wins Telemetry class, and local public-channel subscriptions over signed Broadcast envelopes are implemented.
+> **Status: pre-alpha, through MSH-28.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest, bounded anti-entropy sync, range-based reconciliation on meeting links, binary spray-and-wait for Direct traffic, signed delivery receipts with bounded store purging, relative-age lifetime ceilings, bounded presence announcements with trickle timing, a bounded ephemeral NodeDirectory with coalesced UI events, bounded reverse-path route hints derived from directory observations, bounded latest-wins telemetry with typed advisory coalescing, local public-channel subscriptions over signed Broadcast envelopes, and resource-bounded decoders with nightly fuzz targets are implemented.
 
 Cargo package name: `ao_mesh`.
 
@@ -481,6 +481,12 @@ cargo test --release --all-features --test sim_baseline
 # MSH-19 presence convergence and announcement overhead
 cargo run --release --features sim --example presence_report
 cargo test --release --all-features --test sim_presence
+
+# Fuzzing (nightly; separate crate, no runtime dependencies)
+cd fuzz
+cargo +nightly fuzz run packet_decode -- -max_total_time=3600 -rss_limit_mb=2048 -timeout=10 -max_len=16384
+cargo +nightly fuzz run engine_input -- -max_total_time=3600 -rss_limit_mb=2048 -timeout=10 -max_len=16384
+cargo +nightly fuzz run sync_frames -- -max_total_time=3600 -rss_limit_mb=2048 -timeout=10 -max_len=16384
 ```
 
 MSH-16 adds a separate paired report; the four published rows above stay the
@@ -498,7 +504,10 @@ cargo run --release --features sim --example routehint_report
 cargo test --release --all-features --test sim_routehint
 ```
 
-Tests are `cargo test` only: no Miri or callgrind locally. CI runs fmt, clippy, tests on three operating systems, `cargo doc`, cargo-deny, an MSRV build and miri on every pull request.
+Tests are `cargo test` only: no Miri, callgrind or one-hour fuzz campaigns
+locally. CI runs fmt, clippy, tests on three operating systems, `cargo doc`,
+cargo-deny, an MSRV build and miri on every pull request; the one-hour fuzz
+campaign is a separate nightly workflow (below).
 
 ### Sibling crates
 
@@ -914,3 +923,37 @@ MSH-22: MSH-19's two-link suppression floor makes each line relay forward once,
 replacing the old two-transmission expectation from the pre-MSH-19 tree.
 Reachability and the budget gate are unchanged, and no published MSH-27
 threshold was lowered. The four published MSH-27 baselines are unchanged.
+## Fuzzing and resource bounds (MSH-28)
+
+Every neighbour byte stream and host-supplied slice has a hard bound before it
+can grow engine state. The packet decoder stays allocation-free; sync decoders
+reject a hostile body before copying it; summary construction and sync-offer
+handling read at most the store's entry cap. A reachable `debug_assert` in the
+delivery path was removed so hostile input cannot panic in debug builds.
+
+| Bound | Limit | Why |
+|---|---:|---|
+| Packet payload | 2048 bytes | Existing `MAX_PAYLOAD`, checked in the header (MSH-03) |
+| Varint field | 10 bytes | Canonical unsigned LEB128, checked before value use |
+| Summary entries | 1024 | Matches the default store cap; longer host slices are ignored |
+| Sync frame body | 8198 bytes | `6 + 1024 * 8`, the largest legitimate v1 summary |
+| Offers per engine input | 1024 | Matches the summary cap; `SyncItems` cannot mint extra work |
+| Fuzz input | 16 KiB | Larger than every decoder cap, small enough for fast campaigns |
+| Fuzz RSS / timeout | 2048 MiB / 10 s | Detects runaway allocation or a per-input loop |
+
+`SyncFrame::decode` and `SyncFrameV2::decode` are public and return typed
+`SyncError` / `SyncV2Error` values, including `FrameTooLarge(usize)`. This keeps
+fuzz diagnostics and host integration string-free without changing the wire
+format. `tests/resource_bounds.rs` uses a counting allocator to pin allocation
+and CPU-proxy ceilings for hostile packets, sync frames, summary streams,
+engine Data streams and store quotas. It is a single-test binary so no other
+test can pollute the counters.
+
+The `fuzz/` crate has three `libFuzzer` targets: `packet_decode`,
+`engine_input` and `sync_frames`. They use injected time and RNG, construct a
+verified neighbour without `unwrap`/`expect`, and treat malicious bytes as the
+input rather than setup failure. `.github/workflows/fuzz.yml` runs each target
+for one hour nightly and uploads crash artifacts on failure; no one-hour
+campaign is claimed locally. `libfuzzer-sys` (MIT/Apache-2.0, Rust-Fuzz, small
+binding crate) and `rand` 0.9 (MIT/Apache-2.0, already a dev-dependency) are
+dev-only; the core dependency set is unchanged.

@@ -26,10 +26,14 @@
 //! from typed presence observations, whose coalesced changes are UI events
 //! and never wire bytes. MSH-21 derives bounded reverse-path hints from
 //! those directory observations and uses a fresh one to steer a Direct spray
-//! copy. MSH-23 carries public channels as a bounded envelope inside signed
-//! Broadcast payloads: subscriptions stay local, relays keep no subscription
-//! state, and the channel key reuses MSH-10's bucket table and MSH-11's
-//! suppression.
+//! copy. MSH-22 frames bounded latest-wins telemetry under the existing
+//! class and passes typed coalescing advice to aoNetwork. MSH-23 carries
+//! public channels as a bounded envelope inside signed Broadcast payloads:
+//! subscriptions stay local, relays keep no subscription state, and the
+//! channel key reuses MSH-10's bucket table and MSH-11's suppression. MSH-28
+//! bounds every decoder and host-supplied stream; `tests/resource_bounds.rs`
+//! and the `fuzz/` targets check those limits without changing the sans-IO
+//! core.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -92,8 +96,9 @@ pub use sign::{
 pub use spray::{MAX_COPIES, SPRAY_MAGIC, SPRAY_VERSION, SprayConfig, SprayError, SprayTracker};
 pub use suppress::SuppressionConfig;
 pub use sync::{
-    BeaconTracker, RangeKey, RangeSummary, SHORT_ID_BYTES, SYNC_MAGIC, SYNC_V2_VERSION,
-    SYNC_VERSION, StoreSummary, SummaryConfig, SyncConfig, SyncFrame, SyncFrameV2, SyncOffer,
+    BeaconTracker, MAX_FRAME_BODY_BYTES, MAX_SUMMARY_ENTRIES, RangeKey, RangeSummary,
+    SHORT_ID_BYTES, SYNC_MAGIC, SYNC_V2_VERSION, SYNC_VERSION, StoreSummary, SummaryConfig,
+    SyncConfig, SyncError, SyncFrame, SyncFrameV2, SyncOffer, SyncV2Error,
 };
 pub use telemetry::{
     CoalesceKey, DEFAULT_EXPIRY_MS, DEFAULT_HOP_LIMIT, DEFAULT_MAX_ENTRIES, DEFAULT_RATE_LIMIT_MS,

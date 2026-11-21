@@ -39,9 +39,18 @@ impl StoreSummary {
     /// Input order and duplicate ids do not affect the result. The digest
     /// covers every full message id, not just the exposed prefix, so adding
     /// or removing one message changes it with overwhelming probability.
+    ///
+    /// At most [`MAX_SUMMARY_ENTRIES`] ids are read (MSH-28). The engine's
+    /// own store is capped at that many live messages, so a longer slice
+    /// can only be a host mistake or a hostile stream; ignoring its tail
+    /// keeps the digest and the summary the same bounded view.
     #[must_use]
     pub fn from_ids(ids: &[MessageId]) -> Self {
-        let mut full: Vec<[u8; MSG_ID_LEN]> = ids.iter().map(|id| *id.as_bytes()).collect();
+        let mut full: Vec<[u8; MSG_ID_LEN]> = ids
+            .iter()
+            .take(MAX_SUMMARY_ENTRIES)
+            .map(|id| *id.as_bytes())
+            .collect();
         full.sort_unstable();
         full.dedup();
 
@@ -203,6 +212,15 @@ pub const SYNC_VERSION: u8 = 1;
 /// Hard cap on one exchanged summary, matching the default store's entries.
 pub const MAX_SUMMARY_ENTRIES: usize = 1024;
 
+/// Hard cap on the body of one sync frame.
+///
+/// The largest legitimate body is a full 1024-entry MSH-14 summary
+/// (6 + 1024 * 8 = 8198 bytes); every MSH-15 frame is smaller than that.
+/// A claimed body longer than this is rejected before any slice is copied,
+/// so a hostile `Item` or `SprayItem` cannot make the decoder allocate the
+/// full 64 KiB the two-byte length field could express (MSH-28).
+pub const MAX_FRAME_BODY_BYTES: usize = 6 + MAX_SUMMARY_ENTRIES * SHORT_ID_BYTES;
+
 const FRAME_HEADER_LEN: usize = 5;
 const TAG_DIGEST: u8 = 1;
 const TAG_SUMMARY: u8 = 2;
@@ -285,7 +303,11 @@ impl SyncFrame {
 
     /// Parses a frame. `None` means "not a sync frame"; an error means the
     /// bytes claimed the sync magic but violated the bounded format.
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Option<Self>, SyncError> {
+    ///
+    /// Decoding is bounded before it allocates: a summary is capped by
+    /// [`MAX_SUMMARY_ENTRIES`], every other tag by [`MAX_FRAME_BODY_BYTES`]
+    /// (MSH-28).
+    pub fn decode(bytes: &[u8]) -> Result<Option<Self>, SyncError> {
         if bytes.first() != Some(&SYNC_MAGIC) {
             return Ok(None);
         }
@@ -296,6 +318,14 @@ impl SyncFrame {
             return Err(SyncError::UnsupportedVersion);
         }
         let len = u16::from_be_bytes([bytes[3], bytes[4]]) as usize;
+        // MSH-14 summaries carry their own count and an exact-length check
+        // below, so they keep their historical `TooManyEntries` rejection
+        // even when the declared length is over this general cap. Every
+        // other tag is rejected here, before a slice of hostile size is
+        // copied into an `Item` or `SprayItem` (MSH-28).
+        if len > MAX_FRAME_BODY_BYTES && bytes[2] != TAG_SUMMARY {
+            return Err(SyncError::FrameTooLarge(len));
+        }
         let body = bytes
             .get(FRAME_HEADER_LEN..FRAME_HEADER_LEN.saturating_add(len))
             .ok_or(SyncError::Truncated)?;
@@ -319,10 +349,12 @@ impl SyncFrame {
                     return Err(SyncError::TooManyEntries);
                 }
                 let bytes_needed = count.saturating_mul(SHORT_ID_BYTES);
-                let ids = body.get(6..6 + bytes_needed).ok_or(SyncError::Truncated)?;
-                if ids.len() != bytes_needed {
-                    return Err(SyncError::Truncated);
+                if body.len() != 6 + bytes_needed {
+                    // Extra bytes inside the declared body would be a
+                    // second, unauthenticated encoding of the same summary.
+                    return Err(SyncError::BadLength);
                 }
+                let ids = &body[6..];
                 let short_ids = ids
                     .chunks_exact(SHORT_ID_BYTES)
                     .map(|chunk| {
@@ -366,8 +398,11 @@ impl SyncFrame {
 }
 
 /// Typed rejection of a claimed MSH-14 frame.
+///
+/// Public so fuzz targets and hosts can inspect a rejection without
+/// stringly-typed errors (MSH-28).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SyncError {
+pub enum SyncError {
     /// The magic matched but the fixed header was incomplete.
     Truncated,
     /// The sender speaks another sync version.
@@ -382,7 +417,29 @@ pub(crate) enum SyncError {
     TooManyEntries,
     /// The frame had bytes after its declared length.
     TrailingBytes,
+    /// The declared body exceeds [`MAX_FRAME_BODY_BYTES`] for a tag that
+    /// has no count-based bound. Holds the declared length.
+    FrameTooLarge(usize),
 }
+
+impl std::fmt::Display for SyncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated => write!(f, "truncated sync frame"),
+            Self::UnsupportedVersion => write!(f, "unsupported sync version"),
+            Self::BadTag => write!(f, "unknown sync frame tag"),
+            Self::BadLength => write!(f, "sync frame field has the wrong length"),
+            Self::BadCopies(copies) => write!(f, "invalid spray copy ticket {copies}"),
+            Self::TooManyEntries => write!(f, "sync summary exceeds the store bound"),
+            Self::TrailingBytes => write!(f, "trailing bytes after the sync frame"),
+            Self::FrameTooLarge(len) => {
+                write!(f, "sync frame body {len} exceeds {MAX_FRAME_BODY_BYTES}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SyncError {}
 
 /// Version of the MSH-15 range-reconciliation frames.
 pub const SYNC_V2_VERSION: u8 = 2;
@@ -543,7 +600,10 @@ impl SyncFrameV2 {
     }
 
     /// Parses a v2 frame. `None` means it is not a sync frame.
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Option<Self>, SyncV2Error> {
+    ///
+    /// The body is capped by [`MAX_FRAME_BODY_BYTES`] before any slice is
+    /// copied, and each tag has its own entry bound (MSH-28).
+    pub fn decode(bytes: &[u8]) -> Result<Option<Self>, SyncV2Error> {
         if bytes.first() != Some(&SYNC_MAGIC) {
             return Ok(None);
         }
@@ -554,6 +614,9 @@ impl SyncFrameV2 {
             return Err(SyncV2Error::UnsupportedVersion);
         }
         let len = u16::from_be_bytes([bytes[3], bytes[4]]) as usize;
+        if len > MAX_FRAME_BODY_BYTES {
+            return Err(SyncV2Error::FrameTooLarge(len));
+        }
         let body = bytes
             .get(FRAME_HEADER_LEN..FRAME_HEADER_LEN.saturating_add(len))
             .ok_or(SyncV2Error::Truncated)?;
@@ -682,8 +745,11 @@ fn take_count(body: &[u8], at: usize) -> Result<usize, SyncV2Error> {
 }
 
 /// Typed rejection of a claimed MSH-15 frame.
+///
+/// Public so fuzz targets and hosts can inspect a rejection without
+/// stringly-typed errors (MSH-28).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SyncV2Error {
+pub enum SyncV2Error {
     /// The magic matched but the fixed header was incomplete.
     Truncated,
     /// The sender speaks another sync version.
@@ -698,7 +764,28 @@ pub(crate) enum SyncV2Error {
     BadRange,
     /// The frame had bytes after its declared length.
     TrailingBytes,
+    /// The declared body exceeds [`MAX_FRAME_BODY_BYTES`]. Holds the length.
+    FrameTooLarge(usize),
 }
+
+impl std::fmt::Display for SyncV2Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated => write!(f, "truncated sync v2 frame"),
+            Self::UnsupportedVersion => write!(f, "unsupported sync v2 version"),
+            Self::BadTag => write!(f, "unknown sync v2 frame tag"),
+            Self::TooManyEntries => write!(f, "sync v2 frame exceeds its entry bound"),
+            Self::BadLength => write!(f, "sync v2 frame field has the wrong length"),
+            Self::BadRange => write!(f, "sync v2 range key or id is invalid"),
+            Self::TrailingBytes => write!(f, "trailing bytes after the sync v2 frame"),
+            Self::FrameTooLarge(len) => {
+                write!(f, "sync v2 frame body {len} exceeds {MAX_FRAME_BODY_BYTES}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SyncV2Error {}
 
 /// Byte and time bounds for one anti-entropy contact.
 ///
@@ -1305,7 +1392,9 @@ impl SyncTracker {
             let Some(session) = self.sessions.get_mut(&link) else {
                 return actions;
             };
-            for offer in offers {
+            // Host-supplied, but one input must not be able to demand
+            // unbounded work even if a host is confused or compromised.
+            for offer in offers.iter().take(MAX_SUMMARY_ENTRIES) {
                 if offer.wire.len() > self.config.max_frame_bytes
                     || offer.wire.len() > crate::store::MAX_STORED_PACKET
                     || session.sent.contains(&offer.prefix)
@@ -1748,6 +1837,57 @@ mod tests {
         assert_eq!(
             SyncFrameV2::decode(&too_many),
             Err(SyncV2Error::TooManyEntries)
+        );
+    }
+
+    #[test]
+    fn oversized_frame_bodies_are_rejected_before_copying() {
+        let mut item = SyncFrame::Item(vec![0; MAX_FRAME_BODY_BYTES + 1])
+            .encode()
+            .expect("the u16 length field still fits");
+        assert_eq!(
+            SyncFrame::decode(&item),
+            Err(SyncError::FrameTooLarge(MAX_FRAME_BODY_BYTES + 1))
+        );
+        // The same cap applies to v2 frames.
+        let mut v2 = vec![SYNC_MAGIC, SYNC_V2_VERSION, TAG_V2_READY];
+        v2.extend_from_slice(&((MAX_FRAME_BODY_BYTES + 1) as u16).to_be_bytes());
+        assert_eq!(
+            SyncFrameV2::decode(&v2),
+            Err(SyncV2Error::FrameTooLarge(MAX_FRAME_BODY_BYTES + 1))
+        );
+
+        // A summary keeps its count-based bound and error even when the
+        // declared body is longer than the general cap. The count lives
+        // after the four-byte digest inside the body.
+        item[2] = TAG_SUMMARY;
+        item[9] = 0x05;
+        item[10] = 0x01;
+        assert_eq!(SyncFrame::decode(&item), Err(SyncError::TooManyEntries));
+    }
+
+    #[test]
+    fn summary_frames_reject_bytes_inside_the_declared_body() {
+        let mut frame = SyncFrame::Summary {
+            digest: [0; BEACON_DIGEST_LEN],
+            short_ids: vec![[1; SHORT_ID_BYTES]],
+        }
+        .encode()
+        .expect("encodes");
+        frame.extend_from_slice(&[7; 16]);
+        assert_eq!(SyncFrame::decode(&frame), Err(SyncError::BadLength));
+    }
+
+    #[test]
+    fn a_summary_never_holds_more_ids_than_the_store_bound() {
+        let ids: Vec<MessageId> = (0..MAX_SUMMARY_ENTRIES + 256)
+            .map(|i| id((i % 251) as u8))
+            .collect();
+        let summary = StoreSummary::from_ids(&ids);
+        assert_eq!(summary.len(), MAX_SUMMARY_ENTRIES);
+        assert_eq!(
+            summary.digest(),
+            StoreSummary::from_ids(&ids[..MAX_SUMMARY_ENTRIES]).digest()
         );
     }
 }

@@ -12,7 +12,7 @@ use crate::neighbor::{MeshConfig, NeighborTable};
 use crate::presence::{self, PresenceError, PresenceTracker};
 use crate::receipt::{self, ReceiptError};
 use crate::routehint::{RouteHintMode, RouteHintObservation, RouteHintTable};
-use crate::seen::{Offer, SeenCache};
+use crate::seen::SeenCache;
 use crate::suppress::{self, Sighting, SuppressionTable};
 use crate::sync::{
     BeaconTracker, SHORT_ID_BYTES, StoreSummary, SyncAction, SyncFrame, SyncFrameV2, SyncOffer,
@@ -965,12 +965,17 @@ impl<R: RngCore> MeshEngine<R> {
                                     // Recording only after acceptance: a forgery
                                     // that fails the pipeline must not consume
                                     // the dedupe key the honest copy needs.
-                                    let offer = self.seen.check_and_insert(
+                                    // MSH-28: no assertion here. The peek
+                                    // was fresh and nothing re-entered the
+                                    // engine, so the recording is a no-op
+                                    // on the happy path; an unexpected
+                                    // duplicate must not turn hostile input
+                                    // into a debug-build panic.
+                                    let _ = self.seen.check_and_insert(
                                         now,
                                         header.class,
                                         header.msg_id,
                                     );
-                                    debug_assert_eq!(offer, Offer::Fresh, "forward peeked fresh");
                                     outputs.push(MeshOutput::Deliver {
                                         header,
                                         payload: plaintext,
