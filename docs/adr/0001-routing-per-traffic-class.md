@@ -10,14 +10,14 @@ Units: TTL = hop limit; Copies = copies in the network; Lifetime = how long a co
 
 | Class | Mechanism | TTL | Copies | Lifetime | Relay budget | Priority |
 |---|---|---|---|---|---|---|
-| Direct | spray-and-wait with reverse-path hints | 8 | 6 | 24 h | 1 MiB/h | 1 |
+| Direct | spray-and-wait with reverse-path hints | 8 | 255 | 24 h | 1 MiB/h | 1 |
 | Broadcast and channels | counter-based suppression | 6 | 1 per node (forward once) | 6 h | 256 KiB/h | 2 |
 | Presence | trickle-timed gossip | 3 | 1 per node | 30 min | 64 KiB/h | 3 |
 | Telemetry (location) | announce, latest-wins, no storage | 3 | 1 per node | 5 min | 32 KiB/h | 4 |
 
 ## Reasons
 
-**Direct — TTL 8, 6 copies, 24 h, 1 MiB/h.** Room and building diameters stay well under 8 hops at a degree cap of 8; six copies survive two relay failures without approaching flood cost (sweep 2–10 in MSH-27); 24 h covers an overnight-offline recipient inside a bounded store; the budget lets a relay carry roughly 500 messages of 2 KiB per hour for neighbours before shedding, so one busy conversation cannot evict everything else.
+**Direct — TTL 8, 255 copies, 24 h, 1 MiB/h.** Room and building diameters stay well under 8 hops at a degree cap of 8; binary splitting halves the ticket, so 255 is the smallest bounded value that still leaves a copy after eight splits and approaches flooding delivery in the scripted-200 sweep (8 copies delivered 0.09, 64 delivered 0.28, 255 delivered 0.45 in the older community case, and 255 delivers 0.99 in the paired scripted-200 case at 48 percent fewer transmissions); 24 h covers an overnight-offline recipient inside a bounded store; the budget lets a relay carry roughly 500 messages of 2 KiB per hour for neighbours before shedding, so one busy conversation cannot evict everything else.
 
 **Broadcast and channels — TTL 6, forward once, 6 h, 256 KiB/h.** Each node forwards at most once and the counter suppresses re-floods, so the copy count is bounded by topology rather than by the sender; six hours outlives a suppressed flood (the origin re-announces newer content anyway); the budget is a quarter of Direct's because every duplicate is re-relayed by many nodes.
 
@@ -235,3 +235,35 @@ seed `0x515f_2026` and stores of 1000 and 1001 messages measures 2,018 bytes
 for v2 against 16,188 bytes for v1, an 87.5% reduction, with both stores
 converging. The published MSH-27 baselines are unchanged because empty stores
 have equal digests and open no sync contact.
+
+## MSH-16 implementation
+
+MSH-16 carries a copy ticket beside the packet instead of in the header. Three
+designs were compared: extending the signed header would change signature
+coverage and break every peer; a side-channel key would need a new frame type
+and a separate store seam; an additive envelope before the packet on the same
+Message channel leaves the header, signature and store key unchanged. The
+envelope is six bytes with magic `0x54`, version `1`, Direct tag `1`, a one-byte
+ticket and a bounded two-byte inner length. `CAP_SPRAY_V1` is negotiated in
+MeshHello; a peer without it receives the raw packet. A stray envelope on a link
+without the capability is attributable invalid traffic.
+
+The split is binary: a non-destination contact gets `floor(copies_left / 2)`,
+the destination gets one copy, and a node at one ticket waits for the
+destination. Fixed fan-out was rejected because it cannot adapt to the number
+of contacts and would either over-send in dense meetings or starve sparse ones.
+Header-based tickets were rejected because hop-mutable fields must stay outside
+the signature and the header is already at its fixed layout. The tracker holds
+at most 4096 live ids, and tickets survive store/sync through
+`StoreMetadata::copies_left` and `SyncFrame::SprayItem`, so a stored copy can
+continue spraying after a later encounter.
+
+Seeds and paired scenarios are fixed in `spray_scenarios()`. With seed
+`1297303752` on scripted-200, flooding delivers 100/100 with 3,455
+transmissions (34.5500 per delivery); spraying with 255 initial tickets
+delivers 99/100 with 1,786 transmissions (18.0404 per delivery), a 48 percent
+transmission reduction. With seed `1297303584` on line-20, both deliver 20/20
+while spraying uses 186 transmissions against 193. Earlier sweeps with 8 and
+64 tickets delivered far below flooding, so the default moved from the ADR's
+original six-copy estimate to 255; the published MSH-27 rows remain the
+relay-only reference.

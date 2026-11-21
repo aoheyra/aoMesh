@@ -21,7 +21,7 @@
 //! and `tests/sim_baseline.rs` enforces the published numbers. Per-origin
 //! delivery counts are kept off the CSV for the MSH-10 flood test.
 
-use crate::store::{MemoryStore, MessageStore, StoreMetadata, StoredMessage};
+use crate::store::{MemoryStore, MessageStore, StoreLimits, StoreMetadata, StoredMessage};
 use crate::{
     CAP_SYNC_V1, CAPS, Header, MeshConfig, MeshEngine, MeshHello, MeshInput, MeshOutput, MessageId,
     NetworkAdapter, Packet, PacketClass, SHORT_ID_BYTES, SYNC_MAGIC, SYNC_V2_VERSION, StoreSummary,
@@ -41,6 +41,8 @@ use std::time::Duration;
 /// Poll step: the world runs scheduled events exactly, so this only bounds
 /// how late a node reacts to them.
 const TICK: Duration = Duration::from_millis(50);
+/// A sync offer can trigger another need; bound one input's host work.
+const MAX_STORE_SERVICE_ROUNDS: usize = 64;
 /// Radio range in the position units used by random and community layouts.
 const RADIUS: i64 = 100;
 
@@ -160,6 +162,11 @@ pub struct Scenario {
     ///
     /// Ablation runs set this to false to measure immediate flooding.
     pub enforce_suppression: bool,
+    /// Whether Direct traffic uses MSH-16 copy tickets.
+    ///
+    /// The published MSH-27 baselines keep this false so they remain the
+    /// relay-only MSH-08 reference; spray gets its own paired report.
+    pub spray: bool,
     /// Suppression bounds and timer parameters under test.
     pub suppression: SuppressionConfig,
 }
@@ -268,6 +275,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             traffic: Traffic::Balanced,
             enforce_budgets: true,
             enforce_suppression: true,
+            spray: false,
             suppression: SuppressionConfig::default(),
         },
         Scenario {
@@ -285,6 +293,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             traffic: Traffic::Balanced,
             enforce_budgets: true,
             enforce_suppression: true,
+            spray: false,
             suppression: SuppressionConfig::default(),
         },
         Scenario {
@@ -302,6 +311,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             traffic: Traffic::Balanced,
             enforce_budgets: true,
             enforce_suppression: true,
+            spray: false,
             suppression: SuppressionConfig::default(),
         },
         Scenario {
@@ -317,6 +327,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             traffic: Traffic::Balanced,
             enforce_budgets: true,
             enforce_suppression: true,
+            spray: false,
             suppression: SuppressionConfig::default(),
         },
     ]
@@ -347,6 +358,7 @@ pub fn flood_scenarios() -> Vec<Scenario> {
         },
         enforce_budgets: true,
         enforce_suppression: true,
+        spray: false,
         suppression: SuppressionConfig::default(),
     }]
 }
@@ -376,8 +388,63 @@ pub fn suppression_scenarios() -> Vec<Scenario> {
         },
         enforce_budgets: true,
         enforce_suppression: true,
+        spray: false,
         suppression: SuppressionConfig::default(),
     }]
+}
+
+/// MSH-16's paired mobility case.
+///
+/// Both scenarios share the MSH-27 waypoint seed, topology, traffic and
+/// budgets. The only difference is the spray bit, so the report isolates
+/// binary copy tickets from the relay-only MSH-08 baseline.
+pub fn spray_scenarios() -> Vec<Scenario> {
+    let line = Scenario {
+        name: "spray-relay-line-20",
+        seed: 1_297_303_584,
+        nodes: 20,
+        topology: Topology::Line,
+        mobility: Mobility::Static,
+        settle: Duration::from_secs(30),
+        run: Duration::from_secs(30),
+        messages: 20,
+        payload_len: 128,
+        traffic: Traffic::Balanced,
+        enforce_budgets: true,
+        enforce_suppression: true,
+        spray: false,
+        suppression: SuppressionConfig::default(),
+    };
+    let scripted = Scenario {
+        name: "spray-relay-scripted-200",
+        seed: 1_297_303_752,
+        nodes: 200,
+        topology: Topology::Scripted(scripted_contacts(200)),
+        mobility: Mobility::Scripted,
+        settle: Duration::from_secs(60),
+        run: Duration::from_secs(60),
+        messages: 100,
+        payload_len: 128,
+        traffic: Traffic::Balanced,
+        enforce_budgets: true,
+        enforce_suppression: true,
+        spray: false,
+        suppression: SuppressionConfig::default(),
+    };
+    vec![
+        line.clone(),
+        Scenario {
+            name: "spray-enabled-line-20",
+            spray: true,
+            ..line
+        },
+        scripted.clone(),
+        Scenario {
+            name: "spray-enabled-scripted-200",
+            spray: true,
+            ..scripted
+        },
+    ]
 }
 
 /// A permanent chain plus short-lived shortcuts on a 200-node chain.
@@ -422,6 +489,7 @@ pub struct Simulation {
     scenario: Scenario,
     world: SimWorld,
     nodes: Vec<Node>,
+    stores: Vec<MemoryStore>,
     identities: Vec<Identity>,
     ranges: Vec<Vec<bool>>,
     applied: Vec<Vec<bool>>,
@@ -485,6 +553,7 @@ impl Simulation {
             let engine_rng = EngineRng::seed_from_u64(scenario.seed ^ (i as u64 + 1));
             let mut engine_config = MeshConfig::default();
             engine_config.budgets.enforce = scenario.enforce_budgets;
+            engine_config.spray.enabled = scenario.spray;
             engine_config.suppression = SuppressionConfig {
                 enabled: scenario.enforce_suppression,
                 ..scenario.suppression
@@ -564,6 +633,9 @@ impl Simulation {
             }
         }
         let applied = vec![vec![false; n]; n];
+        let stores = (0..n)
+            .map(|_| MemoryStore::new(StoreLimits::default()))
+            .collect();
         let delivered_ids = vec![BTreeSet::new(); n];
         let origin_index = identities
             .iter()
@@ -579,6 +651,7 @@ impl Simulation {
             scenario,
             world,
             nodes,
+            stores,
             identities,
             ranges,
             applied,
@@ -678,6 +751,126 @@ impl Simulation {
         self.radio_bytes_run = 0;
     }
 
+    fn store_item(&mut self, node: usize, now_ms: u64, wire: &[u8], copies_left: u8) {
+        let metadata = StoreMetadata {
+            copies_left: copies_left.max(1),
+            first_seen: now_ms,
+            received_at: now_ms,
+            priority: 0,
+            received_from: None,
+            age_ms: 0,
+        };
+        let Ok(message) = StoredMessage::new(wire, metadata) else {
+            return;
+        };
+        let _ = self.stores[node].put(now_ms, message);
+    }
+
+    fn refresh_store_summary(&mut self, node: usize, now: Duration, now_ms: u64) {
+        let ids = self.stores[node].summary(now_ms);
+        let outputs = self.nodes[node]
+            .adapter
+            .engine_mut()
+            .handle(now_ms, MeshInput::StoreSummary { ids: &ids })
+            .expect("store summary is valid");
+        if outputs.is_empty() {
+            return;
+        }
+        self.count_outputs(node, now_ms, &outputs);
+        let events = self.nodes[node].adapter.apply(now, outputs);
+        for event in events {
+            if let crate::AdapterEvent::SendFailed { .. } = event {
+                self.send_failures += 1;
+            }
+        }
+    }
+
+    /// Services the host side of MSH-14/15/16 outputs: persist received
+    /// items and answer sync needs from that node's bounded store.
+    fn service_stores(
+        &mut self,
+        node: usize,
+        now: Duration,
+        now_ms: u64,
+        outputs: Vec<MeshOutput>,
+    ) {
+        let mut pending = outputs;
+        for _ in 0..MAX_STORE_SERVICE_ROUNDS {
+            let mut needs = Vec::new();
+            let mut items = Vec::new();
+            for output in &pending {
+                match output {
+                    MeshOutput::SyncNeed { link, prefixes } => {
+                        needs.push((*link, prefixes.clone()));
+                    }
+                    MeshOutput::SyncItem {
+                        id,
+                        wire,
+                        copies_left,
+                    } => items.push((*id, wire.clone(), *copies_left)),
+                    _ => {}
+                }
+            }
+            let mut stored = false;
+            for (id, wire, copies_left) in items {
+                debug_assert_eq!(
+                    crate::Packet::decode(&wire).map(|packet| packet.header.msg_id),
+                    Ok(id)
+                );
+                self.store_item(node, now_ms, &wire, copies_left);
+                stored = true;
+            }
+            if stored {
+                self.refresh_store_summary(node, now, now_ms);
+            }
+            let mut extra = Vec::new();
+            for (link, prefixes) in needs {
+                let store = &self.stores[node];
+                let ids = store.summary(now_ms);
+                let offers: Vec<SyncOffer<'_>> = prefixes
+                    .iter()
+                    .filter_map(|prefix| {
+                        let id = ids
+                            .iter()
+                            .find(|id| id.as_bytes()[..SHORT_ID_BYTES] == prefix[..])?;
+                        let message = store.get(now_ms, id)?;
+                        Some(SyncOffer {
+                            prefix: *prefix,
+                            wire: message.wire(),
+                            copies_left: message.metadata().copies_left,
+                        })
+                    })
+                    .collect();
+                if offers.is_empty() {
+                    continue;
+                }
+                let produced = self.nodes[node]
+                    .adapter
+                    .engine_mut()
+                    .handle(
+                        now_ms,
+                        MeshInput::SyncItems {
+                            link,
+                            items: &offers,
+                        },
+                    )
+                    .expect("host sync offers are valid");
+                extra.extend(produced);
+            }
+            if extra.is_empty() {
+                return;
+            }
+            self.count_outputs(node, now_ms, &extra);
+            let events = self.nodes[node].adapter.apply(now, extra.clone());
+            for event in events {
+                if let crate::AdapterEvent::SendFailed { .. } = event {
+                    self.send_failures += 1;
+                }
+            }
+            pending = extra;
+        }
+    }
+
     /// Advances the world, drives every node and samples queue occupancy.
     fn pump(&mut self, steps: usize) {
         let mut cx = Context::from_waker(Waker::noop());
@@ -749,6 +942,7 @@ impl Simulation {
                         .handle(now_ms, input)
                         .expect("engine inputs are well formed");
                     self.count_outputs(i, now_ms, &outputs);
+                    self.service_stores(i, now, now_ms, outputs.clone());
                     let events = self.nodes[i].adapter.apply(now, outputs);
                     for event in events {
                         if let crate::AdapterEvent::SendFailed { .. } = event {
@@ -904,7 +1098,7 @@ impl Simulation {
         let now_ms = self.world.now().as_millis() as u64;
         let mut rng = SealRng::seed_from_u64(self.scenario.seed ^ (m as u64 + 1));
         let plaintext = vec![(m % 251) as u8; self.scenario.payload_len];
-        let (header, payload) = if broadcast {
+        let (header, payload, wire) = if broadcast {
             // Plain Broadcast: the engine caps TTL at ADR-0001's six hops
             // on submission. Payload is opaque to the mesh.
             let sender = &self.identities[origin];
@@ -921,7 +1115,8 @@ impl Simulation {
             };
             let signature = sign_packet(sender, &mut header, &plaintext).expect("fixed key signs");
             let packet = crate::Packet::new(header, signature, &plaintext).expect("lengths agree");
-            (packet.header, plaintext)
+            let wire = packet.encode();
+            (packet.header, plaintext, wire)
         } else {
             let sender = &self.identities[origin];
             let recipient = &self.identities[dst];
@@ -930,7 +1125,8 @@ impl Simulation {
                     .expect("fixed identities seal");
             let signature = sign_packet(sender, &mut header, &payload).expect("fixed key signs");
             let packet = crate::Packet::new(header, signature, &payload).expect("lengths agree");
-            (packet.header, payload)
+            let wire = packet.encode();
+            (packet.header, payload, wire)
         };
         let submitted_id = header.msg_id;
         let outputs = self.nodes[origin]
@@ -952,7 +1148,16 @@ impl Simulation {
         } else {
             self.direct_submitted += 1;
         }
+        if self.scenario.spray && !broadcast {
+            let copies = self.nodes[origin]
+                .adapter
+                .engine()
+                .spray_copies_left(submitted_id);
+            self.store_item(origin, now_ms, &wire, copies);
+            self.refresh_store_summary(origin, self.world.now(), now_ms);
+        }
         self.count_outputs(origin, now_ms, &outputs);
+        self.service_stores(origin, self.world.now(), now_ms, outputs.clone());
         let events = self.nodes[origin].adapter.apply(self.world.now(), outputs);
         for event in events {
             if let crate::AdapterEvent::SendFailed { .. } = event {
@@ -1263,9 +1468,11 @@ fn bench_service(
                         let id = ids
                             .iter()
                             .find(|id| id.as_bytes()[..SHORT_ID_BYTES] == prefix[..])?;
+                        let message = store.get(now, id)?;
                         Some(SyncOffer {
                             prefix: *prefix,
-                            wire: store.get(now, id)?.wire(),
+                            wire: message.wire(),
+                            copies_left: message.metadata().copies_left,
                         })
                     })
                     .collect();

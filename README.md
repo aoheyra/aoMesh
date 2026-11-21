@@ -2,7 +2,7 @@
 
 **The routing and store-and-forward engine of the aoheyra mesh.** A sans-IO Rust crate that decides what happens to a packet: forward it, hold it, suppress it, deliver it, or drop it, across a phone-to-phone mesh where links come and go.
 
-> **Status: pre-alpha, through MSH-15.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest, bounded anti-entropy sync and range-based reconciliation on meeting links are implemented.
+> **Status: pre-alpha, through MSH-16.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest, bounded anti-entropy sync, range-based reconciliation on meeting links and binary spray-and-wait for Direct traffic are implemented.
 
 Cargo package name: `ao_mesh`.
 
@@ -356,6 +356,14 @@ cargo run --release --features sim --example sim_report
 cargo test --release --all-features --test sim_baseline
 ```
 
+MSH-16 adds a separate paired report; the four published rows above stay the
+relay-only MSH-08 reference:
+
+```bash
+cargo run --release --all-features --example spray_report
+cargo test --release --all-features --test sim_spray
+```
+
 Tests are `cargo test` only: no Miri or callgrind locally. CI runs fmt, clippy, tests on three operating systems, `cargo doc`, cargo-deny, an MSRV build and miri on every pull request.
 
 ### Sibling crates
@@ -487,3 +495,43 @@ convergence, codec bounds and the v1-only fallback. The simulator report
 `cargo run --release --all-features --example sync_v2_report` uses seed
 `0x515f_2026` with stores of 1000 and 1001 messages: v2 exchanges 2,018 bytes
 against v1's 16,188 bytes, with both stores converging.
+
+## Binary spray-and-wait (MSH-16)
+
+Direct packets now carry a copy ticket in a small additive envelope on the same
+Message channel as the packet. The envelope is six bytes: magic `0x54`, version
+`1`, tag `1` for Direct, a one-byte remaining-copy count and a two-byte inner
+length. The packet header and its signed immutable part are unchanged; relays
+may lower the hop-mutable ticket without forging origin content. Both peers must
+advertise `CAP_SPRAY_V1` (`1 << 2`); a peer without it receives the ordinary
+packet bytes, so this is a negotiated wire addition, not a packet version bump.
+Receiving a stray envelope on a link that did not negotiate the bit is an
+attributable protocol error.
+
+Each new Direct message starts with 255 tickets. On contact with a non-destination
+peer the node hands over half of its remaining tickets and keeps the rest; a
+destination always receives one copy and ends the spray. At one ticket a node
+waits and only hands that copy to the destination, which is also how a stored
+copy reaches a later contact through MSH-14/15 sync. The tracker is bounded to
+4096 live ids, and tickets, store metadata and sync frames carry the count
+without adding a header field.
+
+| Setting | Default | Why |
+|---|---|---|
+| Initial copies | 255 | Halving across an eight-hop TTL still leaves a copy for the destination; measured below |
+| Maximum tracked ids | 4096 | Bounds memory across overlapping contact windows |
+| Envelope header | 6 bytes | Magic, version, tag, count and a bounded inner length |
+
+The paired report keeps topology, mobility, traffic and budgets identical:
+
+| Scenario | Seed | Delivered / submitted | Delivery ratio | Transmissions | Overhead |
+|---|---:|---:|---:|---:|---:|
+| `spray-relay-line-20` | 1297303584 | 20 / 20 | 1.0000 | 193 | 9.6500 |
+| `spray-enabled-line-20` | 1297303584 | 20 / 20 | 1.0000 | 186 | 9.3000 |
+| `spray-relay-scripted-200` | 1297303752 | 100 / 100 | 1.0000 | 3455 | 34.5500 |
+| `spray-enabled-scripted-200` | 1297303752 | 99 / 100 | 0.9900 | 1786 | 18.0404 |
+
+The scripted-200 case keeps 99 percent delivery while using 48 percent fewer
+transmissions. `tests/spray.rs` covers envelope bounds, the binary split, the
+destination shortcut, wait-phase delivery, tracker eviction and capability
+fallback; `tests/sim_spray.rs` locks the fixed-seed numbers.

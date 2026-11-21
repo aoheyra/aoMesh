@@ -39,6 +39,7 @@ pub mod seen;
 pub mod sign;
 #[cfg(feature = "sim")]
 pub mod sim;
+pub mod spray;
 pub mod store;
 pub mod suppress;
 pub mod sync;
@@ -47,13 +48,14 @@ pub mod sync;
 pub use adapter::{AdapterEvent, NetworkAdapter};
 pub use budget::{BudgetConfig, BudgetOutcome, BudgetTracker, ClassRate};
 pub use engine::{MeshEngine, MeshError, MeshInput, MeshOutput};
-pub use hello::{CAP_SYNC_V1, CAP_SYNC_V2, CAPS, HelloError, MeshHello};
+pub use hello::{CAP_SPRAY_V1, CAP_SYNC_V1, CAP_SYNC_V2, CAPS, HelloError, MeshHello};
 pub use neighbor::{MeshConfig, Neighbor, NeighborTable};
 pub use packet::{Header, MessageId, Packet, PacketClass, PacketError, SIGNATURE_LEN};
 pub use seen::{Offer, SeenCache, SeenConfig};
 pub use sign::{
     RelayOutcome, VerifyError, derive_msg_id, sign_packet, verify_for_relay, verify_origin,
 };
+pub use spray::{MAX_COPIES, SPRAY_MAGIC, SPRAY_VERSION, SprayConfig, SprayError, SprayTracker};
 pub use suppress::SuppressionConfig;
 pub use sync::{
     BeaconTracker, RangeKey, RangeSummary, SHORT_ID_BYTES, SYNC_MAGIC, SYNC_V2_VERSION,

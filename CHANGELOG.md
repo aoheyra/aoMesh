@@ -7,6 +7,17 @@ change without notice until v0.1.0, and consumers pin by git tag
 
 ## Unreleased
 
+MSH-16 adds binary spray-and-wait for Direct traffic. Packets keep their signed
+header; a six-byte capability-negotiated envelope carries a remaining-copy
+ticket on the Message channel. Peers without `CAP_SPRAY_V1` receive the raw
+packet. Each message starts with 255 tickets, hands half to a non-destination
+contact, gives one to the destination and otherwise waits with its last copy;
+tickets also travel through MSH-14/15 sync and are bounded by a 4096-id tracker.
+The paired `spray_report` uses the fixed MSH-27 seeds: scripted-200 delivers
+99/100 with 1,786 transmissions against relay-only 100/100 with 3,455, and
+line-20 keeps 20/20 with 186 transmissions against 193. The published
+MSH-27 baselines remain relay-only and unchanged.
+
 MSH-15 adds range-based reconciliation for links that advertise both sync
 capability bits. Each side hashes binary ranges of the canonical id space,
 splits only differing ranges and exchanges full ids in small leaves. The

@@ -4,7 +4,7 @@ mod common;
 use ao_idents::{Identity, ReplayConfig};
 use ao_mesh::{
     BudgetConfig, ClassRate, Header, MeshConfig, MeshEngine, MeshError, MeshHello, MeshInput,
-    MeshOutput, Packet, PacketClass, SuppressionConfig, sign_packet, verify_origin,
+    MeshOutput, Packet, PacketClass, SprayConfig, SuppressionConfig, sign_packet, verify_origin,
 };
 use ao_network::{AppHello, Channel, DisconnectReason, Hello, LinkId, LocalTag};
 use rand::{SeedableRng, rngs::StdRng};
@@ -16,12 +16,23 @@ use std::sync::LazyLock;
 /// `header()` stamps nor the `[1; 32]` sender the helpers build.
 static LOCAL: LazyLock<Identity> = LazyLock::new(|| Identity::from_seed([3; 32]));
 
+/// MSH-16's spray store events are exercised in their own tests; the
+/// forwarding pipeline assertions here stay relay-only (MSH-08).
+fn no_spray_config() -> MeshConfig {
+    MeshConfig {
+        spray: SprayConfig {
+            enabled: false,
+            ..SprayConfig::default()
+        },
+        ..MeshConfig::default()
+    }
+}
 fn engine(limit: usize) -> MeshEngine<StdRng> {
     MeshEngine::with_config(
         StdRng::seed_from_u64(0x6006),
         MeshConfig {
             max_neighbors: limit,
-            ..MeshConfig::default()
+            ..no_spray_config()
         },
     )
 }
@@ -453,7 +464,7 @@ fn an_excessive_origin_is_denied_without_blaming_its_sender() {
     let config = MeshConfig {
         max_neighbors: 2,
         budgets,
-        ..MeshConfig::default()
+        ..no_spray_config()
     };
     let mut e = MeshEngine::with_config(StdRng::seed_from_u64(7), config);
     let sender = LinkId::new(1);
@@ -520,7 +531,7 @@ fn a_neighbor_limit_denial_is_still_penalised() {
     let config = MeshConfig {
         max_neighbors: 2,
         budgets,
-        ..MeshConfig::default()
+        ..no_spray_config()
     };
     let mut e = MeshEngine::with_config(StdRng::seed_from_u64(9), config);
     let sender = LinkId::new(1);
@@ -1133,7 +1144,7 @@ fn fast_suppression_engine(neighbors: usize, enabled: bool) -> MeshEngine<StdRng
                 max_delay_ms: 10,
                 ..SuppressionConfig::default()
             },
-            ..MeshConfig::default()
+            ..no_spray_config()
         },
     )
 }
@@ -1286,7 +1297,7 @@ fn budget_denied_broadcast_and_presence_never_enter_suppression() {
                 max_delay_ms: 10,
                 ..SuppressionConfig::default()
             },
-            ..MeshConfig::default()
+            ..no_spray_config()
         };
         let mut e = MeshEngine::with_config(StdRng::seed_from_u64(0xB11C), config);
         for id in 1..=2u64 {

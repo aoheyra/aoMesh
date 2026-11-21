@@ -331,6 +331,27 @@ per-contact budget, 20-second deadline and two-phase release therefore still
 apply. A stalled v2 contact is released once; a link drop removes the session
 so the next meeting starts from a fresh digest.
 
+## Binary spray-and-wait (MSH-16)
+
+`MeshHello` adds `CAP_SPRAY_V1` (`1 << 2`). The packet header and signature
+layout do not change: a copy ticket travels in a six-byte envelope before the
+ordinary encoded packet, on the same Message channel. The bytes are magic
+`0x54`, version `1`, tag `1` for Direct, one byte of remaining copies (1 to 255)
+and a little-endian two-byte inner length. The decoder checks the fixed header
+before reading the inner packet, rejects bad versions, tags, tickets, lengths
+and trailing bytes, and never allocates before those checks pass. A link that
+did not negotiate the capability receives the raw packet from its peer and
+rejects an unexpected envelope as attributable invalid traffic.
+
+A local Direct submission or a received spray copy creates a bounded tracker
+entry containing the destination, expiry and remaining tickets. For each
+non-destination contact the engine hands over `floor(copies_left / 2)` and keeps
+the rest; a destination contact receives one ticket and ends the spray. At one
+ticket the node waits and only hands that copy to the destination. Sync frames
+carry the same count in `SprayItem`, so a stored copy received through
+MSH-14/15 can continue spraying on a later contact. The host persists the count
+as `StoreMetadata::copies_left`; the engine keeps at most 4096 live tickets.
+
 ## Simulation evidence (MSH-27)
 
 No wire format changes. Feature `sim` drives the codec and engine over aoNetwork's

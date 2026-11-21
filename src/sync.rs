@@ -208,6 +208,7 @@ const TAG_DIGEST: u8 = 1;
 const TAG_SUMMARY: u8 = 2;
 const TAG_ITEM: u8 = 3;
 const TAG_DONE: u8 = 4;
+const TAG_SPRAY_ITEM: u8 = 5;
 
 /// One bounded anti-entropy frame (MSH-14).
 ///
@@ -228,6 +229,13 @@ pub enum SyncFrame {
     },
     /// One complete encoded mesh packet the peer was missing.
     Item(Vec<u8>),
+    /// One packet with its MSH-16 copy ticket, for spray-capable peers only.
+    SprayItem {
+        /// Remaining copies the receiving host should record.
+        copies: u8,
+        /// Complete encoded mesh packet.
+        wire: Vec<u8>,
+    },
     /// This contact has finished; the peer may release an opportunistic link.
     Done,
 }
@@ -252,6 +260,12 @@ impl SyncFrame {
                 out
             }
             Self::Item(wire) => wire.clone(),
+            Self::SprayItem { copies, wire } => {
+                let mut out = Vec::with_capacity(1 + wire.len());
+                out.push(*copies);
+                out.extend_from_slice(wire);
+                out
+            }
             Self::Done => Vec::new(),
         };
         let len = u16::try_from(payload.len()).ok()?;
@@ -259,6 +273,7 @@ impl SyncFrame {
             Self::Digest(_) => TAG_DIGEST,
             Self::Summary { .. } => TAG_SUMMARY,
             Self::Item(_) => TAG_ITEM,
+            Self::SprayItem { .. } => TAG_SPRAY_ITEM,
             Self::Done => TAG_DONE,
         };
         let mut out = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
@@ -324,6 +339,21 @@ impl SyncFrame {
                 }
                 Ok(Some(Self::Item(body.to_vec())))
             }
+            TAG_SPRAY_ITEM => {
+                let Some((copies, wire)) = body.split_first() else {
+                    return Err(SyncError::BadLength);
+                };
+                if *copies == 0 {
+                    return Err(SyncError::BadCopies(*copies));
+                }
+                if wire.is_empty() {
+                    return Err(SyncError::BadLength);
+                }
+                Ok(Some(Self::SprayItem {
+                    copies: *copies,
+                    wire: wire.to_vec(),
+                }))
+            }
             TAG_DONE => {
                 if !body.is_empty() {
                     return Err(SyncError::BadLength);
@@ -346,6 +376,8 @@ pub(crate) enum SyncError {
     BadTag,
     /// A field had the wrong length for its tag.
     BadLength,
+    /// A spray item advertised an out-of-range copy ticket.
+    BadCopies(u8),
     /// The summary advertised more ids than the store bound allows.
     TooManyEntries,
     /// The frame had bytes after its declared length.
@@ -717,6 +749,8 @@ pub struct SyncOffer<'a> {
     pub prefix: [u8; SHORT_ID_BYTES],
     /// Complete encoded mesh packet, borrowed only for this call.
     pub wire: &'a [u8],
+    /// Retained spray copies for Direct items; one for other classes.
+    pub copies_left: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -728,19 +762,21 @@ struct SyncSession {
     received: BTreeSet<[u8; SHORT_ID_BYTES]>,
     sent: BTreeSet<[u8; SHORT_ID_BYTES]>,
     bytes_sent: usize,
+    spray: bool,
     deadline_ms: u64,
     done_sent: bool,
     released: bool,
 }
 
 impl SyncSession {
-    fn new(now: u64, timeout_ms: u64) -> Self {
+    fn new(now: u64, timeout_ms: u64, spray: bool) -> Self {
         Self {
             target: BTreeSet::new(),
             incoming: BTreeSet::new(),
             received: BTreeSet::new(),
             sent: BTreeSet::new(),
             bytes_sent: 0,
+            spray,
             deadline_ms: now.saturating_add(timeout_ms),
             done_sent: false,
             released: false,
@@ -763,6 +799,8 @@ struct V2Session {
     deadline_ms: u64,
     /// Snapshot of the local store taken when the contact opened.
     ids: Vec<[u8; MSG_ID_LEN]>,
+    /// Whether the contact may carry MSH-16 copy tickets.
+    spray: bool,
     /// Ranges still waiting for the peer's summary.
     outstanding: BTreeSet<RangeKey>,
     /// Summaries already received, so duplicates and loops are ignored.
@@ -785,10 +823,11 @@ struct V2Session {
 }
 
 impl V2Session {
-    fn new(now: u64, timeout_ms: u64, ids: Vec<[u8; MSG_ID_LEN]>) -> Self {
+    fn new(now: u64, timeout_ms: u64, ids: Vec<[u8; MSG_ID_LEN]>, spray: bool) -> Self {
         Self {
             deadline_ms: now.saturating_add(timeout_ms),
             ids,
+            spray,
             outstanding: BTreeSet::new(),
             received_summaries: BTreeSet::new(),
             leafs: BTreeSet::new(),
@@ -840,10 +879,14 @@ pub(crate) enum SyncAction {
     },
     /// Hand an authenticated-envelope item to the host store.
     Item {
+        /// Link that supplied the item, excluded from further spray handoff.
+        link: LinkId,
         /// Full content address parsed from the wire packet.
         id: MessageId,
         /// Complete encoded packet.
         wire: Vec<u8>,
+        /// Spray copies from a negotiated frame, or one otherwise.
+        copies_left: u8,
     },
     /// The contact is over; release it if aoNetwork made it opportunistic.
     Release {
@@ -893,12 +936,23 @@ impl SyncTracker {
         self.local.digest()
     }
 
+    /// Resolves a short id back to the full id in the current summary.
+    pub(crate) fn local_id_for_prefix(&self, prefix: [u8; SHORT_ID_BYTES]) -> Option<MessageId> {
+        self.local
+            .full_ids()
+            .iter()
+            .copied()
+            .find(|id| id[..SHORT_ID_BYTES] == prefix)
+            .map(MessageId::from_bytes)
+    }
+
     /// Opens a contact when the peer's hello advertises a different digest.
     pub(crate) fn start(
         &mut self,
         now: u64,
         link: LinkId,
         remote_digest: [u8; BEACON_DIGEST_LEN],
+        spray: bool,
     ) -> Vec<SyncAction> {
         if !self.config.enabled || self.sessions.contains_key(&link) {
             return Vec::new();
@@ -910,7 +964,7 @@ impl SyncTracker {
             return Vec::new();
         }
         self.sessions
-            .insert(link, SyncSession::new(now, self.config.timeout_ms));
+            .insert(link, SyncSession::new(now, self.config.timeout_ms, spray));
         vec![SyncAction::Send {
             link,
             frame: SyncFrame::Digest(self.local_digest()),
@@ -923,6 +977,7 @@ impl SyncTracker {
         now: u64,
         link: LinkId,
         remote_digest: [u8; BEACON_DIGEST_LEN],
+        spray: bool,
     ) -> Vec<SyncAction> {
         if !self.config.enabled
             || self.sessions.contains_key(&link)
@@ -941,8 +996,12 @@ impl SyncTracker {
         if wire.len() > self.config.max_frame_bytes {
             return Vec::new();
         }
-        let mut session =
-            V2Session::new(now, self.config.timeout_ms, self.local.full_ids().to_vec());
+        let mut session = V2Session::new(
+            now,
+            self.config.timeout_ms,
+            self.local.full_ids().to_vec(),
+            spray,
+        );
         session.outstanding.insert(root);
         session.bytes_sent = wire.len();
         self.v2_sessions.insert(link, session);
@@ -1004,7 +1063,7 @@ impl SyncTracker {
             actions.extend(self.v2_send(link, &mut session, SyncFrameV2::Ready));
         }
         if session.ready_sent && session.peer_ready {
-            let mut next = SyncSession::new(now, self.config.timeout_ms);
+            let mut next = SyncSession::new(now, self.config.timeout_ms, session.spray);
             next.target = session.target.clone();
             next.incoming = session.incoming.clone();
             self.sessions.insert(link, next);
@@ -1127,11 +1186,15 @@ impl SyncTracker {
         if !self.config.enabled {
             return Vec::new();
         }
+        let incoming_copies = match &frame {
+            SyncFrame::SprayItem { copies, .. } => *copies,
+            _ => 1,
+        };
         match frame {
             SyncFrame::Digest(digest) => {
                 if !self.sessions.contains_key(&link) {
                     self.sessions
-                        .insert(link, SyncSession::new(now, self.config.timeout_ms));
+                        .insert(link, SyncSession::new(now, self.config.timeout_ms, false));
                 }
                 if digest == self.local_digest() {
                     return self.finish(link);
@@ -1168,7 +1231,7 @@ impl SyncTracker {
                     let session = self
                         .sessions
                         .entry(link)
-                        .or_insert_with(|| SyncSession::new(now, self.config.timeout_ms));
+                        .or_insert_with(|| SyncSession::new(now, self.config.timeout_ms, false));
                     session.target = target;
                     session.incoming = incoming;
                     session
@@ -1191,7 +1254,7 @@ impl SyncTracker {
                 }
                 vec![SyncAction::Need { link, prefixes }]
             }
-            SyncFrame::Item(wire) => {
+            SyncFrame::Item(wire) | SyncFrame::SprayItem { wire, .. } => {
                 if !self.sessions.contains_key(&link) {
                     return Vec::new();
                 }
@@ -1213,7 +1276,12 @@ impl SyncTracker {
                     session.received.insert(prefix);
                     session.received_all() && (session.target.is_empty() || session.sent_all())
                 };
-                let mut actions = vec![SyncAction::Item { id, wire }];
+                let mut actions = vec![SyncAction::Item {
+                    link,
+                    id,
+                    wire,
+                    copies_left: incoming_copies,
+                }];
                 if complete {
                     actions.extend(self.send_done(link));
                 }
@@ -1257,10 +1325,15 @@ impl SyncTracker {
                 }
                 session.bytes_sent = bytes;
                 session.sent.insert(prefix);
-                actions.push(SyncAction::Send {
-                    link,
-                    frame: SyncFrame::Item(offer.wire.to_vec()),
-                });
+                let frame = if session.spray && offer.copies_left > 1 {
+                    SyncFrame::SprayItem {
+                        copies: offer.copies_left,
+                        wire: offer.wire.to_vec(),
+                    }
+                } else {
+                    SyncFrame::Item(offer.wire.to_vec())
+                };
+                actions.push(SyncAction::Send { link, frame });
             }
             (
                 session.sent_all(),
@@ -1579,6 +1652,7 @@ mod tests {
                     prefix
                 },
                 wire: &first,
+                copies_left: 1,
             },
             SyncOffer {
                 prefix: {
@@ -1587,6 +1661,7 @@ mod tests {
                     prefix
                 },
                 wire: &second,
+                copies_left: 1,
             },
         ];
         let actions = tracker.on_offers(link, &offers);

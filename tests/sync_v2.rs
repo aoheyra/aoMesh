@@ -107,6 +107,7 @@ fn service(
                         Some(SyncOffer {
                             prefix: *prefix,
                             wire: message.wire(),
+                            copies_left: 1,
                         })
                     })
                     .collect();

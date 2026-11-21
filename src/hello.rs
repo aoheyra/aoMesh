@@ -47,14 +47,17 @@ pub const MIN_PROTO: u8 = 1;
 /// Feature bits this build sets.
 ///
 /// Bit 0 advertises MSH-14's anti-entropy sync frames. Bit 1 advertises
-/// MSH-15's range reconciliation. A peer that lacks both keeps the plain
-/// forwarding path; a peer with only bit 0 gets the MSH-14 summary exchange.
-/// Every bit needs an ADR entry.
+/// MSH-15's range reconciliation. Bit 2 advertises MSH-16's bounded spray
+/// envelope. A peer that lacks all three keeps the plain forwarding path;
+/// a peer with only bit 0 gets the MSH-14 summary exchange. Every bit needs
+/// an ADR entry.
 pub const CAP_SYNC_V1: u32 = 1 << 0;
 /// Capability bit for MSH-15 range-based set reconciliation.
 pub const CAP_SYNC_V2: u32 = 1 << 1;
+/// Capability bit for MSH-16 binary spray copy tickets.
+pub const CAP_SPRAY_V1: u32 = 1 << 2;
 /// Feature bits this build sets (ADR-0001).
-pub const CAPS: u32 = CAP_SYNC_V1 | CAP_SYNC_V2;
+pub const CAPS: u32 = CAP_SYNC_V1 | CAP_SYNC_V2 | CAP_SPRAY_V1;
 
 /// Encoded length of a v1 hello: fixed, so a wrong length is rejected
 /// before anything is read (ADR-0004).

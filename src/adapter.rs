@@ -47,6 +47,8 @@ pub enum AdapterEvent {
         id: crate::MessageId,
         /// Complete encoded mesh packet.
         wire: Vec<u8>,
+        /// Remaining spray copies for the host store metadata.
+        copies_left: u8,
     },
 }
 
@@ -135,9 +137,15 @@ impl<R: RngCore, T: Transport> NetworkAdapter<R, T> {
                 MeshOutput::SyncNeed { link, prefixes } => {
                     events.push(AdapterEvent::SyncNeed { link, prefixes })
                 }
-                MeshOutput::SyncItem { id, wire } => {
-                    events.push(AdapterEvent::SyncItem { id, wire })
-                }
+                MeshOutput::SyncItem {
+                    id,
+                    wire,
+                    copies_left,
+                } => events.push(AdapterEvent::SyncItem {
+                    id,
+                    wire,
+                    copies_left,
+                }),
                 MeshOutput::Deliver { header, payload } => {
                     events.push(AdapterEvent::Deliver { header, payload })
                 }

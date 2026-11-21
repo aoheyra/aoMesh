@@ -3,7 +3,7 @@
 use ao_idents::Identity;
 use ao_mesh::{
     AdapterEvent, Header, MeshConfig, MeshEngine, MeshHello, MeshInput, MeshOutput, NetworkAdapter,
-    PacketClass,
+    PacketClass, SprayConfig,
 };
 use ao_network::{
     AppHello, BeaconFlags, Channel, DisconnectReason, LinkId, LocalTag, Network, NetworkConfig,
@@ -15,6 +15,29 @@ use std::time::Duration;
 
 type Adapter = NetworkAdapter<StdRng, SimTransport>;
 const SEED: u64 = 0x6006;
+/// Relay-only configuration keeps these facade assertions focused on
+/// adapter plumbing; MSH-16 has dedicated spray tests.
+fn no_spray_config() -> MeshConfig {
+    MeshConfig {
+        spray: SprayConfig {
+            enabled: false,
+            ..SprayConfig::default()
+        },
+        ..MeshConfig::default()
+    }
+}
+fn engine() -> MeshEngine<StdRng> {
+    MeshEngine::with_config(
+        StdRng::seed_from_u64(SEED),
+        MeshConfig {
+            spray: SprayConfig {
+                enabled: false,
+                ..SprayConfig::default()
+            },
+            ..no_spray_config()
+        },
+    )
+}
 fn pair() -> (SimWorld, Vec<Adapter>) {
     let world = SimWorld::new(SimConfig {
         seed: SEED,
@@ -25,7 +48,7 @@ fn pair() -> (SimWorld, Vec<Adapter>) {
             let radio = world.add_node(SimNode::default()).unwrap();
             let network = Network::new(NetworkConfig::default(), radio);
             let identity = Identity::from_seed([i; 32]);
-            let engine = MeshEngine::new(StdRng::seed_from_u64(SEED));
+            let engine = engine();
             let mut adapter = NetworkAdapter::new(engine, network);
             let signed = MeshHello::sign(&identity, [0; 8], [0; 4]).unwrap();
             assert!(
@@ -251,7 +274,7 @@ fn rejected_link_is_released_through_the_network_without_retaining_it() {
                 StdRng::seed_from_u64(SEED),
                 MeshConfig {
                     max_neighbors: limit,
-                    ..MeshConfig::default()
+                    ..no_spray_config()
                 },
             );
             let mut n = NetworkAdapter::new(engine, Network::new(NetworkConfig::default(), radio));
@@ -304,10 +327,7 @@ fn rejected_link_is_released_through_the_network_without_retaining_it() {
 fn async_wrapper_is_pending_without_network_events() {
     let world = SimWorld::new(SimConfig::default());
     let radio = world.add_node(SimNode::default()).unwrap();
-    let mut n = NetworkAdapter::new(
-        MeshEngine::new(StdRng::seed_from_u64(SEED)),
-        Network::new(NetworkConfig::default(), radio),
-    );
+    let mut n = NetworkAdapter::new(engine(), Network::new(NetworkConfig::default(), radio));
     let mut cx = Context::from_waker(Waker::noop());
     let identity = Identity::from_seed([1; 32]);
     let mut future = std::pin::pin!(n.next_event(Duration::ZERO, 0, &identity));

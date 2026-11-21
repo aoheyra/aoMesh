@@ -6,6 +6,7 @@ use ao_network::{Hello, LinkId};
 use std::collections::BTreeMap;
 
 use crate::budget::BudgetConfig;
+use crate::spray::SprayConfig;
 use crate::suppress::SuppressionConfig;
 use crate::sync::{SummaryConfig, SyncConfig};
 
@@ -26,6 +27,8 @@ pub struct MeshConfig {
     pub summary: SummaryConfig,
     /// Anti-entropy contact bounds and timeout (MSH-14).
     pub sync: SyncConfig,
+    /// Binary spray-and-wait policy for Direct traffic (MSH-16).
+    pub spray: SprayConfig,
 }
 
 impl Default for MeshConfig {
@@ -50,6 +53,7 @@ impl Default for MeshConfig {
             suppression: SuppressionConfig::default(),
             summary: SummaryConfig::default(),
             sync: SyncConfig::default(),
+            spray: SprayConfig::default(),
         }
     }
 }

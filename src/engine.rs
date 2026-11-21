@@ -146,14 +146,19 @@ pub enum MeshOutput {
         /// Prefixes the peer is missing.
         prefixes: Vec<[u8; SHORT_ID_BYTES]>,
     },
-    /// An item from a peer, ready for the host to insert in its store.
-    /// The engine checked bounds and the content address, not the origin
-    /// signature: final authenticity remains the store owner's job.
+    /// An item from a peer or a local submission, ready for the host to
+    /// insert in its store. The engine checked bounds and the content
+    /// address, not the origin signature: final authenticity remains the
+    /// store owner's job. Locally submitted Direct items appear here too,
+    /// so the host can persist the same metadata the spray policy uses.
     SyncItem {
         /// Full content address parsed from the packet.
         id: MessageId,
         /// Complete encoded mesh packet.
         wire: Vec<u8>,
+        /// Remaining spray copies to record with the item. Non-spray items
+        /// and peers without the spray capability use one.
+        copies_left: u8,
     },
     /// End an MSH-14 contact. The adapter uses aoNetwork's `release`, which
     /// only closes opportunistic links and leaves stable ones alone.
@@ -202,6 +207,7 @@ pub struct MeshEngine<R: RngCore> {
     suppression: SuppressionTable,
     beacon: BeaconTracker,
     sync: SyncTracker,
+    spray: crate::spray::SprayTracker,
 }
 impl<R: RngCore> MeshEngine<R> {
     /// Creates an engine with the default limits (`MeshConfig::default`).
@@ -224,6 +230,7 @@ impl<R: RngCore> MeshEngine<R> {
             suppression: SuppressionTable::new(config.suppression),
             beacon: BeaconTracker::new(config.summary),
             sync: SyncTracker::new(config.sync),
+            spray: crate::spray::SprayTracker::new(config.spray),
         }
     }
     /// Read-only bookkeeping, not a list of authenticated identities.
@@ -241,6 +248,13 @@ impl<R: RngCore> MeshEngine<R> {
     /// Read-only anti-entropy state (MSH-14).
     pub fn sync(&self) -> &SyncTracker {
         &self.sync
+    }
+    /// Remaining MSH-16 copies for one id, or one when spray is inactive.
+    ///
+    /// The host persists this with the packet bytes so later sync offers
+    /// carry the same ticket the relay policy holds.
+    pub fn spray_copies_left(&self, id: MessageId) -> u8 {
+        self.spray.copies_left(id)
     }
     /// Processes one input at caller-supplied milliseconds.
     ///
@@ -290,12 +304,12 @@ impl<R: RngCore> MeshEngine<R> {
                     return Ok(Vec::new());
                 }
                 let actions = self.sync.on_offers(link, items);
-                Ok(self.apply_sync_actions(actions))
+                Ok(self.apply_sync_actions(now, actions))
             }
             MeshInput::Tick => {
                 let mut outputs = self.drain_due(now);
                 let actions = self.sync.expire(now);
-                outputs.extend(self.apply_sync_actions(actions));
+                outputs.extend(self.apply_sync_actions(now, actions));
                 Ok(outputs)
             }
             MeshInput::LinkUp { link, remote_hello } => {
@@ -325,20 +339,23 @@ impl<R: RngCore> MeshEngine<R> {
                 let Some(caps) = caps else {
                     return Ok(Vec::new());
                 };
+                let spray = self.config.spray.enabled && caps & crate::hello::CAP_SPRAY_V1 != 0;
+                self.spray.set_caps(link, caps);
                 let remote_digest = hello.map_or([0; 4], |hello| hello.store_digest);
                 let actions = if caps & crate::hello::CAP_SYNC_V2 != 0 {
-                    self.sync.start_v2(now, link, remote_digest)
+                    self.sync.start_v2(now, link, remote_digest, spray)
                 } else if caps & crate::hello::CAP_SYNC_V1 != 0 {
-                    self.sync.start(now, link, remote_digest)
+                    self.sync.start(now, link, remote_digest, spray)
                 } else {
                     Vec::new()
                 };
-                Ok(self.apply_sync_actions(actions))
+                Ok(self.apply_sync_actions(now, actions))
             }
             MeshInput::LinkDown { link, .. } => {
                 self.neighbors.remove(link);
                 self.budgets.link_down(link);
                 self.sync.link_down(link);
+                self.spray.link_down(link);
                 Ok(Vec::new())
             }
             MeshInput::Data {
@@ -373,7 +390,7 @@ impl<R: RngCore> MeshEngine<R> {
                                 ));
                             }
                             let actions = self.sync.on_v2_frame(now, link, frame, payload.len());
-                            return Ok(self.apply_sync_actions(actions));
+                            return Ok(self.apply_sync_actions(now, actions));
                         }
                         Ok(None) => {}
                         Err(_) => {
@@ -407,7 +424,7 @@ impl<R: RngCore> MeshEngine<R> {
                                 ));
                             }
                             let actions = self.sync.on_frame(now, link, frame);
-                            return Ok(self.apply_sync_actions(actions));
+                            return Ok(self.apply_sync_actions(now, actions));
                         }
                         Ok(None) => {}
                         Err(_) => {
@@ -423,9 +440,38 @@ impl<R: RngCore> MeshEngine<R> {
                         }
                     }
                 }
+                // A spray envelope is parsed header-first and never allocates
+                // its inner packet. It is only meaningful on a link that
+                // negotiated the capability, so a stray envelope is an
+                // attributable protocol error.
+                let (packet_bytes, incoming_copies) = match crate::spray::decode_frame(payload) {
+                    Ok(Some((copies, inner))) => {
+                        if !self.spray.supports(link) {
+                            self.neighbors.reject(link);
+                            return Ok(Self::release_if_penalised(
+                                link,
+                                self.budgets.penalize(
+                                    now,
+                                    link,
+                                    self.config.budgets.penalty_invalid,
+                                ),
+                            ));
+                        }
+                        (inner, Some(copies))
+                    }
+                    Ok(None) => (payload, None),
+                    Err(_) => {
+                        self.neighbors.reject(link);
+                        return Ok(Self::release_if_penalised(
+                            link,
+                            self.budgets
+                                .penalize(now, link, self.config.budgets.penalty_invalid),
+                        ));
+                    }
+                };
                 // Packet::decode parses the bounded header before inspecting or
                 // borrowing the payload, and allocates nothing on either path.
-                let packet = Packet::decode(payload);
+                let packet = Packet::decode(packet_bytes);
                 self.neighbors
                     .received(now, link, payload.len(), packet.is_ok());
                 let verified = self
@@ -480,6 +526,10 @@ impl<R: RngCore> MeshEngine<R> {
                 // Complete timers that expired while this packet was in
                 // flight before adding a new sighting for the same id.
                 let mut outputs = self.drain_due(now);
+                let wire = packet.encode();
+                let msg_id = packet.header.msg_id;
+                let destination = packet.header.dst.unwrap_or([0; 16]);
+                let lifetime_s = packet.header.lifetime_s;
                 match packet.header.class {
                     crate::PacketClass::Direct => {
                         match forward::on_data(identity.node_id(), &mut self.seen, now, packet) {
@@ -523,6 +573,13 @@ impl<R: RngCore> MeshEngine<R> {
                                         header,
                                         payload: plaintext,
                                     });
+                                    if self.config.spray.enabled {
+                                        outputs.push(MeshOutput::SyncItem {
+                                            id: msg_id,
+                                            wire: wire.clone(),
+                                            copies_left: incoming_copies.unwrap_or(1),
+                                        });
+                                    }
                                 }
                                 Err(_) => {
                                     self.neighbors.reject(link);
@@ -536,9 +593,46 @@ impl<R: RngCore> MeshEngine<R> {
                                 }
                             },
                             Action::Relay { bytes } if outcome == BudgetOutcome::Admitted => {
-                                let mut senders = BTreeSet::new();
-                                senders.insert(link);
-                                outputs.extend(self.send_to_links(bytes, &senders));
+                                if self.config.spray.enabled && incoming_copies.is_some() {
+                                    self.spray.observe(
+                                        now,
+                                        msg_id,
+                                        crate::PacketClass::Direct,
+                                        destination,
+                                        lifetime_s,
+                                        incoming_copies.unwrap_or(1),
+                                    );
+                                    let candidates: Vec<(LinkId, [u8; 16])> = self
+                                        .neighbors
+                                        .iter()
+                                        .filter_map(|neighbor| {
+                                            neighbor
+                                                .node_id
+                                                .map(|id| (neighbor.link, *id.as_bytes()))
+                                        })
+                                        .collect();
+                                    let plan = self.spray.plan(now, msg_id, Some(link), candidates);
+                                    for (next, give) in plan {
+                                        if let Some(payload) =
+                                            crate::spray::encode_frame(give, &bytes)
+                                        {
+                                            outputs.push(MeshOutput::Send {
+                                                link: next,
+                                                channel: Channel::Message,
+                                                payload,
+                                            });
+                                        }
+                                    }
+                                    outputs.push(MeshOutput::SyncItem {
+                                        id: msg_id,
+                                        wire: wire.clone(),
+                                        copies_left: self.spray.copies_left(msg_id),
+                                    });
+                                } else {
+                                    let mut senders = BTreeSet::new();
+                                    senders.insert(link);
+                                    outputs.extend(self.send_to_links(bytes, &senders));
+                                }
                             }
                             Action::Relay { .. } => {}
                         }
@@ -645,6 +739,51 @@ impl<R: RngCore> MeshEngine<R> {
                 let bytes = Packet::new(header, signature, payload)
                     .map_err(MeshError::Packet)?
                     .encode();
+                if header.class == crate::PacketClass::Direct && self.config.spray.enabled {
+                    self.spray.observe(
+                        now,
+                        header.msg_id,
+                        header.class,
+                        header.dst.unwrap_or([0; 16]),
+                        header.lifetime_s,
+                        self.config.spray.copies,
+                    );
+                    let candidates: Vec<(LinkId, [u8; 16])> = match via {
+                        Some(link) => self
+                            .neighbors
+                            .get(link)
+                            .and_then(|neighbor| neighbor.node_id)
+                            .map(|id| vec![(link, *id.as_bytes())])
+                            .unwrap_or_default(),
+                        None => self
+                            .neighbors
+                            .iter()
+                            .filter_map(|neighbor| {
+                                neighbor.node_id.map(|id| (neighbor.link, *id.as_bytes()))
+                            })
+                            .collect(),
+                    };
+                    let plan = self.spray.plan(now, header.msg_id, None, candidates);
+                    let mut outputs = Vec::new();
+                    for (link, give) in plan {
+                        let payload = if self.spray.supports(link) {
+                            match crate::spray::encode_frame(give, &bytes) {
+                                Some(payload) => payload,
+                                None => bytes.clone(),
+                            }
+                        } else {
+                            bytes.clone()
+                        };
+                        outputs.push(MeshOutput::Send {
+                            link,
+                            channel,
+                            payload,
+                        });
+                    }
+                    // The host submitted these bytes and already owns them;
+                    // only received copies need a store event.
+                    return Ok(outputs);
+                }
                 Ok(vec![match via {
                     Some(link) => MeshOutput::Send {
                         link,
@@ -665,6 +804,7 @@ impl<R: RngCore> MeshEngine<R> {
     /// cancel nothing but will be recognised as a duplicate.
     fn drain_due(&mut self, now: u64) -> Vec<MeshOutput> {
         let due = self.suppression.take_due(now);
+        self.spray.expire(now);
         let mut outputs = Vec::new();
         for entry in due {
             let _ = self.seen.check_and_insert(now, entry.class, entry.msg_id);
@@ -676,7 +816,7 @@ impl<R: RngCore> MeshEngine<R> {
     /// Translates sync state changes into host actions and Bulk sends.
     /// A frame that cannot fit the two-byte length field is simply not
     /// emitted; every tracker-produced frame is already bounded by config.
-    fn apply_sync_actions(&self, actions: Vec<SyncAction>) -> Vec<MeshOutput> {
+    fn apply_sync_actions(&mut self, now: u64, actions: Vec<SyncAction>) -> Vec<MeshOutput> {
         let mut outputs = Vec::new();
         for action in actions {
             match action {
@@ -699,9 +839,67 @@ impl<R: RngCore> MeshEngine<R> {
                     }
                 }
                 SyncAction::Need { link, prefixes } => {
-                    outputs.push(MeshOutput::SyncNeed { link, prefixes })
+                    let peer = self
+                        .neighbors
+                        .get(link)
+                        .and_then(|neighbor| neighbor.node_id)
+                        .map(|id| *id.as_bytes())
+                        .unwrap_or([0; 16]);
+                    let prefixes: Vec<_> = prefixes
+                        .into_iter()
+                        .filter(|prefix| {
+                            self.sync
+                                .local_id_for_prefix(*prefix)
+                                .is_none_or(|id| self.spray.can_sync(id, peer))
+                        })
+                        .collect();
+                    if !prefixes.is_empty() {
+                        outputs.push(MeshOutput::SyncNeed { link, prefixes });
+                    }
                 }
-                SyncAction::Item { id, wire } => outputs.push(MeshOutput::SyncItem { id, wire }),
+                SyncAction::Item {
+                    link,
+                    id,
+                    wire,
+                    copies_left,
+                } => {
+                    if self.config.spray.enabled && copies_left > 1 {
+                        if let Ok(header) = crate::Header::decode(&wire) {
+                            if header.class == crate::PacketClass::Direct {
+                                self.spray.observe(
+                                    now,
+                                    id,
+                                    header.class,
+                                    header.dst.unwrap_or([0; 16]),
+                                    header.lifetime_s,
+                                    copies_left,
+                                );
+                                let candidates: Vec<(LinkId, [u8; 16])> = self
+                                    .neighbors
+                                    .iter()
+                                    .filter_map(|neighbor| {
+                                        neighbor.node_id.map(|id| (neighbor.link, *id.as_bytes()))
+                                    })
+                                    .collect();
+                                for (next, give) in self.spray.plan(now, id, Some(link), candidates)
+                                {
+                                    if let Some(payload) = crate::spray::encode_frame(give, &wire) {
+                                        outputs.push(MeshOutput::Send {
+                                            link: next,
+                                            channel: Channel::Message,
+                                            payload,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    outputs.push(MeshOutput::SyncItem {
+                        id,
+                        wire,
+                        copies_left,
+                    });
+                }
                 SyncAction::Release { link } => {
                     outputs.push(MeshOutput::ReleaseOpportunistic { link })
                 }
