@@ -219,15 +219,26 @@ Published baseline (Rust stable, release profile, fixed seeds):
 | Scenario | Nodes | Seed | Delivered / submitted | Delivery ratio | Overhead | Mean / max latency (ms) | Radio bytes | Peak queued bytes |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | `line-20` | 20 | 1297303584 | 20 / 20 | 1.0000 | 9.6500 | 730 / 1200 | 102065 | 550 |
-| `waypoint-50` | 50 | 1297303632 | 29 / 50 | 0.5800 | 135.8966 | 506 / 1200 | 1537858 | 11394 |
-| `community-100` | 100 | 1297303652 | 74 / 80 | 0.9250 | 328.5541 | 713 / 1200 | 10917151 | 32814 |
-| `scripted-200` | 200 | 1297303752 | 100 / 100 | 1.0000 | 34.5500 | 561 / 1200 | 1536915 | 6600 |
+| `waypoint-50` | 50 | 1297303632 | 31 / 50 | 0.6200 | 125.7742 | 551 / 1200 | 2080893 | 12375 |
+| `community-100` | 100 | 1297303652 | 75 / 80 | 0.9375 | 328.7067 | 676 / 1200 | 13031341 | 33290 |
+| `scripted-200` | 200 | 1297303752 | 100 / 100 | 1.0000 | 34.5500 | 561 / 1200 | 1850727 | 6600 |
 
 `send_failures` and duplicate deliveries are zero in every scenario. The
 mobile scenarios are deliberately lossy under TTL 8: random-waypoint contacts
 leave some destinations farther than eight hops, which is the baseline later
 spray-and-wait and sync work must beat. The topology and metric choices are
 recorded in [the simulator baseline decision](docs/adr/simulator-baseline.md).
+
+These values were regenerated against aoNetwork `492e148c` (Net 25 flow
+control), which changed simulated link formation. Waypoint and community
+delivery improved, waypoint overhead fell, and community overhead rose slightly
+from 328.5541 to 328.7067 per delivery. The exact settled link counts moved
+from 182/424 to 180/412. Radio-byte accounting was also fixed: the harness now
+sums per-tick `tx_bytes` deltas per link instead of subtracting two snapshots
+of only the currently up links, so bytes sent on links that close during
+mobility are no longer lost. That is why the radio-byte figures are higher than
+the previous fixture; it is not a routing regression. Repeated debug and
+release runs produced identical metrics. No aoMesh routing code changed.
 
 ## Targets and evidence
 
