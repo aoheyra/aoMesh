@@ -153,17 +153,29 @@ impl SeenCache {
     #[must_use]
     pub fn check_and_insert(&mut self, now: u64, class: PacketClass, msg_id: MessageId) -> Offer {
         self.sweep(now);
-        if let Some(&expires_at) = self.entries.get(&msg_id) {
-            if expires_at > now {
-                return Offer::Duplicate;
-            }
-            // Expired: drop the stale record so the new recording below
-            // gets the full window. Its old order slot is reclaimed when
-            // the deque reaches it.
-            self.entries.remove(&msg_id);
+        if self.is_duplicate(now, &msg_id) {
+            return Offer::Duplicate;
         }
+        // Expired: drop the stale record so the new recording below
+        // gets the full window (a no-op when absent). Its old order
+        // slot is reclaimed when the deque reaches it.
+        self.entries.remove(&msg_id);
         self.record(now, class, msg_id);
         Offer::Fresh
+    }
+
+    /// Whether `msg_id` already has a fresh recording at `now`: a pure
+    /// read, with no sweep, no recording and no window change.
+    ///
+    /// The delivery path (MSH-09) checks this before it spends
+    /// cryptography, and the engine records only after its pipeline
+    /// accepts a delivery, so a forgery that fails authentication can
+    /// never consume the key the honest copy still needs.
+    #[must_use]
+    pub fn is_duplicate(&self, now: u64, msg_id: &MessageId) -> bool {
+        self.entries
+            .get(msg_id)
+            .is_some_and(|&expires_at| expires_at > now)
     }
 
     /// The number of recordings held, expired ones included until they
@@ -330,6 +342,30 @@ mod tests {
                 "{class:?}: end of the second window"
             );
         }
+    }
+
+    #[test]
+    fn is_duplicate_is_a_pure_freshness_read() {
+        let mut cache = SeenCache::default();
+        let msg_id = id(7);
+        assert!(!cache.is_duplicate(0, &msg_id));
+        assert_eq!(
+            cache.check_and_insert(0, PacketClass::Direct, msg_id),
+            Offer::Fresh
+        );
+        assert!(cache.is_duplicate(0, &msg_id));
+        // The read neither records nor extends: at the window's end the
+        // recording reads as gone while the entry is still held.
+        let expiry = 24 * 60 * 60 * 1_000;
+        assert!(!cache.is_duplicate(expiry, &msg_id));
+        assert_eq!(cache.len(), 1);
+        // Only an offer records again, and it sees the expired entry as
+        // absent rather than as a duplicate.
+        assert_eq!(
+            cache.check_and_insert(expiry, PacketClass::Direct, msg_id),
+            Offer::Fresh
+        );
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]

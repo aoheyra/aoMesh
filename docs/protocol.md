@@ -37,10 +37,9 @@ using aoIdents' context-separated sign/verify (IDN-04); both domains are
 registered in aoIdents ADR-0001. The policy: relays verify Broadcast and
 Presence always, Direct only while their CPU budget allows, and never
 Telemetry; the recipient always verifies a Direct packet addressed to it
-(`sign::verify_for_relay`, `sign::verify_origin`). MSH-04 ships those
-calls; none of them run yet, because MSH-08's baseline relay and delivery
-are deliberately structural. The recipient's check arrives with MSH-09,
-relay-side checks with the issues that build those paths (MSH-10, MSH-11).
+(`sign::verify_for_relay`, `sign::verify_origin`). MSH-04 ships the calls;
+MSH-09 runs the recipient's check for local delivery. Relay-side checks
+follow with the issues that build those paths (MSH-10, MSH-11).
 
 `msg_id` is a content address, in two domain-separated steps under
 `aoheyra/mesh/v1/msg-id`:
@@ -154,9 +153,47 @@ sending link with `ttl` decremented (hop limit: submitted `ttl` N reaches N
 hops, and the destination delivers regardless of a worn `ttl`) and `hops`
 incremented, saturating at 255. Classes other than Direct, senders without a
 verified `node_id` (ADR-0004) and content whose bytes no longer match its
-`msg_id` are counted and dropped. A valid codec result is still never a
-trust decision: this path verifies no origin signature, and MSH-09
-authenticates local delivery. Link-up authentication is MSH-07 (above).
+`msg_id` are counted and dropped. A forged content address is additionally
+counted as a rejection on the sending link. The relay path itself verifies
+no origin signature; local delivery is authenticated by MSH-09 below and
+relay-side verification follows with MSH-10/MSH-11. Link-up authentication
+is MSH-07 (above).
+
+## Authenticated local delivery (MSH-09)
+
+A Direct packet whose `dst` names the receiving node is only a candidate.
+Its payload must be an aoIdents `SealedMessage` (IDN-09) addressed to the
+receiving node. The sender seals the plaintext to the recipient's public
+identity under associated data `derive_msg_id(header, &[])` - the immutable
+header content address with `msg_id` zeroed by the derivation. The seal's
+encoded length does not depend on the associated data, so the sender sets
+`header.payload_len` before the real seal and then signs with `sign_packet`,
+which stamps `origin` and the ciphertext-derived `msg_id`. This binding is
+not circular: `msg_id` is authenticated separately by the origin signature
+over the header and the seal's hash. Decision record:
+[ADR-0005](adr/0005-local-delivery-pipeline.md).
+
+`MeshInput::Data` borrows the local `Identity` for this call; the engine
+never retains a key. The recipient then:
+
+1. decodes the bounded seal;
+2. opens it under that content-address binding, which authenticates the
+   plaintext and the sender's public identity;
+3. derives the sender's `NodeId` from the seal and requires it to equal
+   `header.origin`;
+4. verifies the origin signature and re-derives `msg_id`;
+5. accepts `(origin, msg_id, created_ms, now)` through aoIdents'
+   `ReplayGuard` (IDN-14), configured with a 1024-id window per sender,
+   a 24-hour timestamp tolerance and 64 senders.
+
+Only then is `MeshOutput::Deliver` emitted, with the **opened plaintext**.
+The header is unchanged, so its `payload_len` still counts sealed wire
+bytes. A tampered seal, a seal for another recipient, a forged sender, a
+broken signature, a claimed id the content does not produce or a replayed
+or stale timestamp produces no delivery and increments
+`Neighbor::rejected_packets` on the sending link. The seen-cache records a
+delivery only after acceptance; relays are recorded before forwarding to
+keep their loop invariant.
 
 ## Local storage metadata
 
