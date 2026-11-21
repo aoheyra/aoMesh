@@ -352,6 +352,48 @@ carry the same count in `SprayItem`, so a stored copy received through
 MSH-14/15 can continue spraying on a later contact. The host persists the count
 as `StoreMetadata::copies_left`; the engine keeps at most 4096 live tickets.
 
+## Signed delivery receipts (MSH-17)
+
+`MeshHello` adds `CAP_RECEIPT_V1` (`1 << 3`). The packet header, signature
+coverage and class set do not change. A successful authenticated delivery emits
+a control envelope on the Message channel with this fixed header:
+
+| Bytes | Field |
+|---|---|
+| 1 | Magic `0x55` |
+| 1 | Version `1` |
+| 1 | Tag `1` (Ack) |
+| 1 | Flags, currently zero |
+| 2 | Little-endian encoded original-header length |
+| 2 | Little-endian encoded acknowledgement-packet length |
+| 32 | Destination signing public key |
+| 32 | Destination agreement public key |
+| 64 | Agreement-key binding signature |
+
+The variable part is the original encoded header (including hop-mutable
+`ttl`/`hops`), a 32-byte payload hash in the same domain as `msg_id`, and the
+complete encoded acknowledgement packet. The acknowledgement is an ordinary
+Direct packet addressed to the original origin whose payload is the original
+`MessageId`, signed under the registered `aoheyra/mesh/v1/packet` domain. The
+decoder reads both lengths before allocating, rejects unknown versions, tags,
+non-zero flags, bad lengths and trailing bytes, and parses the original header
+before any signature work.
+
+Verification is self-contained: `verify_binding` and `compute_node_id` prove the
+attached public identity owns the original destination; re-deriving the id from
+the original header and payload hash proves the acknowledged id belongs to that
+destination; `verify_origin` checks the acknowledgement under the existing
+packet domain. No key directory and no new crypto domain are required. A stray
+receipt on a link without the capability, or one that fails verification, is
+attributable invalid traffic and feeds the neighbour penalty.
+
+An accepted receipt produces `MeshOutput::Purge { id }` for the host store and
+`MeshOutput::Delivered { id, origin, by }` at the origin. It also inserts a
+bounded immunity entry (512 ids, 300 seconds, 16 frames per contact burst).
+Immune ids are never relayed, re-stored or served from sync. This is distinct
+from aoIdents' recipient-side replay guard and from the engine's forwarding
+dedupe cache.
+
 ## Simulation evidence (MSH-27)
 
 No wire format changes. Feature `sim` drives the codec and engine over aoNetwork's

@@ -7,6 +7,15 @@ change without notice until v0.1.0, and consumers pin by git tag
 
 ## Unreleased
 
+MSH-17 adds signed delivery receipts and bounded store immunity. An
+authenticated delivery emits a cap-gated receipt envelope carrying a signed
+Direct acknowledgement, the destination's public identity and the original
+header/hash, so any relay can prove the acker without a directory. Accepted
+receipts purge host-store copies, stop spray and sync of the id, and report
+`Delivered` to the origin. The fixed-seed report purges all 206 line-20 copies
+in 1,550 ms and all 1,341 scripted-200 copies in 1,750 ms, with the ablations
+retaining their copies.
+
 MSH-16 adds binary spray-and-wait for Direct traffic. Packets keep their signed
 header; a six-byte capability-negotiated envelope carries a remaining-copy
 ticket on the Message channel. Peers without `CAP_SPRAY_V1` receive the raw

@@ -41,6 +41,20 @@ pub enum AdapterEvent {
         /// Prefixes the peer is missing.
         prefixes: Vec<[u8; crate::sync::SHORT_ID_BYTES]>,
     },
+    /// The host store must remove this delivered message (MSH-17).
+    Purge {
+        /// Content address whose copies are no longer needed.
+        id: crate::MessageId,
+    },
+    /// An authenticated receipt reached its sender (MSH-17).
+    Delivered {
+        /// The acknowledged message.
+        id: crate::MessageId,
+        /// Original sender from the acknowledged packet.
+        origin: [u8; 16],
+        /// Authenticated destination that issued the receipt.
+        by: [u8; 16],
+    },
     /// A peer's item is ready for the store owner to validate and insert.
     SyncItem {
         /// Full content address parsed from the packet.
@@ -148,6 +162,10 @@ impl<R: RngCore, T: Transport> NetworkAdapter<R, T> {
                 }),
                 MeshOutput::Deliver { header, payload } => {
                     events.push(AdapterEvent::Deliver { header, payload })
+                }
+                MeshOutput::Purge { id } => events.push(AdapterEvent::Purge { id }),
+                MeshOutput::Delivered { id, origin, by } => {
+                    events.push(AdapterEvent::Delivered { id, origin, by })
                 }
             }
         }

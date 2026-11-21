@@ -2,7 +2,7 @@
 
 **The routing and store-and-forward engine of the aoheyra mesh.** A sans-IO Rust crate that decides what happens to a packet: forward it, hold it, suppress it, deliver it, or drop it, across a phone-to-phone mesh where links come and go.
 
-> **Status: pre-alpha, through MSH-16.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest, bounded anti-entropy sync, range-based reconciliation on meeting links and binary spray-and-wait for Direct traffic are implemented.
+> **Status: pre-alpha, through MSH-17.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest, bounded anti-entropy sync, range-based reconciliation on meeting links, binary spray-and-wait for Direct traffic, and signed delivery receipts with bounded store purging are implemented.
 
 Cargo package name: `ao_mesh`.
 
@@ -47,7 +47,7 @@ aoMesh consumes **aoNetwork** (links and frames) and **aoIdents** (signatures, s
 
 | Class | Strategy | Storage | Notes |
 |---|---|---|---|
-| **Direct** (1:1) | Spray-and-wait (binary spray, default `L = 8` copies) plus reverse-path hints | Stored; default lifetime ~48 h | Highest relay priority; receipt and immunity purge copies |
+| **Direct** (1:1) | Spray-and-wait (binary spray, default `L = 255` copies) plus reverse-path hints | Stored; default lifetime ~48 h | Highest relay priority; signed receipt and immunity purge copies |
 | **Broadcast / channels** | Counter-based suppression, random assessment delay, per-class TTL | Short | Main flood-prevention mechanism |
 | **Presence** | Trickle-timed gossip, short TTL, latest-wins by `seq` | Not stored long (~10 min) | Interval backs off when nothing changes |
 | **Telemetry** (location) | Latest-wins, hop limit ~3, per-origin rate cap | **Never stored**; ~30 s | Coalesced in aoNetwork via `coalesce_key` |
@@ -78,7 +78,7 @@ Lifetimes, TTLs, copy counts and budgets are **defaults with documented reasons*
    aoNetwork  (NetworkEvent in, actions out)      aoIdents (sign, open, replay)
 ```
 
-**Engine inputs:** `LinkUp`, `LinkDown`, `Data`, `Tick`, `Submit`, `StoreSummary`, `SyncItems`. **Outputs:** `Send`, `Broadcast`, `Release`, `Deliver`, `SetHello`, `SetBeacon`, `SyncNeed`, `SyncItem`, `ReleaseOpportunistic`.
+**Engine inputs:** `LinkUp`, `LinkDown`, `Data`, `Tick`, `Submit`, `StoreSummary`, `SyncItems`. **Outputs:** `Send`, `Broadcast`, `Release`, `Deliver`, `SetHello`, `SetBeacon`, `SyncNeed`, `SyncItem`, `ReleaseOpportunistic`, `Purge`, `Delivered`.
 
 ### Engine and adapter (MSH-06)
 
@@ -535,3 +535,52 @@ The scripted-200 case keeps 99 percent delivery while using 48 percent fewer
 transmissions. `tests/spray.rs` covers envelope bounds, the binary split, the
 destination shortcut, wait-phase delivery, tracker eviction and capability
 fallback; `tests/sim_spray.rs` locks the fixed-seed numbers.
+
+## Signed delivery receipts and immunity (MSH-17)
+
+A successful authenticated delivery emits a signed receipt on the Message
+channel. The receipt is a cap-gated control envelope, not a fifth packet class:
+magic `0x55`, version `1`, tag `1`, flags `0`, two little-endian lengths, the
+destination's 128-byte public identity, the original encoded header, the
+original payload hash and a normal signed Direct packet whose payload is the
+acknowledged `MessageId`. The ack uses the already registered
+`aoheyra/mesh/v1/packet` domain, so no sibling crypto domain or key directory is
+needed. Peers advertise `CAP_RECEIPT_V1` (`1 << 3`); a link without it receives
+no receipt and never parses the envelope.
+
+The engine verifies the binding signature, derives the signer's `NodeId`,
+re-derives the acknowledged id from the original header and payload hash,
+checks that the signer is the packet's destination and verifies the ack
+signature. Accepted receipts enter a bounded immunity list (512 ids, five
+minutes), suppress further spray or sync of that id, and produce a `Purge`
+output for the host store. The sender receives one `Delivered` output, which is
+the origin's sender-status transition. The host owns the bytes; the engine never
+holds keys, payloads or a store handle.
+
+A late spray copy is dropped rather than re-stored once its id is immune. This
+was the root cause of residual copies in the first scripted-200 run: four nodes
+had purged, then re-stored a copy from an older spray ticket.
+
+| Setting | Default | Why |
+|---|---|---|
+| Immunity entries | 512 | Bounds receipt bytes and per-link sent sets |
+| Immunity lifetime | 300 s | Outlives a contact and its later re-sync |
+| Gossip per contact | 16 frames | Bounds a link-up burst; further entries follow later contacts |
+
+The paired report uses spray in both rows so the stores are populated, and only
+the receipt bit differs:
+
+| Scenario | Seed | Delivered | Receipts at origin | Purges | Copies left | Slowest purge |
+|---|---:|---:|---:|---:|---:|---:|
+| `receipt-relay-line-20` | 1297303584 | 20 / 20 | 0 | 0 | 206 | n/a |
+| `receipt-enabled-line-20` | 1297303584 | 20 / 20 | 20 | 206 | 0 | 1,550 ms |
+| `receipt-relay-scripted-200` | 1297303752 | 100 / 100 | 0 | 0 | 1,436 | n/a |
+| `receipt-enabled-scripted-200` | 1297303752 | 100 / 100 | 100 | 1,341 | 0 | 1,750 ms |
+
+```bash
+cargo run --release --all-features --example receipt_report
+cargo test --release --all-features --test sim_receipts
+```
+
+`tests/receipts.rs` covers the two-node pipeline; `tests/sim_receipts.rs` locks
+the fixed-seed numbers and requires zero delivered copies at every node.
