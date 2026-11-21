@@ -28,7 +28,8 @@ use crate::{
     CAP_PRESENCE_V1, CAP_RECEIPT_V1, CAP_SYNC_V1, CAPS, DirectoryChange, Header, MeshConfig,
     MeshEngine, MeshHello, MeshInput, MeshOutput, MessageId, NetworkAdapter, Packet, PacketClass,
     PresenceConfig, RouteHintMode, SHORT_ID_BYTES, SYNC_MAGIC, SYNC_V2_VERSION, StoreSummary,
-    SuppressionConfig, SyncOffer, derive_msg_id, sign_packet,
+    SuppressionConfig, SyncOffer, TelemetryConfig, TelemetryFrame, TelemetryKind, derive_msg_id,
+    sign_packet,
 };
 use ao_idents::{Identity, NodeId, SealedMessage};
 use ao_network::{
@@ -52,6 +53,9 @@ const RADIUS: i64 = 100;
 /// MSH-21 paired report. These are host facts, not mesh packets; verified
 /// presence announcements feed the same seam automatically in other scenarios.
 const HINT_REFRESH: Duration = Duration::from_secs(5);
+
+type TelemetryStream = ([u8; 16], TelemetryKind);
+type TelemetrySeqs = BTreeMap<TelemetryStream, BTreeSet<u64>>;
 
 /// Where nodes start and which pairs are in radio range.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,6 +154,18 @@ pub enum Traffic {
     ///
     /// This isolates presence convergence and overhead from message delivery.
     Presence,
+    /// Submit latest-wins Telemetry updates through the typed MSH-22 path.
+    Telemetry {
+        /// Node index of the origin.
+        origin: usize,
+        /// Opaque stream tag, passed through unchanged.
+        kind: u8,
+        /// Submit every update at once instead of staggering it.
+        ///
+        /// The burst is what makes a send queue the bottleneck: NET-21's
+        /// coalescing key must leave one pending update for the stream.
+        burst: bool,
+    },
 }
 
 /// Host-side directory observation schedule for one scenario (MSH-20).
@@ -224,6 +240,8 @@ pub struct Scenario {
     pub presence_config: PresenceConfig,
     /// Optional directory observation schedule (MSH-20).
     pub directory: Option<DirectoryPlan>,
+    /// Telemetry freshness, throttle and state bounds under test (MSH-22).
+    pub telemetry: TelemetryConfig,
 }
 
 /// Everything one run measured. Ratios are fractions, not percentages.
@@ -281,6 +299,23 @@ pub struct Metrics {
     ///
     /// Not part of the CSV report.
     pub unique_receptions: u64,
+    /// Typed Telemetry submissions attempted in this scenario (MSH-22).
+    pub telemetry_attempts: u64,
+    /// Telemetry submissions the origin's throttle accepted.
+    pub telemetry_accepted: u64,
+    /// Telemetry submissions refused by the typed policy.
+    pub telemetry_rejected: u64,
+    /// Structurally valid Telemetry packets received at mesh nodes.
+    pub telemetry_receptions: u64,
+    /// Distinct sequences observed per `(origin, kind)`, summed over nodes.
+    pub telemetry_distinct_seqs: u64,
+    /// Most sequences any one node observed for one stream.
+    ///
+    /// With an in-flight first frame, a value of two proves at most one
+    /// further update stayed pending per coalescing key.
+    pub telemetry_max_seqs_per_node: u64,
+    /// Highest Telemetry sequence observed anywhere in the scenario.
+    pub telemetry_max_seq: u64,
     /// Store evictions caused by authenticated delivery receipts.
     ///
     /// Not part of the CSV report; MSH-17 uses it with `remaining_copies`.
@@ -404,6 +439,29 @@ impl Metrics {
             self.steady_announcement_bytes,
         )
     }
+    /// Telemetry-specific columns, outside the published MSH-27 schema.
+    pub fn telemetry_csv_header() -> &'static str {
+        "scenario,seed,nodes,telemetry_attempts,telemetry_accepted,telemetry_rejected,telemetry_receptions,telemetry_distinct_seqs,telemetry_max_seqs_per_node,telemetry_max_seq,transmissions,radio_bytes"
+    }
+    /// One MSH-22 row. Receptions and distinct sequences are the observable
+    /// proof that only one pending update survived a slow send queue.
+    pub fn telemetry_csv_row(&self) -> String {
+        format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{}",
+            self.scenario,
+            self.seed,
+            self.nodes,
+            self.telemetry_attempts,
+            self.telemetry_accepted,
+            self.telemetry_rejected,
+            self.telemetry_receptions,
+            self.telemetry_distinct_seqs,
+            self.telemetry_max_seqs_per_node,
+            self.telemetry_max_seq,
+            self.transmissions,
+            self.radio_bytes,
+        )
+    }
 }
 
 /// The fixed cases CI runs. Sizes span 20 to 200 nodes and cover static,
@@ -430,6 +488,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             presence: false,
             presence_config: PresenceConfig::default(),
             directory: None,
+            telemetry: TelemetryConfig::default(),
         },
         Scenario {
             name: "waypoint-50",
@@ -453,6 +512,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             presence: false,
             presence_config: PresenceConfig::default(),
             directory: None,
+            telemetry: TelemetryConfig::default(),
         },
         Scenario {
             name: "community-100",
@@ -476,6 +536,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             presence: false,
             presence_config: PresenceConfig::default(),
             directory: None,
+            telemetry: TelemetryConfig::default(),
         },
         Scenario {
             name: "scripted-200",
@@ -497,6 +558,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             presence: false,
             presence_config: PresenceConfig::default(),
             directory: None,
+            telemetry: TelemetryConfig::default(),
         },
     ]
 }
@@ -533,6 +595,7 @@ pub fn flood_scenarios() -> Vec<Scenario> {
         presence: false,
         presence_config: PresenceConfig::default(),
         directory: None,
+        telemetry: TelemetryConfig::default(),
     }]
 }
 
@@ -568,6 +631,7 @@ pub fn suppression_scenarios() -> Vec<Scenario> {
         presence: false,
         presence_config: PresenceConfig::default(),
         directory: None,
+        telemetry: TelemetryConfig::default(),
     }]
 }
 
@@ -597,6 +661,7 @@ pub fn spray_scenarios() -> Vec<Scenario> {
         presence: false,
         presence_config: PresenceConfig::default(),
         directory: None,
+        telemetry: TelemetryConfig::default(),
     };
     let scripted = Scenario {
         name: "spray-relay-scripted-200",
@@ -618,6 +683,7 @@ pub fn spray_scenarios() -> Vec<Scenario> {
         presence: false,
         presence_config: PresenceConfig::default(),
         directory: None,
+        telemetry: TelemetryConfig::default(),
     };
     vec![
         line.clone(),
@@ -663,6 +729,7 @@ pub fn receipt_scenarios() -> Vec<Scenario> {
         presence: false,
         presence_config: PresenceConfig::default(),
         directory: None,
+        telemetry: TelemetryConfig::default(),
     };
     let scripted = Scenario {
         name: "receipt-relay-scripted-200",
@@ -684,6 +751,7 @@ pub fn receipt_scenarios() -> Vec<Scenario> {
         presence: false,
         presence_config: PresenceConfig::default(),
         directory: None,
+        telemetry: TelemetryConfig::default(),
     };
     vec![
         line.clone(),
@@ -741,7 +809,74 @@ pub fn presence_scenarios() -> Vec<Scenario> {
             ..PresenceConfig::default()
         },
         directory: None,
+        telemetry: TelemetryConfig::default(),
     }]
+}
+
+/// MSH-22's paired Telemetry cases.
+///
+/// The slow-line row bursts eight updates from one origin before the radio
+/// gets a tick. NET-21 must coalesce them to one pending frame per key, so
+/// every receiver observes only the newest sequence. The chatty row uses the
+/// default per-origin interval; eleven of its twelve attempts must be
+/// rejected locally before they ever reach a queue.
+pub fn telemetry_scenarios() -> Vec<Scenario> {
+    let slow = Scenario {
+        name: "telemetry-slow-line-5",
+        seed: 1_297_304_023,
+        nodes: 5,
+        topology: Topology::Line,
+        mobility: Mobility::Static,
+        settle: Duration::from_secs(30),
+        run: Duration::from_secs(5),
+        messages: 8,
+        payload_len: 64,
+        traffic: Traffic::Telemetry {
+            origin: 0,
+            kind: 7,
+            burst: true,
+        },
+        enforce_budgets: true,
+        enforce_suppression: true,
+        spray: false,
+        receipts: false,
+        route_hint: RouteHintMode::Off,
+        suppression: SuppressionConfig::default(),
+        presence: false,
+        presence_config: PresenceConfig::default(),
+        directory: None,
+        telemetry: TelemetryConfig {
+            rate_limit_ms: 0,
+            ..TelemetryConfig::default()
+        },
+    };
+    let chatty = Scenario {
+        name: "telemetry-chatty-random-20",
+        seed: 1_297_304_029,
+        nodes: 20,
+        topology: Topology::Random,
+        mobility: Mobility::Static,
+        settle: Duration::from_secs(30),
+        run: Duration::from_secs(8),
+        messages: 12,
+        payload_len: 64,
+        traffic: Traffic::Telemetry {
+            origin: 0,
+            kind: 7,
+            burst: false,
+        },
+        enforce_budgets: true,
+        enforce_suppression: true,
+        spray: false,
+        receipts: false,
+        route_hint: RouteHintMode::Off,
+        suppression: SuppressionConfig::default(),
+        presence: false,
+        presence_config: PresenceConfig::default(),
+        directory: None,
+        telemetry: TelemetryConfig::default(),
+    };
+    vec![slow, chatty]
 }
 
 /// MSH-20's fixed directory case: a small static line whose nodes announce
@@ -782,6 +917,7 @@ pub fn directory_scenarios() -> Vec<Scenario> {
             announcements: 8,
             observed_skew_ms: 5_000,
         }),
+        telemetry: TelemetryConfig::default(),
     }]
 }
 
@@ -813,6 +949,7 @@ pub fn route_hint_scenarios() -> Vec<Scenario> {
         presence: false,
         presence_config: PresenceConfig::default(),
         directory: None,
+        telemetry: TelemetryConfig::default(),
     };
     let random = Scenario {
         name: "hint-spray-random-20",
@@ -834,6 +971,7 @@ pub fn route_hint_scenarios() -> Vec<Scenario> {
         presence: false,
         presence_config: PresenceConfig::default(),
         directory: None,
+        telemetry: TelemetryConfig::default(),
     };
     vec![
         line.clone(),
@@ -929,6 +1067,11 @@ pub struct Simulation {
     delivered_ids: Vec<BTreeSet<MessageId>>,
     delivered_by_origin: Vec<u64>,
     received_ids: Vec<BTreeSet<MessageId>>,
+    telemetry_attempts: u64,
+    telemetry_accepted: u64,
+    telemetry_rejected: u64,
+    telemetry_receptions: u64,
+    telemetry_seqs: Vec<TelemetrySeqs>,
     origin_index: BTreeMap<[u8; 16], usize>,
     links_after_settle: usize,
     receipts: u64,
@@ -1012,6 +1155,7 @@ impl Simulation {
                 enabled: scenario.enforce_suppression,
                 ..scenario.suppression
             };
+            engine_config.telemetry = scenario.telemetry;
             let engine = MeshEngine::with_config(engine_rng, engine_config);
             // Baseline nodes have empty stores. The hello and beacon must
             // advertise the engine's actual digest, otherwise every link
@@ -1176,6 +1320,11 @@ impl Simulation {
             delivered_ids,
             delivered_by_origin: vec![0; n],
             received_ids: vec![BTreeSet::new(); n],
+            telemetry_attempts: 0,
+            telemetry_accepted: 0,
+            telemetry_rejected: 0,
+            telemetry_receptions: 0,
+            telemetry_seqs: vec![BTreeMap::new(); n],
             origin_index,
             links_after_settle: 0,
             receipts: 0,
@@ -1447,13 +1596,13 @@ impl Simulation {
                         Poll::Pending => break,
                         Poll::Ready(event) => event,
                     };
-                    let (input, received_id) = match &event {
+                    let (input, observed) = match &event {
                         NetworkEvent::LinkUp { link, remote_hello } => (
                             MeshInput::LinkUp {
                                 link: *link,
                                 remote_hello: remote_hello.clone(),
                             },
-                            None,
+                            (None, None),
                         ),
                         NetworkEvent::LinkDown { link, reason } => {
                             self.pending[i].remove(link);
@@ -1463,7 +1612,7 @@ impl Simulation {
                                     link: *link,
                                     reason: *reason,
                                 },
-                                None,
+                                (None, None),
                             )
                         }
                         NetworkEvent::Data {
@@ -1474,15 +1623,29 @@ impl Simulation {
                             // Broadcast has no Deliver event yet. Count a
                             // structurally valid flooded packet as a unique
                             // reception at this node, once per content id.
-                            let received_id = crate::Packet::decode(payload)
-                                .ok()
-                                .filter(|packet| {
-                                    matches!(
-                                        packet.header.class,
-                                        PacketClass::Broadcast | PacketClass::Presence
-                                    )
-                                })
-                                .map(|packet| packet.header.msg_id);
+                            // Telemetry has no Deliver either; its framed
+                            // sequence is the only observable coalescing
+                            // result at a receiver.
+                            let observed =
+                                crate::Packet::decode(payload)
+                                    .ok()
+                                    .and_then(|packet| match packet.header.class {
+                                        PacketClass::Broadcast | PacketClass::Presence => {
+                                            Some((Some(packet.header.msg_id), None))
+                                        }
+                                        PacketClass::Telemetry => TelemetryFrame::decode(
+                                            packet.payload,
+                                        )
+                                        .ok()
+                                        .map(|frame| {
+                                            (
+                                                None,
+                                                Some((packet.header.origin, frame.kind, frame.seq)),
+                                            )
+                                        }),
+                                        PacketClass::Direct => None,
+                                    });
+                            let (received_id, telemetry) = observed.unwrap_or((None, None));
                             (
                                 MeshInput::Data {
                                     link: *link,
@@ -1490,13 +1653,19 @@ impl Simulation {
                                     payload,
                                     identity: &self.identities[i],
                                 },
-                                received_id,
+                                (received_id, telemetry),
                             )
                         }
                         _ => continue,
                     };
+                    let (received_id, telemetry) = observed;
                     if let Some(id) = received_id {
                         self.received_ids[i].insert(id);
+                    }
+                    if let Some((origin, kind, seq)) = telemetry {
+                        self.telemetry_receptions += 1;
+                        let streams = self.telemetry_seqs[i].entry((origin, kind)).or_default();
+                        streams.insert(seq);
                     }
                     let outputs = self.nodes[i]
                         .adapter
@@ -1658,6 +1827,17 @@ impl Simulation {
                     }
                 }
                 MeshOutput::Broadcast { payload, .. } => {
+                    let links = self.nodes[node].adapter.network().links();
+                    self.transmissions += links.len() as u64;
+                    for info in links {
+                        *self.pending[node].entry(info.link).or_insert(0) += payload.len() as u64;
+                    }
+                }
+                MeshOutput::TelemetrySend { link, payload, .. } => {
+                    self.transmissions += 1;
+                    *self.pending[node].entry(*link).or_insert(0) += payload.len() as u64;
+                }
+                MeshOutput::TelemetryBroadcast { payload, .. } => {
                     let links = self.nodes[node].adapter.network().links();
                     self.transmissions += links.len() as u64;
                     for info in links {
@@ -1886,6 +2066,44 @@ impl Simulation {
     /// affect delivery instead of finishing before the first contact changes.
     fn submit_one(&mut self, m: usize) {
         let n = self.nodes.len();
+        if let Traffic::Telemetry {
+            origin: source,
+            kind,
+            ..
+        } = self.scenario.traffic
+        {
+            let origin = source.min(n - 1);
+            let now_ms = self.world.now().as_millis() as u64;
+            let payload = vec![(m % 251) as u8; self.scenario.payload_len];
+            self.telemetry_attempts += 1;
+            self.submitted += 1;
+            match self.nodes[origin].adapter.engine_mut().handle(
+                now_ms,
+                MeshInput::SubmitTelemetry {
+                    identity: &self.identities[origin],
+                    kind: TelemetryKind::new(kind),
+                    seq: m as u64 + 1,
+                    payload: &payload,
+                    via: None,
+                },
+            ) {
+                Ok(outputs) => {
+                    self.telemetry_accepted += 1;
+                    self.count_outputs(origin, now_ms, &outputs);
+                    self.service_stores(origin, self.world.now(), now_ms, outputs.clone());
+                    let events = self.nodes[origin].adapter.apply(self.world.now(), outputs);
+                    for event in events {
+                        if let crate::AdapterEvent::SendFailed { .. } = event {
+                            self.send_failures += 1;
+                        }
+                    }
+                }
+                // A throttled submission is a policy result, not a simulator
+                // failure. It must never reach a radio queue.
+                Err(_) => self.telemetry_rejected += 1,
+            }
+            return;
+        }
         let (origin, broadcast) = match self.scenario.traffic {
             Traffic::Balanced => (m % n, false),
             Traffic::Flood {
@@ -1916,6 +2134,9 @@ impl Simulation {
             // unreachable for the fixed scenario. Returning keeps the harness
             // total without a panic on a misconfigured scenario.
             Traffic::Presence => return,
+            // The typed path returned above; this keeps the match total
+            // without a simulator-only panic.
+            Traffic::Telemetry { origin, .. } => (origin.min(n - 1), false),
         };
         // Destinations stay inside the packet's eight-hop TTL so the
         // baseline measures forwarding, not expiry at an impossible
@@ -2024,8 +2245,21 @@ impl Simulation {
         // Keep the last fifth of the run free so the final message can
         // propagate; otherwise the last submission is cut off at the clock.
         let submit_steps = (steps * 4 / 5).max(1);
+        let burst_telemetry = matches!(
+            self.scenario.traffic,
+            Traffic::Telemetry { burst: true, .. }
+        );
         for step in 0..steps {
-            if step < submit_steps {
+            if burst_telemetry {
+                // All updates are accepted into the send queue before the
+                // radio gets a tick, which is the slow-link case NET-21
+                // coalescing exists to handle.
+                if step == 0 {
+                    while (self.submitted as usize) < self.scenario.messages {
+                        self.submit_one(self.submitted as usize);
+                    }
+                }
+            } else if step < submit_steps {
                 let target = (step + 1) * self.scenario.messages / submit_steps;
                 while (self.submitted as usize) < target {
                     self.submit_one(self.submitted as usize);
@@ -2071,6 +2305,26 @@ impl Simulation {
         } else {
             self.fresh_latencies.iter().sum::<u64>() / self.fresh_latencies.len() as u64
         };
+        let telemetry_distinct_seqs = self
+            .telemetry_seqs
+            .iter()
+            .flat_map(|streams| streams.values())
+            .map(BTreeSet::len)
+            .sum::<usize>() as u64;
+        let telemetry_max_seqs_per_node = self
+            .telemetry_seqs
+            .iter()
+            .map(|streams| streams.values().map(BTreeSet::len).sum::<usize>())
+            .max()
+            .unwrap_or(0) as u64;
+        let telemetry_max_seq = self
+            .telemetry_seqs
+            .iter()
+            .flat_map(|streams| streams.values())
+            .flat_map(BTreeSet::iter)
+            .copied()
+            .max()
+            .unwrap_or(0);
         Metrics {
             scenario: self.scenario.name,
             seed: self.scenario.seed,
@@ -2155,6 +2409,13 @@ impl Simulation {
             announcement_bytes: self.announcement_bytes,
             steady_announcement_sends: self.steady_announcement_sends,
             steady_announcement_bytes: self.steady_announcement_bytes,
+            telemetry_attempts: self.telemetry_attempts,
+            telemetry_accepted: self.telemetry_accepted,
+            telemetry_rejected: self.telemetry_rejected,
+            telemetry_receptions: self.telemetry_receptions,
+            telemetry_distinct_seqs,
+            telemetry_max_seqs_per_node,
+            telemetry_max_seq,
         }
     }
 }
@@ -2607,6 +2868,13 @@ mod tests {
             delivered_by_origin: vec![1, 1],
             unique_receptions_by_node: vec![2, 2],
             unique_receptions: 4,
+            telemetry_attempts: 0,
+            telemetry_accepted: 0,
+            telemetry_rejected: 0,
+            telemetry_receptions: 0,
+            telemetry_distinct_seqs: 0,
+            telemetry_max_seqs_per_node: 0,
+            telemetry_max_seq: 0,
             purges: 2,
             delivery_receipts: 1,
             remaining_copies: 0,

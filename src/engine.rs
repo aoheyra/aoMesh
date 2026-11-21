@@ -14,6 +14,7 @@ use crate::sync::{
     BeaconTracker, SHORT_ID_BYTES, StoreSummary, SyncAction, SyncFrame, SyncFrameV2, SyncOffer,
     SyncTracker,
 };
+use crate::telemetry::{TelemetryAdvisory, TelemetryFrame, TelemetryTracker};
 use crate::{Header, MessageId, Packet, PacketError, sign_packet};
 use ao_idents::{IdentError, Identity, NodeId, ReplayGuard, Signature};
 use ao_network::{AppHello, BeaconFlags, Channel, DisconnectReason, Hello, LinkId, LocalTag};
@@ -109,6 +110,24 @@ pub enum MeshInput<'a> {
         /// A selected neighbour, or all current neighbours.
         via: Option<LinkId>,
     },
+    /// Originate one latest-wins Telemetry update (MSH-22).
+    ///
+    /// The engine frames the opaque payload with `kind` and a monotonic
+    /// `seq`, signs it with the existing Telemetry class and returns an
+    /// advisory for NET-21 coalescing. Unlike low-level [`Self::Submit`],
+    /// this path applies the per-origin throttle and freshness policy.
+    SubmitTelemetry {
+        /// Borrowed only for this signing call; the engine retains no keys.
+        identity: &'a Identity,
+        /// Opaque latest-wins stream tag; the mesh does not interpret it.
+        kind: crate::telemetry::TelemetryKind,
+        /// Sender-monotonic sequence; a relay drops anything not newer.
+        seq: u64,
+        /// Opaque application bytes, framed unchanged behind the kind/seq.
+        payload: &'a [u8],
+        /// A selected neighbour, or all current neighbours.
+        via: Option<LinkId>,
+    },
 }
 
 /// Actions for the host. The MSH-08 baseline emits `Send` relays;
@@ -131,6 +150,29 @@ pub enum MeshOutput {
         channel: Channel,
         /// Complete encoded packet.
         payload: Vec<u8>,
+    },
+    /// Queue one Telemetry update on one link under a NET-21 coalesce key.
+    ///
+    /// The advisory is a bounded policy statement, not a radio command: the
+    /// adapter hands it to aoNetwork's real send-queue options.
+    TelemetrySend {
+        /// Destination link.
+        link: LinkId,
+        /// Always [`Channel::Telemetry`].
+        channel: Channel,
+        /// Complete encoded packet.
+        payload: Vec<u8>,
+        /// Coalescing key, freshness and hop policy for this update.
+        advisory: TelemetryAdvisory,
+    },
+    /// Queue one Telemetry update on every up link under one coalesce key.
+    TelemetryBroadcast {
+        /// Always [`Channel::Telemetry`].
+        channel: Channel,
+        /// Complete encoded packet.
+        payload: Vec<u8>,
+        /// Coalescing key, freshness and hop policy for this update.
+        advisory: TelemetryAdvisory,
     },
     /// Release a refused or penalised neighbour through the network facade.
     /// A budget penalty uses `DisconnectReason::AbuseDetected`; aoNetwork
@@ -246,6 +288,8 @@ pub enum MeshError {
     Presence(PresenceError),
     /// A directory observation violated its configured bounds.
     Directory(DirectoryError),
+    /// A Telemetry policy or framing failure; no packet is emitted.
+    Telemetry(crate::telemetry::TelemetryError),
 }
 impl core::fmt::Display for MeshError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -256,6 +300,7 @@ impl core::fmt::Display for MeshError {
             Self::Receipt(error) => write!(f, "receipt failed: {error}"),
             Self::Presence(error) => write!(f, "presence failed: {error}"),
             Self::Directory(error) => write!(f, "directory observation failed: {error}"),
+            Self::Telemetry(error) => write!(f, "telemetry rejected: {error}"),
         }
     }
 }
@@ -286,6 +331,7 @@ pub struct MeshEngine<R: RngCore> {
     presence: PresenceTracker,
     directory: NodeDirectory,
     hints: RouteHintTable,
+    telemetry: TelemetryTracker,
 }
 impl<R: RngCore> MeshEngine<R> {
     /// Creates an engine with the default limits (`MeshConfig::default`).
@@ -297,6 +343,12 @@ impl<R: RngCore> MeshEngine<R> {
         // One neighbour bound owns both tables; a mismatch would let budget
         // state outlive its link or refuse honest links silently.
         config.budgets.max_neighbors = config.max_neighbors;
+        // One hop limit owns both the class table and the advisory; a
+        // mismatch would advertise a radius the relay path does not use.
+        config.telemetry.hop_limit = config
+            .telemetry
+            .hop_limit
+            .min(config.suppression.telemetry_ttl);
         let budgets = BudgetTracker::new(config.budgets);
         Self {
             rng,
@@ -313,6 +365,7 @@ impl<R: RngCore> MeshEngine<R> {
             presence: PresenceTracker::new(config.presence),
             directory: NodeDirectory::new(config.directory),
             hints: RouteHintTable::new(config.route_hint),
+            telemetry: TelemetryTracker::new(config.telemetry),
         }
     }
     /// Read-only bookkeeping, not a list of authenticated identities.
@@ -353,6 +406,18 @@ impl<R: RngCore> MeshEngine<R> {
     /// path; hosts may inspect it for diagnostics. No hint is a wire field.
     pub fn route_hints(&self) -> &RouteHintTable {
         &self.hints
+    }
+    /// The Telemetry policy a host must mirror in NET-21 (MSH-22).
+    ///
+    /// The returned reference is the same config that produced every
+    /// [`MeshOutput::TelemetrySend`] advisory, so a host configuring a send
+    /// queue before any update exists reads one source of truth.
+    pub fn telemetry_policy(&self) -> &crate::telemetry::TelemetryConfig {
+        self.telemetry.config()
+    }
+    /// Read-only latest-wins state, for diagnostics and resource-bound tests.
+    pub fn telemetry(&self) -> &TelemetryTracker {
+        &self.telemetry
     }
     /// Whether an acknowledged id is immune from store re-sync (MSH-17).
     #[cfg(feature = "sim")]
@@ -435,6 +500,7 @@ impl<R: RngCore> MeshEngine<R> {
                 let mut outputs = self.drain_due(now);
                 self.receipt.expire(now);
                 self.hints.expire(now);
+                self.telemetry.expire(now);
                 let actions = self.sync.expire(now);
                 outputs.extend(self.apply_sync_actions(now, actions));
                 outputs.extend(self.presence_tick(now, identity, card_hash)?);
@@ -700,6 +766,13 @@ impl<R: RngCore> MeshEngine<R> {
                 if self.budgets.is_released(link) {
                     return Ok(Vec::new());
                 }
+                // Telemetry is ambient state, not a stored message. Its
+                // policy runs before the relay budget so superseded, stale
+                // or throttled updates cost neither a token nor a state
+                // change beyond the signed packet's traffic counters.
+                if packet.header.class == crate::PacketClass::Telemetry {
+                    return Ok(self.on_telemetry_data(now, link, packet));
+                }
                 // Both the claimed origin and the sending link pay for a
                 // relay. A local delivery still happens; only its onward
                 // copies are withheld when either bucket is empty.
@@ -960,6 +1033,62 @@ impl<R: RngCore> MeshEngine<R> {
                     crate::PacketClass::Telemetry => {}
                 }
                 Ok(outputs)
+            }
+            MeshInput::SubmitTelemetry {
+                identity,
+                kind,
+                seq,
+                payload,
+                via,
+            } => {
+                if let Some(link) = via {
+                    if self.neighbors.get(link).is_none() {
+                        return Err(MeshError::UnknownLink(link));
+                    }
+                }
+                let framed =
+                    TelemetryFrame::encode(kind, seq, payload).map_err(MeshError::Telemetry)?;
+                // Round up: a sub-second policy window must not become a
+                // zero-lifetime packet at a relay. The tracker still caps
+                // freshness at the configured millisecond value.
+                let lifetime_s = self.config.telemetry.expiry_ms.saturating_add(999) / 1000;
+                let origin = *identity.node_id().as_bytes();
+                let advisory = self
+                    .telemetry
+                    .admit(now, &origin, kind, seq, lifetime_s)
+                    .map_err(MeshError::Telemetry)?;
+                let mut header = Header {
+                    class: crate::PacketClass::Telemetry,
+                    dst: None,
+                    msg_id: [0; 16].into(),
+                    origin,
+                    created_ms: now,
+                    lifetime_s,
+                    payload_len: framed.len() as u64,
+                    ttl: self.config.telemetry.hop_limit,
+                    hops: 0,
+                };
+                let signature =
+                    sign_packet(identity, &mut header, &framed).map_err(MeshError::Signing)?;
+                let bytes = Packet::new(header, signature, &framed)
+                    .map_err(MeshError::Packet)?
+                    .encode();
+                // A looped copy must be recognised without consulting the
+                // store, which never holds Telemetry.
+                let _ = self.seen.check_and_insert(now, header.class, header.msg_id);
+                Ok(vec![match via {
+                    Some(link) => MeshOutput::TelemetrySend {
+                        link,
+                        channel: Channel::Telemetry,
+                        payload: bytes,
+                        advisory,
+                    },
+                    None => MeshOutput::TelemetryBroadcast {
+                        channel: Channel::Telemetry,
+                        payload: bytes,
+                        advisory,
+                    },
+                }])
             }
             MeshInput::Submit {
                 identity,
@@ -1473,6 +1602,116 @@ impl<R: RngCore> MeshEngine<R> {
             channel: Channel::Message,
             payload,
         }]
+    }
+
+    /// Applies MSH-22's latest-wins policy to one inbound Telemetry packet.
+    ///
+    /// This runs after header parsing and neighbour verification but before
+    /// the relay budget: a superseded, throttled or expired update must not
+    /// spend a token or leave a dedupe record. Only a malformed frame or a
+    /// bad content address is attributable to the sending link. Telemetry is
+    /// never offered to the store or sync tracker.
+    fn on_telemetry_data(&mut self, now: u64, link: LinkId, packet: Packet<'_>) -> Vec<MeshOutput> {
+        let mut outputs = self.drain_due(now);
+        if !suppress::content_valid(&packet) {
+            return self.reject_telemetry(now, link, outputs);
+        }
+        let frame = match TelemetryFrame::decode(packet.payload) {
+            Ok(frame) => frame,
+            Err(_) => return self.reject_telemetry(now, link, outputs),
+        };
+        let hop_limit = self.config.telemetry.hop_limit;
+        if hop_limit <= 1 || packet.header.ttl <= 1 || packet.header.hops >= hop_limit {
+            return outputs;
+        }
+        let origin = packet.header.origin;
+        let advisory = match self.telemetry.admit(
+            now,
+            &origin,
+            frame.kind,
+            frame.seq,
+            packet.header.lifetime_s,
+        ) {
+            Ok(advisory) => advisory,
+            // Expiry, staleness and throttling are ordinary policy drops:
+            // no neighbour penalty and no budget debit.
+            Err(_) => return outputs,
+        };
+        if self.seen.is_duplicate(now, &packet.header.msg_id) {
+            return outputs;
+        }
+        let outcome = self.budgets.admit(
+            now,
+            link,
+            ao_idents::NodeId::from_bytes(origin),
+            packet.header.class,
+            packet.payload.len(),
+        );
+        match outcome {
+            BudgetOutcome::Admitted => {}
+            BudgetOutcome::OriginDenied => return outputs,
+            BudgetOutcome::NeighborDenied => {
+                if self
+                    .budgets
+                    .penalize(now, link, self.config.budgets.penalty_excess)
+                {
+                    outputs.push(MeshOutput::Release {
+                        link,
+                        reason: DisconnectReason::AbuseDetected,
+                    });
+                }
+                return outputs;
+            }
+        }
+        let _ = self
+            .seen
+            .check_and_insert(now, packet.header.class, packet.header.msg_id);
+        let Some(bytes) = suppress::relay_bytes(packet, hop_limit) else {
+            return outputs;
+        };
+        outputs.extend(self.telemetry_to_links(bytes, link, advisory));
+        outputs
+    }
+
+    /// Counts a malformed Telemetry frame against its sender, preserving any
+    /// unrelated suppression outputs already due at this timestamp.
+    fn reject_telemetry(
+        &mut self,
+        now: u64,
+        link: LinkId,
+        mut outputs: Vec<MeshOutput>,
+    ) -> Vec<MeshOutput> {
+        self.neighbors.reject(link);
+        if self
+            .budgets
+            .penalize(now, link, self.config.budgets.penalty_invalid)
+        {
+            outputs.push(MeshOutput::Release {
+                link,
+                reason: DisconnectReason::AbuseDetected,
+            });
+        }
+        outputs
+    }
+
+    /// Copies one accepted update to every verified neighbour except the
+    /// sender, carrying the same coalescing advisory on each link.
+    fn telemetry_to_links(
+        &self,
+        bytes: Vec<u8>,
+        sender: LinkId,
+        advisory: TelemetryAdvisory,
+    ) -> Vec<MeshOutput> {
+        self.neighbors
+            .iter()
+            .filter(|neighbor| neighbor.node_id.is_some() && neighbor.link != sender)
+            .map(|neighbor| MeshOutput::TelemetrySend {
+                link: neighbor.link,
+                channel: Channel::Telemetry,
+                payload: bytes.clone(),
+                advisory,
+            })
+            .collect()
     }
 
     /// Sends one relayed packet to every verified neighbour that did not

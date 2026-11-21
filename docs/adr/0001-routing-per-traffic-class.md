@@ -13,7 +13,7 @@ Units: TTL = hop limit; Copies = copies in the network; Lifetime = how long a co
 | Direct | spray-and-wait with reverse-path hints | 8 | 255 | 24 h | 1 MiB/h | 1 |
 | Broadcast and channels | counter-based suppression | 6 | 1 per node (forward once) | 6 h | 256 KiB/h | 2 |
 | Presence | trickle-timed gossip | 3 | 1 per node | 30 min | 64 KiB/h | 3 |
-| Telemetry (location) | announce, latest-wins, no storage | 3 | 1 per node | 5 min | 32 KiB/h | 4 |
+| Telemetry (location) | announce, latest-wins, no storage | 3 | 1 per node | 30 s | 32 KiB/h | 4 |
 
 ## Reasons
 
@@ -23,7 +23,7 @@ Units: TTL = hop limit; Copies = copies in the network; Lifetime = how long a co
 
 **Presence — TTL 3, 30 min, 64 KiB/h.** A 150-byte signed announcement carries the origin's card hash, capabilities, sequence and existing public identity. Trickle refreshes from 1 minute to a 15-minute steady bound, so a packet only has to outlive one missed period; three hops cover the immediate neighbourhood where presence is useful; the budget bounds Sybil spam to a few dozen announcements per hour. With the measured 258-byte average wire frame, one source's steady refresh is 15,480 B/h against the 64 KiB/h allowance.
 
-**Telemetry — TTL 3, 5 min, 32 KiB/h.** Location is worthless when stale, so nothing is stored and the newest wins; three hops is the bound for "who is near me"; being the lowest budget, telemetry is the first class shed under pressure.
+**Telemetry — TTL 3, 30 s, 32 KiB/h.** Location is worthless when stale, so nothing is stored and the newest wins; MSH-22 tightened the freshness ceiling from this table's original 5 min to 30 s because a moving contact cannot act on minute-old ambient state, and the paired simulator rows below show that the one-per-origin/10 s cap still leaves the newest update reaching the three-hop radius. Three hops is the bound for "who is near me"; being the lowest budget, telemetry is the first class shed under pressure.
 
 **Priority order.** User-visible content (Direct, Broadcast) before ambient state (Presence); presence self-refreshes through trickle and telemetry through latest-wins, so neither loses anything to a short delay. Nothing above can be starved by anything below, mirroring aoNetwork's control-over-bulk rule.
 
@@ -99,8 +99,9 @@ same id during a seeded assessment window; copies from one neighbour are one
 copy. Reaching the copy threshold cancels the relay and records the id in the
 seen-cache. Reaching the deadline first re-encodes one relay with the class
 TTL from the table above, decrements `ttl`, increments `hops`, and sends to
-every verified neighbour except those already counted. Direct and Telemetry
-keep their existing paths; no wire field changes.
+every verified neighbour except those already counted. Direct keeps its
+existing path; Telemetry uses its MSH-22 latest-wins path and never enters the
+suppression table. No wire field changes.
 
 | Setting | Default | Reason |
 |---|---|---|
@@ -474,3 +475,42 @@ default: it meets the issue's latency goal without increasing transmissions.
 | Maximum entries | 1024 | Bounded per-destination state at the documented directory scale |
 | Lifetime | 300,000 ms | Shorter than the 10-15 min presence refresh, so stale paths age out |
 | Fresh hop ceiling | 8 | Matches Direct's TTL; longer paths are not trusted |
+## MSH-22 implementation
+
+Telemetry keeps class 4 and the registered packet signature domain; the
+wire header is untouched. The frame adds a version byte, an opaque one-byte
+`kind`, a big-endian `u64` sequence and the opaque application payload. Two
+designs were considered for replacement: key dedupe by content address (every
+update is a different message, so a slow queue fills with stale values) or by
+`(origin, kind)` (chosen). The coalescing key hashes only the latter pair under
+a dedicated BLAKE3 domain, so a newer sequence replaces a waiting older one.
+aoNetwork's NET-21 `SendOpts` already owns replacement and deadlines; aoMesh
+passes them through `TelemetryAdvisory` and adds no radio queue.
+
+The alternative to a per-origin throttle was relying only on queue coalescing.
+That bounds queued bytes but lets one chatty origin spend every relay's
+Telemetry budget and starve honest senders. The chosen 10 s cap is applied at
+the origin's typed submission and again at each relay before budget admission.
+It is keyed by origin, not by `(origin, kind)`, so switching kind cannot evade
+it. Stale, expired, throttled and hop-limited updates are silent drops; only
+malformed frames or content-address mismatches earn a neighbour penalty.
+
+Three-hop TTL and 30 s freshness are enforced with local monotonic `now`;
+remote `created_ms` is ignored. Per-`(origin, kind)` freshness and per-origin
+rate windows are bounded by `TelemetryConfig::max_entries` (default 512),
+evicting by earliest expiry then key order. Telemetry is never stored or
+synced.
+
+| Setting | Default | Reason |
+|---|---|---|
+| Freshness | 30 s | Tighter than the original 5 min table value; measured with the fixed seeds below |
+| Rate cap | One accepted update per origin per 10 s | A chatty origin is rejected locally; seed `1297304029` accepted 1 of 12 |
+| Hop limit | 3 | Same class TTL as the table above; enforced before policy state is written |
+| State entries | 512 | Bounds relay memory by earliest local expiry, then key order |
+
+The slow-link row bursts eight updates from one origin before the radio gets a
+tick (seed `1297304023`). Each receiver observes only the first in-flight
+frame and the newest pending replacement: six total receptions, at most two
+sequences at any node, maximum sequence 8, 12 transmissions. The chatty row
+(seed `1297304029`) accepts one of twelve attempts, emits no telemetry frame,
+and records no store copy. `tests/sim_telemetry.rs` locks both exact CSV rows.

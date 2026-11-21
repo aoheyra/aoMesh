@@ -76,3 +76,7 @@ required-features = ["sim"]
 [[example]]
 name = "routehint_report"
 required-features = ["sim"]
+
+[[example]]
+name = "telemetry_report"
+required-features = ["sim"]

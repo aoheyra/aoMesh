@@ -249,11 +249,53 @@ to every verified neighbour except the links already counted. The configured
 threshold is fractional for most degrees; the seeded rounding draw keeps its
 expected value exact without making the engine non-deterministic.
 
-`Direct` keeps the MSH-08 path unchanged, `Telemetry` is dropped as before,
-and locally submitted packets are clamped to their ADR-0001 class TTL before
-signing. `SuppressionConfig::enabled` is a simulator ablation switch only.
-The pending table never holds payload bytes borrowed from a neighbour: the
-relay bytes are encoded once when the first copy arrives.
+`Direct` keeps the MSH-08 path unchanged, and locally submitted packets are
+clamped to their ADR-0001 class TTL before signing. Telemetry has its own
+latest-wins path below and never enters the suppression table.
+`SuppressionConfig::enabled` is a simulator ablation switch only. The pending
+table never holds payload bytes borrowed from a neighbour: the relay bytes are
+encoded once when the first copy arrives.
+
+## Telemetry latest-wins (MSH-22)
+
+Telemetry reuses class 4 and the `aoheyra/mesh/v1/packet` signature domain; no
+header field, class id or capability bit changes. Older nodes already dropped
+this class, and a node that understands the frame accepts it without a new
+negotiation. The payload begins with a fixed ten-byte prefix:
+
+| Offset | Bytes | Field | Meaning |
+|---|---|---|---|
+| 0 | 1 | `version` | `1`; another value is an attributable malformed frame |
+| 1 | 1 | `kind` | Opaque application stream tag; aoMesh does not interpret it |
+| 2..10 | 8 | `seq` | Sender-monotonic big-endian sequence |
+| 10.. | remainder | payload | Opaque bytes, unchanged by the mesh |
+
+`MeshInput::SubmitTelemetry` frames and signs this payload and returns
+`TelemetrySend` or `TelemetryBroadcast` with a typed `TelemetryAdvisory`. The
+advisory's coalescing key is BLAKE3 over
+`aoheyra/mesh/v1/telemetry/coalesce || origin(16) || kind(1)`, truncated to
+16 bytes; `seq` is excluded so a newer value replaces an older waiting frame.
+`NetworkAdapter` maps the advisory to aoNetwork's `SendOpts { coalesce_key,
+expires_at }` using `Network::send_opts`. It never queues in the core and never
+invents a network API.
+
+Relays first check the content address and frame prefix. A malformed frame or
+content mismatch is charged to the sending neighbour as invalid traffic.
+Freshness and rate policy run before the relay budget: a sender declaring
+zero lifetime, a sequence not newer than the last accepted one, an origin
+inside its 10 s cap, or a packet with no relay hop left is a silent drop with
+no budget debit, no penalty and no dedupe record. Remote `created_ms` is
+ignored; only local monotonic `now` drives expiry, eviction and throttling, so
+skewed device clocks cannot buy freshness. The effective window is
+`min(sender lifetime, 30 s)`.
+
+Telemetry is ambient state, not a message: it is never offered to `SyncItem`,
+the store, or the receipt tracker. Per-`(origin, kind)` freshness and
+per-origin rate state are bounded by `TelemetryConfig::max_entries` (default
+512); full state evicts by earliest local expiry, then key order. The relay
+caps `ttl` at the Telemetry class limit, decrements it and increments `hops`
+outside the signed prefix, exactly like other classes, and refuses a packet
+that has already spent the configured radius.
 
 ## Presence announcements (MSH-19)
 
