@@ -251,6 +251,10 @@ mod tests {
     /// returns the wire bytes.
     fn signed_bytes(origin_id: &Identity, class: PacketClass, payload: &[u8]) -> Vec<u8> {
         let mut header = header_for(class, [0; NODE_ID_LEN]);
+        // `header_for` defaults to a four-byte "ping". An honest sender
+        // declares the length of the payload it actually signs and sends;
+        // some callers here use longer payloads.
+        header.payload_len = u64::try_from(payload.len()).expect("test payload fits");
         let signature = sign_packet(origin_id, &mut header, payload).expect("sign");
         Packet::new(header, signature, payload)
             .expect("lengths agree")
