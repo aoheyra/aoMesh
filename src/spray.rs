@@ -455,18 +455,21 @@ mod tests {
 
     #[test]
     fn hint_replaces_a_recipient_without_adding_a_transmission() {
+        // Four tickets stop the binary split after two contacts, leaving C as
+        // a candidate the hint can actually substitute. With eight tickets the
+        // split would already select C, so the hint would be a no-op.
         let candidates = [(LINK_A, [3; 16]), (LINK_B, [4; 16]), (LINK_C, [5; 16])];
-        let mut baseline = tracker(8, 8);
-        baseline.observe(0, id(1), PacketClass::Direct, [9; 16], 60, 8);
+        let mut baseline = tracker(4, 8);
+        baseline.observe(0, id(1), PacketClass::Direct, [9; 16], 60, 4);
         let base = baseline.plan(0, id(1), None, candidates);
-        assert_eq!(base, vec![(LINK_A, 4), (LINK_B, 2)]);
+        assert_eq!(base, vec![(LINK_A, 2), (LINK_B, 1)]);
         let base_left = baseline.copies_left(id(1));
 
-        let mut hinted = tracker(8, 8);
-        hinted.observe(0, id(1), PacketClass::Direct, [9; 16], 60, 8);
+        let mut hinted = tracker(4, 8);
+        hinted.observe(0, id(1), PacketClass::Direct, [9; 16], 60, 4);
         let plan = hinted.plan_with_hint(0, id(1), None, candidates, Some(LINK_C));
+        assert_eq!(plan, vec![(LINK_A, 2), (LINK_C, 1)]);
         assert_eq!(plan.len(), base.len());
-        assert_eq!(plan.last(), Some(&(LINK_C, 1)));
         assert_eq!(hinted.copies_left(id(1)), base_left);
     }
 
