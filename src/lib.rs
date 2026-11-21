@@ -119,3 +119,5 @@ pub use telemetry::{
 // A signed hello must fit the opaque blob aoNetwork allows (NET-04's
 // MAX_APP_HELLO); this fails at compile time if the layout ever grows.
 const _: () = assert!(hello::HELLO_LEN <= ao_network::MAX_APP_HELLO);
+
+pub use snapshot::{TIMED_SNAPSHOT_MAGIC, TIMED_SNAPSHOT_VERSION, TimedSnapshot};

@@ -214,7 +214,7 @@ impl SprayTracker {
         self.config.enabled && self.caps.contains_key(&link)
     }
 
-    /// Starts or refreshes the local ticket for a Direct packet.
+    /// Starts one local ticket; repeated observations cannot refill it.
     pub(crate) fn observe(
         &mut self,
         now: u64,
@@ -224,14 +224,15 @@ impl SprayTracker {
         lifetime_s: u64,
         copies: u8,
     ) {
-        if class != PacketClass::Direct || copies == 0 {
+        if class != PacketClass::Direct || copies == 0 || self.config.max_entries == 0 {
             return;
         }
+        self.expire(now);
         let copies = copies.clamp(1, MAX_COPIES);
         let expires_at_ms = now.saturating_add(lifetime_s.saturating_mul(1_000));
-        if let Some(entry) = self.entries.get_mut(&id) {
-            entry.copies_left = entry.copies_left.max(copies);
-            entry.expires_at_ms = entry.expires_at_ms.max(expires_at_ms);
+        // Includes restored zero-copy tombstones: stale host metadata or a
+        // loop must never mint another allocation for the same live id.
+        if self.entries.contains_key(&id) {
             return;
         }
         if self.entries.len() >= self.config.max_entries {
@@ -537,5 +538,53 @@ mod tests {
                 .plan(3_000, id(3), None, [(LINK_A, [4; 16])])
                 .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod restart_copy_regressions {
+    use super::*;
+    #[test]
+    fn restored_zero_ticket_cannot_be_refilled_by_stale_metadata() {
+        let id = MessageId::from_bytes([29; 16]);
+        let config = SprayConfig {
+            enabled: true,
+            copies: 8,
+            max_entries: 2,
+        };
+        let mut original = SprayTracker::new(config);
+        original.observe(100, id, PacketClass::Direct, [9; 16], 60, 8);
+        assert_eq!(
+            original.plan(100, id, None, [(LinkId::new(1), [9; 16])]),
+            vec![(LinkId::new(1), 1)]
+        );
+        let mut restored = SprayTracker::new(config);
+        restored.import_state(original.export_state());
+        restored.observe(200, id, PacketClass::Direct, [9; 16], 3600, 255);
+        assert_eq!(restored.copies_left(id), 0);
+        let state = restored.export_state();
+        assert_eq!(state.entries[&id].expires_at_ms, 60_100);
+        assert!(
+            restored
+                .plan(201, id, None, [(LinkId::new(2), [8; 16])])
+                .is_empty()
+        );
+    }
+    #[test]
+    fn zero_capacity_survives_live_observations() {
+        let mut tracker = SprayTracker::new(SprayConfig {
+            enabled: true,
+            copies: 8,
+            max_entries: 0,
+        });
+        tracker.observe(
+            0,
+            MessageId::from_bytes([1; 16]),
+            PacketClass::Direct,
+            [9; 16],
+            60,
+            8,
+        );
+        assert!(tracker.export_state().entries.is_empty());
     }
 }

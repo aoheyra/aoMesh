@@ -7,6 +7,14 @@ change without notice until v0.1.0, and consumers pin by git tag
 
 ## Unreleased
 
+MSH-29 gains an explicit TimedSnapshot wrapper for process/device restarts with
+changed clock epochs. It binds state to the local owner, stores remaining
+lifetimes, rebases with host-supplied elapsed time and clears transport LinkIds.
+Restore is atomic and fresh-engine-only. Duplicate observations cannot refill
+spent spray tickets or extend their expiry; zero-capacity spray stores no state.
+Legacy Snapshot format and tests remain supported for same-epoch restoration.
+
+
 MSH-19 adds bounded presence announcements. An ordinary signed `Presence`
 packet carries a fixed 150-byte body with the origin's card hash, capabilities,
 sequence and existing public identity, so every relay can verify the binding

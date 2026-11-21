@@ -1045,3 +1045,10 @@ neighbour was accounted for. `tests/sim_observability.rs` locks every value,
 and `tests/observability.rs` covers adapter mapping, stability, bounds and
 absence of content leakage. The actual APP-15 bundle wiring belongs to
 aoheyra and consumes this plain snapshot.
+
+For a process/device restart with a new monotonic epoch, prefer `TimedSnapshot`:
+call `snapshot_at(now, owner)` and restore a fresh engine using
+`restore_at(new_now, owner, elapsed_ms, &bytes)`. This identity-bound format stores
+remaining lifetimes and discards old transport LinkIds. Legacy `Snapshot` bytes
+require the original clock epoch and link namespace. See
+[the clock-safe restart contract](docs/adr/clock-safe-restart.md).
