@@ -16,13 +16,16 @@
 //! sender and hands packets addressed to this node to MSH-09, which
 //! opens the sealed payload against the local identity, binds the
 //! seal's sender to `origin`, verifies the origin signature and runs
-//! the replay guard before a `Deliver` is emitted.
+//! the replay guard before a `Deliver` is emitted. MSH-10 bounds
+//! relays with per-origin and per-neighbour token buckets and
+//! releases abusive links.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 #[cfg(feature = "adapter")]
 pub mod adapter;
+pub mod budget;
 mod deliver;
 pub mod engine;
 mod forward;
@@ -37,6 +40,7 @@ pub mod store;
 
 #[cfg(feature = "adapter")]
 pub use adapter::{AdapterEvent, NetworkAdapter};
+pub use budget::{BudgetConfig, BudgetOutcome, BudgetTracker, ClassRate};
 pub use engine::{MeshEngine, MeshError, MeshInput, MeshOutput};
 pub use hello::{HelloError, MeshHello};
 pub use neighbor::{MeshConfig, Neighbor, NeighborTable};

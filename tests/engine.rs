@@ -3,8 +3,8 @@ mod common;
 
 use ao_idents::{Identity, ReplayConfig};
 use ao_mesh::{
-    Header, MeshConfig, MeshEngine, MeshError, MeshHello, MeshInput, MeshOutput, Packet,
-    PacketClass, verify_origin,
+    BudgetConfig, ClassRate, Header, MeshConfig, MeshEngine, MeshError, MeshHello, MeshInput,
+    MeshOutput, Packet, PacketClass, sign_packet, verify_origin,
 };
 use ao_network::{AppHello, Channel, DisconnectReason, Hello, LinkId, LocalTag};
 use rand::{SeedableRng, rngs::StdRng};
@@ -80,6 +80,16 @@ fn signed_with(class: PacketClass, mutate: impl FnOnce(&mut Header), payload: &[
 }
 fn signed(class: PacketClass, payload: &[u8]) -> Vec<u8> {
     signed_with(class, |_| {}, payload)
+}
+/// A relay-valid packet signed by an explicit identity, for budget tests
+/// that need distinct claimed origins on the same sender link.
+fn signed_by(identity: &Identity, class: PacketClass, payload: &[u8]) -> Vec<u8> {
+    let mut header = header(class, payload.len());
+    let signature = sign_packet(identity, &mut header, payload).unwrap();
+    Packet::new(header, signature, payload)
+        .unwrap()
+        .encode()
+        .to_vec()
 }
 /// One encoded packet whose payload is the plaintext sealed to this
 /// node, built with the MSH-09 recipe; `mutate` adjusts the header
@@ -358,32 +368,40 @@ fn malformed_and_oversized_data_are_counted_without_delivery_or_forwarding() {
     .unwrap();
     let wire = signed(PacketClass::Direct, b"hello");
     for end in 0..wire.len() {
-        assert!(
-            e.handle(
+        let outputs = e
+            .handle(
                 1,
                 MeshInput::Data {
                     link,
                     channel: Channel::Message,
                     payload: &wire[..end],
                     identity: &LOCAL,
-                }
+                },
             )
-            .unwrap()
-            .is_empty()
+            .unwrap();
+        // Malformed traffic never delivers or forwards; once the penalty
+        // crosses its threshold the only extra output is the link release.
+        assert!(
+            outputs
+                .iter()
+                .all(|output| matches!(output, MeshOutput::Release { .. }))
         );
     }
-    assert!(
-        e.handle(
+    let outputs = e
+        .handle(
             2,
             MeshInput::Data {
                 link,
                 channel: Channel::Bulk,
                 payload: &[0; 16384],
                 identity: &LOCAL,
-            }
+            },
         )
-        .unwrap()
-        .is_empty()
+        .unwrap();
+    assert!(
+        outputs
+            .iter()
+            .all(|output| matches!(output, MeshOutput::Release { .. }))
     );
     let n = e.neighbors().get(link).unwrap();
     assert_eq!(n.received_packets, 0);
@@ -403,7 +421,130 @@ fn malformed_and_oversized_data_are_counted_without_delivery_or_forwarding() {
         .is_empty()
     );
     assert_eq!(e.neighbors().len(), 1);
+    assert_eq!(e.budgets().origins(), 0);
 }
+
+#[test]
+fn an_excessive_origin_is_denied_without_blaming_its_sender() {
+    let mut budgets = BudgetConfig::default();
+    budgets.rates[0] = ClassRate {
+        bytes_per_hour: 9_600,
+        burst_seconds: 600,
+    };
+    budgets.penalty_excess = 2;
+    budgets.penalty_release_at = 2;
+    let config = MeshConfig {
+        max_neighbors: 2,
+        budgets,
+        ..MeshConfig::default()
+    };
+    let mut e = MeshEngine::with_config(StdRng::seed_from_u64(7), config);
+    let sender = LinkId::new(1);
+    let other = LinkId::new(2);
+    e.handle(
+        0,
+        MeshInput::LinkUp {
+            link: sender,
+            remote_hello: hello(),
+        },
+    )
+    .unwrap();
+    e.handle(
+        0,
+        MeshInput::LinkUp {
+            link: other,
+            remote_hello: hello_of(&Identity::from_seed([8; 32])),
+        },
+    )
+    .unwrap();
+    let first = signed(PacketClass::Direct, &vec![1; 700]);
+    let second = signed(PacketClass::Direct, &vec![2; 700]);
+    let first_outputs = e
+        .handle(
+            0,
+            MeshInput::Data {
+                link: sender,
+                channel: Channel::Message,
+                payload: &first,
+                identity: &LOCAL,
+            },
+        )
+        .unwrap();
+    assert!(
+        first_outputs
+            .iter()
+            .any(|output| matches!(output, MeshOutput::Send { link, .. } if *link == other))
+    );
+    let second_outputs = e
+        .handle(
+            0,
+            MeshInput::Data {
+                link: sender,
+                channel: Channel::Message,
+                payload: &second,
+                identity: &LOCAL,
+            },
+        )
+        .unwrap();
+    // The flooder is throttled, but the neighbour that carried its packets
+    // stays connected: disconnecting it would also drop honest traffic.
+    assert!(second_outputs.is_empty());
+    assert_eq!(e.budgets().penalty(sender), 0);
+}
+
+#[test]
+fn a_neighbor_limit_denial_is_still_penalised() {
+    let budgets = BudgetConfig {
+        max_origins_per_neighbor: 0,
+        penalty_excess: 1,
+        penalty_release_at: 1,
+        ..BudgetConfig::default()
+    };
+    let config = MeshConfig {
+        max_neighbors: 2,
+        budgets,
+        ..MeshConfig::default()
+    };
+    let mut e = MeshEngine::with_config(StdRng::seed_from_u64(9), config);
+    let sender = LinkId::new(1);
+    let other = LinkId::new(2);
+    e.handle(
+        0,
+        MeshInput::LinkUp {
+            link: sender,
+            remote_hello: hello(),
+        },
+    )
+    .unwrap();
+    e.handle(
+        0,
+        MeshInput::LinkUp {
+            link: other,
+            remote_hello: hello_of(&Identity::from_seed([8; 32])),
+        },
+    )
+    .unwrap();
+    let packet = signed_by(&Identity::from_seed([1; 32]), PacketClass::Direct, &[1; 64]);
+    let outputs = e
+        .handle(
+            0,
+            MeshInput::Data {
+                link: sender,
+                channel: Channel::Message,
+                payload: &packet,
+                identity: &LOCAL,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        outputs,
+        vec![MeshOutput::Release {
+            link: sender,
+            reason: DisconnectReason::AbuseDetected,
+        }]
+    );
+}
+
 #[test]
 fn structural_validity_never_means_authenticated_delivery() {
     let mut e = engine(1);

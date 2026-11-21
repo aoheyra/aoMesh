@@ -9,13 +9,15 @@
 //! One scenario runs in three phases:
 //!
 //! 1. settle until links have formed at the seeded radio topology;
-//! 2. submit sealed Direct messages from spread-out origins, staggered so
-//!    mobility and scripted contacts can affect them;
+//! 2. submit sealed Direct messages from spread-out origins, or from one
+//!    flooding origin in MSH-10's ablation case, staggered so mobility and
+//!    scripted contacts can affect them;
 //! 3. advance the world, applying optional mobility, and record deliveries,
 //!    transmissions, receptions, queue occupancy and radio bytes.
 //!
 //! The report is one CSV row per scenario. `examples/sim_report` writes it
-//! and `tests/sim_baseline.rs` enforces the published numbers.
+//! and `tests/sim_baseline.rs` enforces the published numbers. Per-origin
+//! delivery counts are kept off the CSV for the MSH-10 flood test.
 
 use crate::{
     Header, MeshConfig, MeshEngine, MeshHello, MeshInput, MeshOutput, MessageId, NetworkAdapter,
@@ -88,6 +90,23 @@ pub enum Mobility {
     Scripted,
 }
 
+/// How submitted messages are shared between origins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Traffic {
+    /// Rotate evenly across every node, as the published baselines do.
+    Balanced,
+    /// Give one origin `weight` messages per round and spread the rest.
+    ///
+    /// This is how MSH-10 exercises a flooding origin without changing
+    /// packet size or the honest nodes' allowance.
+    Flood {
+        /// Node index of the abusive origin.
+        origin: usize,
+        /// Number of flood messages per honest message.
+        weight: usize,
+    },
+}
+
 /// One reproducible experiment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Scenario {
@@ -109,6 +128,12 @@ pub struct Scenario {
     pub messages: usize,
     /// Plaintext bytes per message.
     pub payload_len: usize,
+    /// Origin pattern used for submissions.
+    pub traffic: Traffic,
+    /// Whether engines enforce MSH-10 budgets and penalties.
+    ///
+    /// Ablation runs set this to false to measure an unbounded flood.
+    pub enforce_budgets: bool,
 }
 
 /// Everything one run measured. Ratios are fractions, not percentages.
@@ -148,6 +173,11 @@ pub struct Metrics {
     pub peak_queued_bytes: usize,
     /// Up links once settlement finished.
     pub links_after_settle: usize,
+    /// Unique deliveries attributed to each submitting node index.
+    ///
+    /// Not part of the CSV report; MSH-10 uses it to check that a flood
+    /// is throttled without hurting honest origins.
+    pub delivered_by_origin: Vec<u64>,
 }
 
 impl Metrics {
@@ -194,6 +224,8 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             run: Duration::from_secs(30),
             messages: 20,
             payload_len: 128,
+            traffic: Traffic::Balanced,
+            enforce_budgets: true,
         },
         Scenario {
             name: "waypoint-50",
@@ -207,6 +239,8 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             run: Duration::from_secs(60),
             messages: 50,
             payload_len: 128,
+            traffic: Traffic::Balanced,
+            enforce_budgets: true,
         },
         Scenario {
             name: "community-100",
@@ -220,6 +254,8 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             run: Duration::from_secs(90),
             messages: 80,
             payload_len: 128,
+            traffic: Traffic::Balanced,
+            enforce_budgets: true,
         },
         Scenario {
             name: "scripted-200",
@@ -231,8 +267,37 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             run: Duration::from_secs(60),
             messages: 100,
             payload_len: 128,
+            traffic: Traffic::Balanced,
+            enforce_budgets: true,
         },
     ]
+}
+
+/// MSH-10's fixed flood case: one origin sends as many oversized messages
+/// as all honest nodes together on a static 20-node random graph.
+///
+/// The origin's 300 messages carry 850 plaintext bytes each (1117 sealed),
+/// well past what the 1 MiB/h Direct bucket can refill during the run, while
+/// honest origins stay far below their own allowances. The fixed seed keeps
+/// the flooder connected to several disjoint routes, so releasing its link
+/// does not decide the outcome by partitioning the graph.
+pub fn flood_scenarios() -> Vec<Scenario> {
+    vec![Scenario {
+        name: "flood-random-20",
+        seed: 1_297_304_003,
+        nodes: 20,
+        topology: Topology::Random,
+        mobility: Mobility::Static,
+        settle: Duration::from_secs(30),
+        run: Duration::from_secs(120),
+        messages: 600,
+        payload_len: 850,
+        traffic: Traffic::Flood {
+            origin: 0,
+            weight: 1,
+        },
+        enforce_budgets: true,
+    }]
 }
 
 /// A permanent chain plus short-lived shortcuts on a 200-node chain.
@@ -298,6 +363,8 @@ pub struct Simulation {
     radio_tx_last: Vec<BTreeMap<LinkId, u64>>,
     latencies: Vec<u64>,
     delivered_ids: Vec<BTreeSet<MessageId>>,
+    delivered_by_origin: Vec<u64>,
+    origin_index: BTreeMap<[u8; 16], usize>,
     links_after_settle: usize,
 }
 
@@ -334,7 +401,9 @@ impl Simulation {
             seed.copy_from_slice(blake3::hash(&seed_input).as_bytes());
             let identity = Identity::from_seed(seed);
             let engine_rng = EngineRng::seed_from_u64(scenario.seed ^ (i as u64 + 1));
-            let engine = MeshEngine::with_config(engine_rng, MeshConfig::default());
+            let mut engine_config = MeshConfig::default();
+            engine_config.budgets.enforce = scenario.enforce_budgets;
+            let engine = MeshEngine::with_config(engine_rng, engine_config);
             let mut adapter =
                 NetworkAdapter::new(engine, Network::new(NetworkConfig::default(), radio));
             let tag = {
@@ -405,6 +474,11 @@ impl Simulation {
         }
         let applied = vec![vec![false; n]; n];
         let delivered_ids = vec![BTreeSet::new(); n];
+        let origin_index = identities
+            .iter()
+            .enumerate()
+            .map(|(i, identity)| (*identity.node_id().as_bytes(), i))
+            .collect();
         let mut contacts = match &scenario.topology {
             Topology::Scripted(contacts) => contacts.clone(),
             _ => Vec::new(),
@@ -435,6 +509,8 @@ impl Simulation {
             radio_tx_last: vec![BTreeMap::new(); n],
             latencies: Vec::new(),
             delivered_ids,
+            delivered_by_origin: vec![0; n],
+            origin_index,
             links_after_settle: 0,
         };
         sim.apply_ranges();
@@ -585,6 +661,9 @@ impl Simulation {
                         self.delivered += 1;
                         self.latencies
                             .push(now_ms.saturating_sub(header.created_ms));
+                        if let Some(origin) = self.origin_index.get(&header.origin) {
+                            self.delivered_by_origin[*origin] += 1;
+                        }
                     } else {
                         self.duplicate_deliveries += 1;
                     }
@@ -666,7 +745,22 @@ impl Simulation {
     /// affect delivery instead of finishing before the first contact changes.
     fn submit_one(&mut self, m: usize) {
         let n = self.nodes.len();
-        let origin = m % n;
+        let origin = match self.scenario.traffic {
+            Traffic::Balanced => m % n,
+            Traffic::Flood {
+                origin: flood,
+                weight,
+            } => {
+                let round = weight.max(1) + 1;
+                if m % round == 0 {
+                    flood.min(n - 1)
+                } else {
+                    let honest = n - 1;
+                    let slot = (m / round) * weight + (m % round) - 1;
+                    (flood.min(n - 1) + 1 + slot % honest) % n
+                }
+            }
+        };
         // Destinations stay inside the packet's eight-hop TTL so the
         // baseline measures forwarding, not expiry at an impossible
         // graph distance. Reflect at the ends because a line has no
@@ -775,6 +869,7 @@ impl Simulation {
             duplicate_ratio: self.duplicate_deliveries as f64 / self.delivered.max(1) as f64,
             peak_queued_bytes: self.peak_queued_bytes,
             links_after_settle: self.links_after_settle,
+            delivered_by_origin: self.delivered_by_origin,
         }
     }
 }
@@ -868,6 +963,7 @@ mod tests {
             duplicate_ratio: 0.0,
             peak_queued_bytes: 100,
             links_after_settle: 1,
+            delivered_by_origin: vec![1, 1],
         };
         let row = m.csv_row();
         assert_eq!(row.lines().count(), 1);

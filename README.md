@@ -2,7 +2,7 @@
 
 **The routing and store-and-forward engine of the aoheyra mesh.** A sans-IO Rust crate that decides what happens to a packet: forward it, hold it, suppress it, deliver it, or drop it, across a phone-to-phone mesh where links come and go.
 
-> **Status: pre-alpha, through MSH-09.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours) and authenticated local delivery (seal, origin binding, signature and replay guard) are implemented. Relay budgets (MSH-10) and broadcast suppression (MSH-11) are not implemented yet.
+> **Status: pre-alpha, through MSH-10.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard) and per-origin/per-neighbour relay budgets with neighbour penalties are implemented. Broadcast suppression (MSH-11) is not implemented yet.
 
 Cargo package name: `ao_mesh`.
 
@@ -82,11 +82,12 @@ Lifetimes, TTLs, copy counts and budgets are **defaults with documented reasons*
 
 ### Engine and adapter (MSH-06)
 
-`MeshEngine::new(rng)` uses `MeshConfig::default()` (32 neighbour entries and
-the MSH-09 replay guard: 1024 ids per sender, 24 h tolerance, 64 senders).
-`with_config` accepts explicit bounds; zero neighbours refuses all new links. Excess
-links emit `Release`, duplicate link-up events preserve counters, and link-down
-removes the entry. These are bookkeeping limits, not radio topology policy.
+`MeshEngine::new(rng)` uses `MeshConfig::default()`: 32 neighbour entries, the
+MSH-09 replay guard (1024 ids per sender, 24 h tolerance, 64 senders) and the
+budget fields below. `with_config` accepts explicit bounds; zero neighbours
+refuses all new links. Excess links emit `Release`, duplicate link-up events
+preserve counters, and link-down removes the entry. These are bookkeeping
+limits, not radio topology policy.
 Link-up verifies the peer's signed MeshHello, so each entry carries a verified
 `NodeId` or none (below).
 
@@ -186,6 +187,52 @@ opened plaintext. The header's `payload_len` stays the sealed wire length.
 Failed checks and forged content addresses increment
 `Neighbor::rejected_packets` and never produce a delivery; policy drops do
 not. Decision record: [ADR-0005](docs/adr/0005-local-delivery-pipeline.md).
+
+### Relay budgets and penalties (MSH-10)
+
+Every admitted packet debits two token buckets: one keyed by the packet's
+claimed origin and one keyed by the (sending link, claimed origin) pair. Both
+refill continuously in caller-supplied milliseconds and use the ADR-0001 hourly
+rates, so Direct has the largest allowance and Telemetry the smallest. The
+per-link map is bounded by `BudgetConfig::max_origins_per_neighbor` (default 64)
+and evicts least-recently-used origins. Buckets are per class and
+never borrow from each other; a full Direct bucket cannot hide a Telemetry
+flood. Local delivery is never suppressed: only the onward relay copies are
+withheld when either bucket is empty. The refusal is typed: an exhausted
+origin is that origin's fault and drops without blaming the neighbour that
+carried it, while an exhausted sending link feeds that link's penalty.
+Disconnecting a neighbour merely because an origin ran out of allowance would
+also drop honest traffic crossing that link. Origin state is bounded by
+`BudgetConfig::max_origins` (default 1024) and evicted least-recently-used
+first; neighbour state follows the neighbour table and is removed on
+`LinkDown`.
+
+| Setting | Default | Why |
+|---|---|---|
+| Direct | 1 MiB/h, 10 min burst | About 500 2 KiB messages per hour, with a bounded first burst (ADR-0001) |
+| Broadcast | 256 KiB/h, 10 min burst | Quarter of Direct; suppression already duplicates each flood |
+| Presence | 64 KiB/h, 10 min burst | A few dozen announcements per hour bounds Sybil spam |
+| Telemetry | 32 KiB/h, 10 min burst | Lowest class, shed first under pressure |
+| Invalid packet | +3 penalty | Structural garbage is a clear abuse signal |
+| Unverified sender | +2 penalty | The link may watch, but cannot act through this engine |
+| Over-budget packet | +1 penalty | Only for a saturated sending link; an exhausted origin is dropped without blame |
+| Release threshold | 12, decay 1 per 60 s | A sustained offender is disconnected once; short mistakes fade |
+
+Crossing the threshold emits `MeshOutput::Release` with
+`DisconnectReason::AbuseDetected`. The release is emitted once per link until
+`LinkDown`; aoNetwork owns reconnection and any later blacklist decision.
+`BudgetConfig::enforce` is an ablation switch for the simulator, not a
+production tuning knob.
+
+The fixed flood case in `tests/sim_budgets.rs` submits 300 oversized messages
+from one origin and 300 from honest nodes on a seeded 20-node random graph
+(seed `1297304003`) against aoNetwork `492e148c`. With budgets on, the flooder
+delivers 102 of 300 messages (0.3400) against 244 of 300 (0.8133) with budgets
+off, while honest origins deliver 226 of 300 (0.7533) against 205 of 300
+(0.6833) with no budgets. A no-flood control run delivers 223 of 285 honest
+messages (0.7825), so the remaining gap is first-transmission radio contention
+from the flooder, not a budget applied to honest traffic. The refreshed
+four-scenario baseline is unchanged by this feature.
 
 ### Simulator harness and baseline (MSH-27)
 
