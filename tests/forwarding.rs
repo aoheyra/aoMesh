@@ -208,6 +208,9 @@ fn assert_delivered_once(events: &[(usize, AdapterEvent)], dst: usize) {
             | AdapterEvent::CardFetch { .. } => {
                 panic!("unexpected receipt or presence event in a forwarding test: {event:?}")
             }
+            AdapterEvent::DirectoryChanged { .. } => {
+                panic!("unexpected directory event in a forwarding test: {event:?}")
+            }
         }
     }
     assert_eq!(delivered, [(dst, PAYLOAD)], "one delivery, at dst");

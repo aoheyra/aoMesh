@@ -510,8 +510,10 @@ impl PresenceTracker {
         Some(announcement)
     }
 
-    /// Applies a received announcement, returning a card hash the host must
-    /// fetch when one was seen for the first time.
+    /// Applies a received announcement. The first value is a card hash the
+    /// host must fetch when one was seen for the first time; the second says
+    /// whether this announcement replaced the previous one and should update
+    /// derived state such as the node directory.
     ///
     /// Latest wins by `seq`. Equal sequences are tied deterministically by
     /// the smaller `(card_hash, caps)` pair, so two peers that receive the
@@ -521,9 +523,9 @@ impl PresenceTracker {
         now: u64,
         origin: [u8; 16],
         announcement: Announcement,
-    ) -> Option<[u8; 8]> {
+    ) -> (Option<[u8; 8]>, bool) {
         if !self.config.enabled || self.config.max_entries == 0 {
-            return None;
+            return (None, false);
         }
         self.expire(now);
         let expires_at_ms = now.saturating_add(self.config.lifetime_s.saturating_mul(1_000));
@@ -536,7 +538,7 @@ impl PresenceTracker {
             }
         };
         if !replace {
-            return None;
+            return (None, false);
         }
         if !self.entries.contains_key(&origin) && self.entries.len() >= self.config.max_entries {
             let oldest = self
@@ -568,7 +570,7 @@ impl PresenceTracker {
                 fetched_hash: fetch.or(already_fetched.then_some(announcement.card_hash)),
             },
         );
-        fetch
+        (fetch, true)
     }
 
     /// Deterministic equal-sequence tie break: every authenticated field is
@@ -756,16 +758,16 @@ mod tests {
     fn latest_wins_by_seq_with_a_deterministic_tie() {
         let mut t = tracker();
         let origin = [7; 16];
-        assert_eq!(t.observe(1_000, origin, ann(1, 1)), Some([1; 8]));
+        assert_eq!(t.observe(1_000, origin, ann(1, 1)).0, Some([1; 8]));
         assert_eq!(t.get(&origin), Some(ann(1, 1)));
-        assert_eq!(t.observe(1_001, origin, ann(3, 3)), Some([3; 8]));
+        assert_eq!(t.observe(1_001, origin, ann(3, 3)).0, Some([3; 8]));
         assert_eq!(t.get(&origin), Some(ann(3, 3)));
         // Older sequences cannot roll state back.
-        assert_eq!(t.observe(1_002, origin, ann(2, 2)), None);
+        assert_eq!(t.observe(1_002, origin, ann(2, 2)).0, None);
         assert_eq!(t.get(&origin), Some(ann(3, 3)));
         // Equal seq: smaller card hash wins, independent of arrival order.
-        assert_eq!(t.observe(1_003, origin, ann(3, 9)), None);
-        assert_eq!(t.observe(1_004, origin, ann(3, 2)), Some([2; 8]));
+        assert_eq!(t.observe(1_003, origin, ann(3, 9)).0, None);
+        assert_eq!(t.observe(1_004, origin, ann(3, 2)).0, Some([2; 8]));
         assert_eq!(t.get(&origin), Some(ann(3, 2)));
     }
 
@@ -783,11 +785,11 @@ mod tests {
     fn unknown_cards_are_reported_once_per_node_and_hash() {
         let mut t = tracker();
         let origin = [4; 16];
-        assert_eq!(t.observe(100, origin, ann(1, 8)), Some([8; 8]));
-        assert_eq!(t.observe(101, origin, ann(2, 8)), None);
-        assert_eq!(t.observe(102, origin, ann(3, 9)), Some([9; 8]));
+        assert_eq!(t.observe(100, origin, ann(1, 8)).0, Some([8; 8]));
+        assert_eq!(t.observe(101, origin, ann(2, 8)).0, None);
+        assert_eq!(t.observe(102, origin, ann(3, 9)).0, Some([9; 8]));
         assert!(t.set_known_cards(&[[9; 8], [8; 8]]).is_ok());
-        assert_eq!(t.observe(103, origin, ann(4, 8)), None);
+        assert_eq!(t.observe(103, origin, ann(4, 8)).0, None);
     }
 
     #[test]

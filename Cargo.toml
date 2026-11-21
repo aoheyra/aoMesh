@@ -68,3 +68,7 @@ required-features = ["sim"]
 [[example]]
 name = "receipt_report"
 required-features = ["sim"]
+
+[[example]]
+name = "directory_report"
+required-features = ["sim"]

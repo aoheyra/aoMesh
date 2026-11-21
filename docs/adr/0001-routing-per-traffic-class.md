@@ -373,6 +373,48 @@ receipts purge all 1,341 copies and the slowest purge takes 1,750 ms. Both
 ablations retain their copies (`206` and `1,436`), so the purge is attributable
 to MSH-17. The regression gate `tests/sim_receipts.rs` requires zero remaining
 copies and a purge latency below ten seconds.
+## MSH-20 implementation
+
+The directory is a local, ephemeral view over presence facts, not a wire
+protocol. Two storage designs were compared. An unbounded `BTreeMap<NodeId, _>`
+is the simplest but a hostile announcement flood grows memory without limit;
+a time-only map with periodic scanning bounds staleness but still lets memory
+grow inside the window and makes cleanup linear in attacker-controlled size.
+The chosen design keeps a `BTreeMap` keyed by `NodeId` plus an ordered LRU key
+set `(local receipt time, sequence, node id)`. Inserts are `O(log n)`, eviction
+is `O(log n)`, and both structures are bounded by the same configured
+capacity. The id tie-break makes eviction reproducible with a fixed input
+stream and seed. `std` collections suffice; no dependency is added.
+
+The event stream had two realistic shapes: one UI event per observation, or a
+bounded queue coalesced by node. The first is trivial but gives a hostile
+neighbour an unbounded UI event stream; the second emits only the net effect.
+`set` and `VecDeque` are both capped by `max_change_events`, and merging
+`Added` with `Removed` drops the event entirely while `Removed` followed by
+`Added` becomes `Updated` because the UI last knew the node as present. The UI
+queries the entry by id rather than receiving location bytes in the stream.
+
+| Setting | Default | Reason |
+|---|---|---|
+| Directory entries | 256 | Covers a contact's visible mesh in about 80 KiB including indexes |
+| Stale after | 30 min | ADR-0001 Presence lifetime; one missed trickle refresh does not expire a node |
+| Location bytes | 64 | Bounds hostile claims while leaving the telemetry schema to MSH-22 |
+| UI events | 64 | Absorbs announcement bursts without unbounded app work |
+
+Lifetime is relative to local receipt time with a high-water-mark clock: a
+backwards `now` cannot mint a longer or shorter life. The observation time is
+clamped for display ordering only and never sets `expires_at_ms`; this keeps
+peer clock skew out of expiry, matching MSH-18's contract. A lower `seq` is
+ignored, and equal-content refreshes produce no UI change, so repeated
+announcements cannot churn the event stream.
+
+The fixed `directory-line-6` case (seed `1297304021`, static line, capacity 4,
+2,000 ms staleness, alternating 5,000 ms observation-time skew) peaks at four
+entries, records 24 expirations and 24 evictions, removes the last entry at
+4,000 ms and ends with zero live entries. The numbers are locked in
+`tests/sim_directory.rs`; no MSH-27 routing threshold changed because the
+directory path emits no radio traffic.
+
 ## Lifetime implementation (MSH-18)
 
 `expiry::LifetimePolicy::default()` implements this table's lifetimes unchanged.

@@ -63,6 +63,12 @@ pub enum AdapterEvent {
         /// Opaque hash to resolve out of band.
         card_hash: [u8; 8],
     },
+    /// Coalesced directory changes for the UI (MSH-20). No network action
+    /// follows; the UI queries `MeshEngine::directory` for details.
+    DirectoryChanged {
+        /// Bounded, ordered change stream.
+        changes: Vec<crate::directory::DirectoryChange>,
+    },
     /// A peer's item is ready for the store owner to validate and insert.
     SyncItem {
         /// Full content address parsed from the packet.
@@ -177,6 +183,9 @@ impl<R: RngCore, T: Transport> NetworkAdapter<R, T> {
                 }
                 MeshOutput::CardFetch { node_id, card_hash } => {
                     events.push(AdapterEvent::CardFetch { node_id, card_hash })
+                }
+                MeshOutput::DirectoryChanged { changes } => {
+                    events.push(AdapterEvent::DirectoryChanged { changes })
                 }
             }
         }
