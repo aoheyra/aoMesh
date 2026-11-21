@@ -1,3 +1,4 @@
+#![cfg(all(feature = "sim", feature = "adapter"))]
 //! MSH-14 acceptance: two nodes meeting on aoNetwork's SimWorld converge
 //! on the union of their stores and the opportunistic contact is released.
 
