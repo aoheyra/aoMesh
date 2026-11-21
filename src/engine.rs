@@ -280,6 +280,7 @@ impl<R: RngCore> MeshEngine<R> {
         self.spray.copies_left(id)
     }
     /// Whether an acknowledged id is immune from store re-sync (MSH-17).
+    #[cfg(feature = "sim")]
     pub(crate) fn is_immune(&self, id: MessageId) -> bool {
         self.receipt.is_immune(id)
     }
