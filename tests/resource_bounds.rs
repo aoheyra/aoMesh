@@ -17,7 +17,8 @@ use ao_mesh::packet::MAX_PAYLOAD;
 use ao_mesh::store::{MemoryStore, MessageStore, StoreLimits, StoreMetadata, StoredMessage};
 use ao_mesh::{
     CAPS, Header, MAX_FRAME_BODY_BYTES, MAX_SUMMARY_ENTRIES, MeshEngine, MeshHello, MeshInput,
-    MessageId, Packet, PacketClass, StoreSummary, SyncFrame, SyncFrameV2, derive_msg_id,
+    MessageId, Packet, PacketClass, StoreSummary, SYNC_MAGIC, SYNC_VERSION, SyncFrame, SyncFrameV2,
+    derive_msg_id,
 };
 use ao_network::{AppHello, Channel, Hello, LinkId, LocalTag};
 use rand::SeedableRng;
@@ -183,6 +184,8 @@ fn hostile_inputs_stay_inside_the_documented_bounds() {
     .expect("fixture fits");
     trailing.extend_from_slice(&[7; 64]);
     oversize.truncate(5);
+    oversize[0] = SYNC_MAGIC;
+    oversize[1] = SYNC_VERSION;
     oversize[2] = 2; // summary tag
     oversize[3..5].copy_from_slice(&8u16.to_be_bytes());
 
