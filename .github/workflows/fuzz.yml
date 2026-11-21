@@ -1,10 +1,13 @@
 name: fuzz
 
 on:
-  schedule:
-    # Nightly: one hour per target, outside normal PR CI.
-    - cron: "0 3 * * *"
   workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: Total libFuzzer seconds, split across all targets
+        required: false
+        default: '5400'
+        type: string
 
 permissions:
   contents: read
@@ -14,40 +17,62 @@ env:
 
 jobs:
   fuzz:
-    name: ${{ matrix.target }}
+    name: Fuzz (90 minutes)
     runs-on: ubuntu-latest
-    timeout-minutes: 75
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - packet_decode
-          - engine_input
-          - sync_frames
+    timeout-minutes: 100
     steps:
-      - uses: actions/checkout@v4
+      - name: checkout
+        uses: actions/checkout@v4
 
-      - name: Install nightly with sanitizer support
+      - name: install nightly with sanitizer support
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: llvm-tools-preview, rust-src
 
-      - name: Install cargo-fuzz
+      - name: install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
-      - name: Fuzz ${{ matrix.target }} for one hour
-        working-directory: fuzz
-        run: >-
-          cargo +nightly fuzz run ${{ matrix.target }} --
-          -max_total_time=3600
-          -rss_limit_mb=2048
-          -timeout=10
-          -max_len=16384
+      - name: run every target for its share of the budget
+        run: |
+          set -euo pipefail
+          total='${{ inputs.duration_seconds || '5400' }}'
+          mapfile -t targets < <(find fuzz/fuzz_targets -maxdepth 1 -name '*.rs' -printf '%f\n' | sed 's/\.rs$//' | sort)
+          n=${#targets[@]}
+          if [ "$n" -eq 0 ]; then
+            echo 'no fuzz targets found' >&2
+            exit 1
+          fi
+          base=$((total / n))
+          remainder=$((total % n))
+          for i in "${!targets[@]}"; do
+            name=${targets[$i]}
+            per=$base
+            if [ "$i" -lt "$remainder" ]; then
+              per=$((per + 1))
+            fi
+            echo "== $name (${per}s)"
+            mkdir -p "fuzz/corpus/$name"
+            if [ -d "fuzz/seeds/$name" ]; then
+              cargo +nightly fuzz run "$name" "fuzz/corpus/$name" "fuzz/seeds/$name" -- \
+                -max_total_time="$per" \
+                -rss_limit_mb=2048 \
+                -timeout=10 \
+                -max_len=16384
+            else
+              cargo +nightly fuzz run "$name" "fuzz/corpus/$name" -- \
+                -max_total_time="$per" \
+                -rss_limit_mb=2048 \
+                -timeout=10 \
+                -max_len=16384
+            fi
+          done
 
-      - name: Upload crash artifacts
+      - name: upload crashes and corpus
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: fuzz-crash-${{ matrix.target }}
-          path: fuzz/artifacts/${{ matrix.target }}
+          name: fuzz-findings
+          path: |
+            fuzz/artifacts/
+            fuzz/corpus/
           if-no-files-found: ignore
