@@ -9,6 +9,7 @@ use crate::deliver;
 use crate::directory::{DirectoryChange, DirectoryError, NodeDirectory, NodeObservation};
 use crate::forward::{self, Action};
 use crate::neighbor::{MeshConfig, NeighborTable};
+use crate::observability::{MESH_SNAPSHOT_VERSION, MeshSnapshot, saturating_u32};
 use crate::presence::{self, PresenceError, PresenceTracker};
 use crate::receipt::{self, ReceiptError};
 use crate::routehint::{RouteHintMode, RouteHintObservation, RouteHintTable};
@@ -391,7 +392,7 @@ impl<R: RngCore> MeshEngine<R> {
             rng,
             config,
             neighbors: NeighborTable::new(config.max_neighbors),
-            seen: SeenCache::default(),
+            seen: SeenCache::new(config.seen),
             replay: ReplayGuard::new(config.replay),
             budgets,
             suppression: SuppressionTable::new(config.suppression),
@@ -461,6 +462,44 @@ impl<R: RngCore> MeshEngine<R> {
     #[must_use]
     pub fn channels(&self) -> &ChannelRules {
         &self.channels
+    }
+
+    /// Plain-data diagnostics view (MSH-30).
+    ///
+    /// Reading a snapshot never mutates state or allocates: cumulative values
+    /// come from the counters owned by the decision modules, and gauges are
+    /// derived from state the engine already holds. The host may call this on
+    /// a debug screen and map the fields into APP-15's diagnostics bundle;
+    /// no packet content, key or personal data is exposed. `version` selects
+    /// the field layout.
+    #[must_use]
+    pub fn observability_snapshot(&self) -> MeshSnapshot {
+        let mut penalty_total = 0u64;
+        let mut penalty_max = 0u32;
+        let mut penalised_neighbours = 0u32;
+        for neighbor in self.neighbors.iter() {
+            let penalty = self.budgets.penalty(neighbor.link);
+            penalty_total = penalty_total.saturating_add(u64::from(penalty));
+            penalty_max = penalty_max.max(penalty);
+            if penalty > 0 {
+                penalised_neighbours = penalised_neighbours.saturating_add(1);
+            }
+        }
+        let (sync_bytes_sent, sync_bytes_received) = self.sync.byte_totals();
+        MeshSnapshot {
+            version: MESH_SNAPSHOT_VERSION,
+            duplicate_packets: self.seen.duplicates(),
+            suppressed_relays: self.suppression.suppressed_relays(),
+            store_entries: saturating_u32(self.sync.local_len()),
+            sync_bytes_sent,
+            sync_bytes_received,
+            neighbour_penalty_events: self.budgets.penalty_events(),
+            neighbour_penalty_total: penalty_total,
+            neighbour_penalty_max: penalty_max,
+            penalised_neighbours,
+            seen_records: saturating_u32(self.seen.len()),
+            suppression_pending: saturating_u32(self.suppression.len()),
+        }
     }
     /// Whether an acknowledged id is immune from store re-sync (MSH-17).
     ///
@@ -659,6 +698,9 @@ impl<R: RngCore> MeshEngine<R> {
                                     ),
                                 ));
                             }
+                            // A valid frame on a verified link is sync traffic;
+                            // malformed or unverified frames are penalties.
+                            self.sync.note_received_bytes(payload.len());
                             let actions = self.sync.on_v2_frame(now, link, frame, payload.len());
                             return Ok(self.apply_sync_actions(now, actions));
                         }
@@ -693,6 +735,7 @@ impl<R: RngCore> MeshEngine<R> {
                                     ),
                                 ));
                             }
+                            self.sync.note_received_bytes(payload.len());
                             let actions = self.sync.on_frame(now, link, frame);
                             return Ok(self.apply_sync_actions(now, actions));
                         }
@@ -1121,6 +1164,9 @@ impl<R: RngCore> MeshEngine<R> {
                         let msg_id = packet.header.msg_id;
                         let class = packet.header.class;
                         if self.seen.is_duplicate(now, &msg_id) {
+                            // The peek leaves the dedupe window alone, but
+                            // this repeat is still a forwarding duplicate.
+                            self.seen.note_duplicate();
                             return Ok(outputs);
                         }
                         let Some(relay) =
@@ -1602,6 +1648,7 @@ impl<R: RngCore> MeshEngine<R> {
             match action {
                 SyncAction::Send { link, frame } => {
                     if let Some(payload) = frame.encode() {
+                        self.sync.note_sent_bytes(payload.len());
                         outputs.push(MeshOutput::Send {
                             link,
                             channel: Channel::Bulk,
@@ -1611,6 +1658,7 @@ impl<R: RngCore> MeshEngine<R> {
                 }
                 SyncAction::SendV2 { link, frame } => {
                     if let Some(payload) = frame.encode() {
+                        self.sync.note_sent_bytes(payload.len());
                         outputs.push(MeshOutput::Send {
                             link,
                             channel: Channel::Bulk,

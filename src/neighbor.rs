@@ -11,6 +11,7 @@ use crate::directory::DirectoryConfig;
 use crate::presence::PresenceConfig;
 use crate::receipt::ReceiptConfig;
 use crate::routehint::RouteHintConfig;
+use crate::seen::SeenConfig;
 use crate::spray::SprayConfig;
 use crate::suppress::SuppressionConfig;
 use crate::sync::{SummaryConfig, SyncConfig};
@@ -21,6 +22,10 @@ use crate::telemetry::TelemetryConfig;
 pub struct MeshConfig {
     /// Maximum neighbour entries; zero refuses every new link.
     pub max_neighbors: usize,
+    /// Bounds and class windows for forwarding dedupe (MSH-05, ADR-0003).
+    /// The engine creates its one [`crate::SeenCache`] from these limits, so
+    /// the snapshot's `seen_records` gauge has a tested, configurable bound.
+    pub seen: SeenConfig,
     /// Replay acceptance at delivery (MSH-09): the per-sender
     /// message-id window, the timestamp tolerance and the sender cap
     /// for [`ao_idents::ReplayGuard`].
@@ -51,7 +56,8 @@ pub struct MeshConfig {
 }
 
 impl Default for MeshConfig {
-    /// The documented bounds: 32 neighbours; 1024 message ids per
+    /// The documented bounds: 32 neighbours, 4096 seen-cache recordings
+    /// (ADR-0003); 1024 message ids per
     /// sender for 24 h across 64 senders. The tolerance is ADR-0001's
     /// Direct lifetime, so a message carried for a full day still
     /// opens at its recipient instead of reading stale; the window
@@ -67,6 +73,7 @@ impl Default for MeshConfig {
     fn default() -> Self {
         Self {
             max_neighbors: 32,
+            seen: SeenConfig::default(),
             replay: ReplayConfig::new(1_024, 86_400_000, 64)
                 .expect("the documented defaults are within aoIdents' bounds"),
             budgets: BudgetConfig::default(),

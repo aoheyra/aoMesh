@@ -7,6 +7,7 @@
 //! vector MSH-14 will exchange. The digest is a change detector, not a proof
 //! of set equality: MSH-14 confirms differences with a full summary exchange.
 
+use crate::observability::Counter;
 use crate::packet::{MSG_ID_LEN, MessageId, Packet};
 use crate::store::MessageStore;
 use ao_network::LinkId;
@@ -987,6 +988,10 @@ pub(crate) enum SyncAction {
 pub struct SyncTracker {
     config: SyncConfig,
     local: StoreSummary,
+    /// Cumulative wire bytes (MSH-30). Per-contact budgets live on sessions;
+    /// these counters survive contact teardown and cannot be derived from it.
+    bytes_sent_total: Counter,
+    bytes_received_total: Counter,
     sessions: BTreeMap<LinkId, SyncSession>,
     v2_sessions: BTreeMap<LinkId, V2Session>,
 }
@@ -1008,6 +1013,8 @@ impl SyncTracker {
         Self {
             config,
             local: StoreSummary::from_ids(&[]),
+            bytes_sent_total: Counter::new(),
+            bytes_received_total: Counter::new(),
             sessions: BTreeMap::new(),
             v2_sessions: BTreeMap::new(),
         }
@@ -1021,6 +1028,28 @@ impl SyncTracker {
     /// The digest advertised in the current local summary.
     pub(crate) fn local_digest(&self) -> [u8; BEACON_DIGEST_LEN] {
         self.local.digest()
+    }
+
+    /// Number of live store ids in the last host-supplied summary (MSH-30).
+    pub(crate) fn local_len(&self) -> usize {
+        self.local.len()
+    }
+
+    /// Adds actually encoded bytes of an emitted sync frame (MSH-30).
+    pub(crate) fn note_sent_bytes(&mut self, bytes: usize) {
+        self.bytes_sent_total
+            .add(u64::try_from(bytes).unwrap_or(u64::MAX));
+    }
+
+    /// Adds bytes of a valid sync frame accepted on a verified link (MSH-30).
+    pub(crate) fn note_received_bytes(&mut self, bytes: usize) {
+        self.bytes_received_total
+            .add(u64::try_from(bytes).unwrap_or(u64::MAX));
+    }
+
+    /// Saturating cumulative sync bytes sent and received (MSH-30).
+    pub(crate) fn byte_totals(&self) -> (u64, u64) {
+        (self.bytes_sent_total.get(), self.bytes_received_total.get())
     }
 
     /// Resolves a short id back to the full id in the current summary.
@@ -1889,5 +1918,27 @@ mod tests {
             summary.digest(),
             StoreSummary::from_ids(&ids[..MAX_SUMMARY_ENTRIES]).digest()
         );
+    }
+
+    #[test]
+    fn byte_totals_follow_encoded_frames_and_saturate() {
+        let mut tracker = SyncTracker::new(SyncConfig::default());
+        assert_eq!(tracker.byte_totals(), (0, 0));
+        tracker.note_sent_bytes(12);
+        tracker.note_received_bytes(30);
+        assert_eq!(tracker.byte_totals(), (12, 30));
+        tracker.bytes_sent_total.set(u64::MAX - 1);
+        tracker.bytes_received_total.set(u64::MAX);
+        tracker.note_sent_bytes(usize::try_from(u64::MAX).unwrap_or(usize::MAX));
+        tracker.note_received_bytes(1);
+        assert_eq!(tracker.byte_totals(), (u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn local_len_reports_the_host_supplied_summary() {
+        let mut tracker = SyncTracker::new(SyncConfig::default());
+        assert_eq!(tracker.local_len(), 0);
+        tracker.set_local(&[id(1), id(2), id(2), id(3)]);
+        assert_eq!(tracker.local_len(), 3);
     }
 }

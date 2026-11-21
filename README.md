@@ -2,7 +2,7 @@
 
 **The routing and store-and-forward engine of the aoheyra mesh.** A sans-IO Rust crate that decides what happens to a packet: forward it, hold it, suppress it, deliver it, or drop it, across a phone-to-phone mesh where links come and go.
 
-> **Status: pre-alpha, through MSH-29.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest, bounded anti-entropy sync, range-based reconciliation on meeting links, binary spray-and-wait for Direct traffic, signed delivery receipts with bounded store purging, relative-age lifetime ceilings, bounded presence announcements with trickle timing, a bounded ephemeral NodeDirectory with coalesced UI events, bounded reverse-path route hints derived from directory observations, bounded latest-wins telemetry with typed advisory coalescing, local public-channel subscriptions over signed Broadcast envelopes, resource-bounded decoders with nightly fuzz targets, and versioned restart snapshots for seen-cache, immunity and spray state are implemented.
+> **Status: pre-alpha, through MSH-30.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest, bounded anti-entropy sync, range-based reconciliation on meeting links, binary spray-and-wait for Direct traffic, signed delivery receipts with bounded store purging, relative-age lifetime ceilings, bounded presence announcements with trickle timing, a bounded ephemeral NodeDirectory with coalesced UI events, bounded reverse-path route hints derived from directory observations, bounded latest-wins telemetry with typed advisory coalescing, local public-channel subscriptions over signed Broadcast envelopes, resource-bounded decoders with nightly fuzz targets, versioned restart snapshots for seen-cache, immunity and spray state, and a versioned content-free diagnostics snapshot are implemented.
 
 Cargo package name: `ao_mesh`.
 
@@ -32,8 +32,9 @@ aoMesh consumes **aoNetwork** (links and frames) and **aoIdents** (signatures, s
 - **Stores and forwards**: `MessageStore` trait with quotas and eviction, store summary and beacon digest, anti-entropy sync when two nodes meet.
 - **Controls abuse mesh-wide**: per-origin and per-class relay budgets, neighbour penalty scores.
 - Handles **delivery receipts and immunity** so copies are purged after delivery.
-- Maintains a bounded mesh-wide **NodeDirectory** from typed presence observations, with LRU eviction, relative-time expiry and coalesced UI changes; derives bounded **reverse-path route hints** from those facts.
+- Maintains bounded **presence** announcements and a mesh-wide **NodeDirectory** from typed observations, with LRU eviction, relative-time expiry and coalesced UI changes; derives bounded **reverse-path route hints** from those facts.
 - Publishes **Telemetry** as latest-wins ambient state with NET-21 coalescing, and carries **public channels** as bounded envelopes inside signed Broadcast packets with local-only subscriptions.
+- Exposes **bounded diagnostics counters** as a versioned, content-free snapshot for the host.
 - Ships a **simulator harness** with mobility models and metrics, so every routing parameter can be swept and every claim measured.
 
 ## What it deliberately does not do
@@ -72,6 +73,7 @@ Lifetimes, TTLs, copy counts and budgets are **defaults with documented reasons*
  │  ├─ store: MessageStore trait · quotas · expiry     │
  │  ├─ sync: summary · digest · anti-entropy v1 (v2)   │
  │  ├─ receipts and immunity                           │
+ │  ├─ observability: bounded counters · snapshot      │
  │  └─ presence · NodeDirectory · route hints · channels│
  └─────────────────────────────────────────────────────┘
        ▲  thin async adapter (feature `adapter`)
@@ -83,12 +85,11 @@ Lifetimes, TTLs, copy counts and budgets are **defaults with documented reasons*
 
 ### Engine and adapter (MSH-06)
 
-`MeshEngine::new(rng)` uses `MeshConfig::default()`: 32 neighbour entries, the
-MSH-09 replay guard (1024 ids per sender, 24 h tolerance, 64 senders), the
-budget fields below, the MSH-11 suppression fields, the MSH-13 summary
-fields, the MSH-14/15 sync fields and the MSH-23 channel bounds below.
-`with_config`
-accepts explicit bounds; zero neighbours
+`MeshEngine::new(rng)` uses `MeshConfig::default()`: 32 neighbour entries,
+4096 MSH-05 seen-cache recordings, the MSH-09 replay guard (1024 ids per
+sender, 24 h tolerance, 64 senders), the budget fields below, the MSH-11
+suppression fields, the MSH-13 summary fields, the MSH-14/15 sync fields and
+the MSH-23 channel bounds below. `with_config` accepts explicit bounds; zero neighbours
 refuses all new links. Excess links emit `Release`, duplicate link-up events
 preserve counters, and link-down removes the entry. These are bookkeeping
 limits, not radio topology policy.
@@ -133,6 +134,10 @@ by `next_deadline()`, and recreates
 borrows the identity and an eight-byte card hash so MSH-19 can sign and emit a
 due announcement; its state is only a sequence number and a deadline. Tick is
 explicit; no mesh timers are scheduled yet.
+
+`MeshEngine::observability_snapshot()` and `NetworkAdapter::snapshot()` return the same
+versioned, content-free diagnostics view (MSH-30). The adapter adds no I/O,
+clock read or second counter; see [Observability](#observability-msh-30).
 
 ```bash
 cargo run --features adapter --example mesh_adapter
@@ -991,3 +996,52 @@ covers the forwarding seen-cache, receipt immunity and spray tickets;
 stored packets, RNG state, config and radio sessions remain with the host.
 See the engine `Snapshot` trait and the paired restart report described in
 the seen-cache section above.
+## Observability (MSH-30)
+
+`MeshSnapshot` is a plain, versioned bundle of saturating counters and gauges.
+The host can map it directly into aoheyra's APP-15 diagnostics bundle; this
+crate performs no logging, file I/O or network export. `version` selects the
+field layout, so a host must switch on `MESH_SNAPSHOT_VERSION` before reading
+fields it does not recognise. Reading a snapshot is side-effect free: gauges
+are derived from state the engine already holds for routing policy.
+
+| Field | Meaning | Bound / owner |
+|---|---|---|
+| `duplicate_packets` | Duplicate verdicts from forwarding dedupe | Saturating `u64`; `SeenCache` |
+| `suppressed_relays` | Flood relays cancelled by MSH-11 | Saturating `u64`; `SuppressionTable` |
+| `store_entries` | Live ids from the last `MeshInput::StoreSummary` | `u32`; host-owned store |
+| `sync_bytes_sent` | Encoded sync frame bytes emitted on Bulk | Saturating `u64`; `SyncTracker` |
+| `sync_bytes_received` | Decoded sync frame bytes from verified neighbours | Saturating `u64`; `SyncTracker` |
+| `neighbour_penalty_events` | Positive penalty applications, including decayed ones | Saturating `u64`; `BudgetTracker` |
+| `neighbour_penalty_total`, `neighbour_penalty_max`, `penalised_neighbours` | Current decayable penalty scores | Existing neighbour table |
+| `seen_records`, `suppression_pending` | Live bounded table entries | `SeenConfig::capacity`, `SuppressionConfig::max_entries` |
+
+Counters are owned by the module that makes the decision, so there is no
+second source of truth. Cumulative counters saturate instead of wrapping under
+hostile traffic. Malformed or unverified frames add a neighbour penalty but are
+not counted as sync bytes. No field carries packet content, `MessageId`, keys,
+identities or personal data. The wire format and MSH-27 CSV schema are
+unchanged.
+
+```bash
+cargo run --release --all-features --example observability_report
+cargo test --release --all-features --test sim_observability
+cargo test --release --all-features --test observability
+```
+
+The fixed 20-node mixed scenario has seed `1297304021`; four malformed frames
+are injected from node 0 after traffic starts. The measured report row is:
+
+| Scenario | Seed | Submitted / delivered | Duplicates | Suppressed | Store ids | Sync bytes sent / received | Penalty events | Seen / pending |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `observability-mixed-20` | 1297304021 | 40 / 6 | 323 | 120 | 88 | 820 / 820 | 4 | 552 / 0 |
+
+The row was remeasured on the accumulated MSH-19 stack: the two-distinct-link
+suppression floor changed which relays cancel a flood, so it is not comparable
+to the original 367/193/89/512/7 measurement. No MSH-27 threshold was lowered.
+Current penalties are zero at the end because scores decay after the four
+events; `neighbour_penalty_events` is the durable evidence that the hostile
+neighbour was accounted for. `tests/sim_observability.rs` locks every value,
+and `tests/observability.rs` covers adapter mapping, stability, bounds and
+absence of content leakage. The actual APP-15 bundle wiring belongs to
+aoheyra and consumes this plain snapshot.

@@ -641,3 +641,44 @@ The default worst case is 4096 seen entries (id, class, expiry plus order slot),
 The paired report with seed `1297303584` on line-20 produced 5,374-byte
 snapshots and showed 14 post-restart re-relays without restore versus zero with
 restore, with delivery unchanged at 20/20.
+## MSH-30 implementation
+
+Four designs were considered for diagnostics. A log or event stream would add
+I/O, risk recording payload-derived data and make a phone debug screen replay
+state. A central engine counter bundle would work, but every decision module
+would need to call into it, creating a second source of truth that could drift
+from `SeenCache`, `SuppressionTable`, `BudgetTracker` or `SyncTracker`.
+Recomputing cumulative counts by scanning bounded tables cannot count expired
+or decayed events at all. The chosen design puts each saturating counter in
+the module that owns the decision; the engine only reads those counters and
+derives current gauges from state already held for routing. Delivery ratio,
+latency and transmission overhead are unchanged because no decision, timer,
+packet field or retry changes. Snapshot reads are O(number of neighbours) and
+allocate nothing; the alternative central design has the same CPU cost but
+weaker ownership, while logging has unbounded battery and storage cost.
+
+| Setting | Default | Reason |
+|---|---|---|
+| Snapshot version | 1 | Hosts switch on a plain integer before interpreting fields |
+| Counter width | `u64`, saturating | No wrap under hostile traffic; fixed O(1) memory |
+| `MeshConfig::seen` | `SeenConfig::default()` (4096 entries) | Makes the existing MSH-05 bound explicit for the `seen_records` gauge |
+| Gauge width | `u32`, clamped | Matches the existing bounded tables without widening public state |
+
+No new map, queue, key, payload or I/O is added. Duplicate and suppression
+counters increment only on their modules' positive verdicts; zero-amount
+penalty decay probes are not events; sync bytes are counted only for encoded
+frames actually emitted or structurally decoded sync frames on verified
+links. Store occupancy is the live id count from the latest host summary, not
+a byte count. Manifest data and content are excluded from the snapshot.
+
+The fixed mixed scenario has seed `1297304021`, 20 nodes and four malformed
+frames injected from node 0. It reports 40 submitted / 6 delivered, 323
+duplicate packets, 120 suppressed relays, 88 store ids, 820 sync bytes sent
+and received, four penalty events, 552 seen records and no pending suppression
+windows. The original 367/193/89/512/7 row was measured before MSH-19 raised
+the suppression floor to two distinct sending links; the row was remeasured on
+the accumulated stack rather than weakening any gate. Current penalties are
+zero at the end by design because scores decay; the cumulative event counter
+is the durable evidence. These metrics are additive and outside the MSH-27 CSV
+schema, so no baseline threshold was weakened. The host maps this plain snapshot into APP-15; aoMesh
+does not implement that bundle.

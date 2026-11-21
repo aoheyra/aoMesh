@@ -124,6 +124,14 @@ impl<R: RngCore, T: Transport> NetworkAdapter<R, T> {
     pub fn engine(&self) -> &MeshEngine<R> {
         &self.engine
     }
+    /// The engine's versioned diagnostics snapshot (MSH-30).
+    ///
+    /// The host maps these plain integer fields into its own diagnostics
+    /// bundle; the adapter adds no I/O, clock read or second counter.
+    #[must_use]
+    pub fn snapshot(&self) -> crate::MeshSnapshot {
+        self.engine.observability_snapshot()
+    }
     /// Inspect the network and its transport.
     pub fn network(&self) -> &Network<T> {
         &self.network

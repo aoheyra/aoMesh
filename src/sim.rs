@@ -466,6 +466,50 @@ pub struct Metrics {
     ///
     /// Not part of the CSV report.
     pub restart_sends_after: u64,
+    /// Sum of per-node duplicate counters (MSH-30).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub duplicate_packets: u64,
+    /// Sum of per-node cancelled relays (MSH-30).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub suppressed_relays: u64,
+    /// Sum of live store ids in the last store summary at each node (MSH-30).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub store_entries: u64,
+    /// Sum of encoded sync bytes sent by every node (MSH-30).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub sync_bytes_sent: u64,
+    /// Sum of valid sync bytes received by every node (MSH-30).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub sync_bytes_received: u64,
+    /// Sum of neighbour penalty applications (MSH-30).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub neighbour_penalty_events: u64,
+    /// Sum of current neighbour penalty scores at the end (MSH-30).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub neighbour_penalty_total: u64,
+    /// Largest current penalty score at any node (MSH-30).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub neighbour_penalty_max: u32,
+    /// Number of neighbours with a non-zero penalty at the end (MSH-30).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub penalised_neighbours: u64,
+    /// Sum of seen-cache recordings at the end (MSH-30).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub seen_records: u64,
+    /// Sum of pending suppression windows at the end (MSH-30).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub suppression_pending: u64,
 }
 
 impl Metrics {
@@ -843,11 +887,78 @@ pub fn spray_scenarios() -> Vec<Scenario> {
     ]
 }
 
-/// MSH-17's paired store-purge case.
+/// Simulator-only hostile-neighbour injection (MSH-30).
 ///
-/// Both rows use spray so their stores are actually populated; the only
-/// difference is the receipt bit. This isolates bounded immunity gossip from
-/// the MSH-16 delivery measurements, whose published rows stay unchanged.
+/// This is never available to a real radio: the harness writes malformed
+/// bytes straight into aoNetwork's facade from one node, so the receiving
+/// engine exercises its penalty path without changing the sender's engine.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Injection {
+    /// Node index whose facade emits malformed frames.
+    pub from: usize,
+    /// Number of one-byte frames to emit, at most one per pump step.
+    pub invalid_frames: usize,
+}
+
+/// One MSH-30 scenario and the hostile neighbour traffic layered on it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservabilityScenario {
+    /// The ordinary seeded scenario.
+    pub scenario: Scenario,
+    /// Malformed frames injected after traffic has started.
+    pub injection: Injection,
+}
+
+/// The fixed MSH-30 counter scenario.
+///
+/// Mixed Broadcast/Direct traffic fills the suppression and dedupe counters,
+/// spray populates host stores and starts anti-entropy contacts for sync
+/// bytes, and a scripted malformed-frame neighbour exercises penalties. The
+/// seed and injection schedule are fixed; `tests/sim_observability.rs` locks
+/// the resulting numbers.
+pub fn observability_scenarios() -> Vec<ObservabilityScenario> {
+    vec![ObservabilityScenario {
+        scenario: Scenario {
+            name: "observability-mixed-20",
+            seed: 1_297_304_021,
+            nodes: 20,
+            topology: Topology::Random,
+            mobility: Mobility::Static,
+            settle: Duration::from_secs(30),
+            run: Duration::from_secs(60),
+            messages: 40,
+            payload_len: 128,
+            traffic: Traffic::MixedBroadcast {
+                origin: 0,
+                direct_every: 5,
+            },
+            enforce_budgets: true,
+            enforce_suppression: true,
+            spray: true,
+            receipts: false,
+            route_hint: RouteHintMode::Off,
+            suppression: SuppressionConfig::default(),
+            presence: false,
+            presence_config: PresenceConfig::default(),
+            directory: None,
+            telemetry: TelemetryConfig::default(),
+            restart: None,
+        },
+        injection: Injection {
+            from: 0,
+            invalid_frames: 4,
+        },
+    }]
+}
+
+/// Runs one MSH-30 scenario with its injection attached.
+pub fn run_observability(experiment: ObservabilityScenario) -> Metrics {
+    let mut simulation = Simulation::new(experiment.scenario);
+    simulation.injection = experiment.injection;
+    simulation.run()
+}
+
+/// The fixed MSH-17 receipt and purge comparison scenarios.
 pub fn receipt_scenarios() -> Vec<Scenario> {
     let line = Scenario {
         name: "receipt-relay-line-20",
@@ -1324,6 +1435,8 @@ pub struct Simulation {
     sent_ids: Vec<BTreeSet<MessageId>>,
     probe_wires: Vec<Option<(LinkId, Channel, Vec<u8>)>>,
     link_hellos: Vec<BTreeMap<LinkId, Hello>>,
+    injection: Injection,
+    injected_invalid: usize,
 }
 
 impl Simulation {
@@ -1598,6 +1711,8 @@ impl Simulation {
             sent_ids: vec![BTreeSet::new(); n],
             probe_wires: vec![None; n],
             link_hellos: vec![BTreeMap::new(); n],
+            injection: Injection::default(),
+            injected_invalid: 0,
         };
         sim.apply_ranges();
         sim
@@ -2578,10 +2693,7 @@ impl Simulation {
         let n = self.nodes.len();
         let mut snapshots = Vec::with_capacity(n);
         for i in 0..n {
-            let bytes = self.nodes[i]
-                .adapter
-                .engine()
-                .snapshot()
+            let bytes = crate::Snapshot::snapshot(self.nodes[i].adapter.engine())
                 .expect("engine state has a valid snapshot");
             self.restart_snapshot_bytes = self.restart_snapshot_bytes.max(bytes.len());
             snapshots.push(bytes);
@@ -2644,6 +2756,37 @@ impl Simulation {
         }
     }
 
+    /// Sends one structurally invalid frame directly through a node's
+    /// network facade. Only MSH-30's simulator scenario calls this: a real
+    /// radio can never drive the engine from this harness hook.
+    fn inject_invalid(&mut self) {
+        if self.injected_invalid >= self.injection.invalid_frames
+            || self.injection.from >= self.nodes.len()
+        {
+            return;
+        }
+        let Some(link) = self.nodes[self.injection.from]
+            .adapter
+            .network()
+            .links()
+            .first()
+            .map(|info| info.link)
+        else {
+            return;
+        };
+        let now = self.world.now();
+        if self.nodes[self.injection.from]
+            .adapter
+            .network_mut()
+            .send(now, link, Channel::Message, vec![0xff])
+            .is_err()
+        {
+            self.send_failures += 1;
+            return;
+        }
+        self.injected_invalid += 1;
+    }
+
     /// Runs the full scenario and returns its metrics.
     pub fn run(mut self) -> Metrics {
         let settle_steps = (self.scenario.settle.as_millis() / TICK.as_millis()) as usize;
@@ -2667,6 +2810,8 @@ impl Simulation {
             self.scenario.traffic,
             Traffic::Telemetry { burst: true, .. }
         );
+        let inject_at = (steps / 2).max(1);
+        let inject_every = (steps / 16).max(1);
         for step in 0..steps {
             if burst_telemetry {
                 // All updates are accepted into the send queue before the
@@ -2690,6 +2835,12 @@ impl Simulation {
                         self.restart();
                     }
                 }
+            }
+            if self.injection.invalid_frames > 0
+                && step >= inject_at
+                && (step - inject_at) % inject_every == 0
+            {
+                self.inject_invalid();
             }
             self.pump(1);
             let now_ms = self.world.now().as_millis() as u64;
@@ -2751,6 +2902,35 @@ impl Simulation {
             .copied()
             .max()
             .unwrap_or(0);
+        let mut duplicate_packets = 0u64;
+        let mut suppressed_relays = 0u64;
+        let mut store_entries = 0u64;
+        let mut sync_bytes_sent = 0u64;
+        let mut sync_bytes_received = 0u64;
+        let mut neighbour_penalty_events = 0u64;
+        let mut neighbour_penalty_total = 0u64;
+        let mut neighbour_penalty_max = 0u32;
+        let mut penalised_neighbours = 0u64;
+        let mut seen_records = 0u64;
+        let mut suppression_pending = 0u64;
+        for node in &self.nodes {
+            let snapshot = node.adapter.engine().observability_snapshot();
+            duplicate_packets = duplicate_packets.saturating_add(snapshot.duplicate_packets);
+            suppressed_relays = suppressed_relays.saturating_add(snapshot.suppressed_relays);
+            store_entries = store_entries.saturating_add(u64::from(snapshot.store_entries));
+            sync_bytes_sent = sync_bytes_sent.saturating_add(snapshot.sync_bytes_sent);
+            sync_bytes_received = sync_bytes_received.saturating_add(snapshot.sync_bytes_received);
+            neighbour_penalty_events =
+                neighbour_penalty_events.saturating_add(snapshot.neighbour_penalty_events);
+            neighbour_penalty_total =
+                neighbour_penalty_total.saturating_add(snapshot.neighbour_penalty_total);
+            neighbour_penalty_max = neighbour_penalty_max.max(snapshot.neighbour_penalty_max);
+            penalised_neighbours =
+                penalised_neighbours.saturating_add(u64::from(snapshot.penalised_neighbours));
+            seen_records = seen_records.saturating_add(u64::from(snapshot.seen_records));
+            suppression_pending =
+                suppression_pending.saturating_add(u64::from(snapshot.suppression_pending));
+        }
         Metrics {
             scenario: self.scenario.name,
             seed: self.scenario.seed,
@@ -2850,6 +3030,17 @@ impl Simulation {
             telemetry_distinct_seqs,
             telemetry_max_seqs_per_node,
             telemetry_max_seq,
+            duplicate_packets,
+            suppressed_relays,
+            store_entries,
+            sync_bytes_sent,
+            sync_bytes_received,
+            neighbour_penalty_events,
+            neighbour_penalty_total,
+            neighbour_penalty_max,
+            penalised_neighbours,
+            seen_records,
+            suppression_pending,
         }
     }
 }
@@ -3366,6 +3557,17 @@ mod tests {
             restart_snapshot_bytes: 0,
             restart_replays: 0,
             restart_sends_after: 0,
+            duplicate_packets: 2,
+            suppressed_relays: 3,
+            store_entries: 4,
+            sync_bytes_sent: 5,
+            sync_bytes_received: 6,
+            neighbour_penalty_events: 7,
+            neighbour_penalty_total: 8,
+            neighbour_penalty_max: 2,
+            penalised_neighbours: 1,
+            seen_records: 9,
+            suppression_pending: 10,
         };
         let row = m.csv_row();
         assert_eq!(row.lines().count(), 1);
