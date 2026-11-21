@@ -128,8 +128,8 @@ impl SuppressionConfig {
         let base = low + (rng.next_u64() % span);
         let reference = self.degree_ref.max(1) as u128;
         let scaled = (base as u128)
-            .saturating_mul(reference)
-            .checked_div(degree.max(1) as u128)
+            .saturating_mul(degree.max(1) as u128)
+            .checked_div(reference)
             .unwrap_or(base as u128);
         let scaled = scaled.min(u64::MAX as u128) as u64;
         scaled.clamp(self.min_delay_ms, self.max_delay_ms.max(self.min_delay_ms))
