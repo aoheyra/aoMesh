@@ -7,7 +7,8 @@ use crate::neighbor::{MeshConfig, NeighborTable};
 use crate::seen::{Offer, SeenCache};
 use crate::suppress::{self, Sighting, SuppressionTable};
 use crate::sync::{
-    BeaconTracker, SHORT_ID_BYTES, StoreSummary, SyncAction, SyncFrame, SyncOffer, SyncTracker,
+    BeaconTracker, SHORT_ID_BYTES, StoreSummary, SyncAction, SyncFrame, SyncFrameV2, SyncOffer,
+    SyncTracker,
 };
 use crate::{Header, MessageId, Packet, PacketError, sign_packet};
 use ao_idents::{IdentError, Identity, ReplayGuard, Signature};
@@ -315,16 +316,23 @@ impl<R: RngCore> MeshEngine<R> {
                 let hello = crate::hello::verified_hello(remote_hello.app_hello.as_bytes()).ok();
                 let node_id = hello.map(|hello| hello.node_id);
                 self.neighbors.insert(now, link, remote_hello, node_id);
-                let cap_sync_v1 = hello.is_some_and(|hello| {
+                let caps = hello.and_then(|hello| {
                     hello
                         .negotiate(crate::hello::PROTO, crate::hello::CAPS)
-                        .is_ok_and(|(_, caps)| caps & crate::hello::CAP_SYNC_V1 != 0)
+                        .ok()
+                        .map(|(_, caps)| caps)
                 });
-                if !cap_sync_v1 {
+                let Some(caps) = caps else {
                     return Ok(Vec::new());
-                }
+                };
                 let remote_digest = hello.map_or([0; 4], |hello| hello.store_digest);
-                let actions = self.sync.start(now, link, remote_digest);
+                let actions = if caps & crate::hello::CAP_SYNC_V2 != 0 {
+                    self.sync.start_v2(now, link, remote_digest)
+                } else if caps & crate::hello::CAP_SYNC_V1 != 0 {
+                    self.sync.start(now, link, remote_digest)
+                } else {
+                    Vec::new()
+                };
                 Ok(self.apply_sync_actions(actions))
             }
             MeshInput::LinkDown { link, .. } => {
@@ -343,6 +351,43 @@ impl<R: RngCore> MeshEngine<R> {
                 // let arbitrary link ids create either.
                 if !self.neighbors.contains(link) {
                     return Ok(Vec::new());
+                }
+                if channel == Channel::Bulk
+                    && payload.first() == Some(&crate::sync::SYNC_MAGIC)
+                    && payload.get(1) == Some(&crate::sync::SYNC_V2_VERSION)
+                {
+                    match SyncFrameV2::decode(payload) {
+                        Ok(Some(frame)) => {
+                            let verified = self
+                                .neighbors
+                                .get(link)
+                                .is_some_and(|neighbor| neighbor.node_id.is_some());
+                            if !verified {
+                                return Ok(Self::release_if_penalised(
+                                    link,
+                                    self.budgets.penalize(
+                                        now,
+                                        link,
+                                        self.config.budgets.penalty_unverified,
+                                    ),
+                                ));
+                            }
+                            let actions = self.sync.on_v2_frame(now, link, frame, payload.len());
+                            return Ok(self.apply_sync_actions(actions));
+                        }
+                        Ok(None) => {}
+                        Err(_) => {
+                            self.neighbors.reject(link);
+                            return Ok(Self::release_if_penalised(
+                                link,
+                                self.budgets.penalize(
+                                    now,
+                                    link,
+                                    self.config.budgets.penalty_invalid,
+                                ),
+                            ));
+                        }
+                    }
                 }
                 if channel == Channel::Bulk {
                     match SyncFrame::decode(payload) {
@@ -636,6 +681,15 @@ impl<R: RngCore> MeshEngine<R> {
         for action in actions {
             match action {
                 SyncAction::Send { link, frame } => {
+                    if let Some(payload) = frame.encode() {
+                        outputs.push(MeshOutput::Send {
+                            link,
+                            channel: Channel::Bulk,
+                            payload,
+                        });
+                    }
+                }
+                SyncAction::SendV2 { link, frame } => {
                     if let Some(payload) = frame.encode() {
                         outputs.push(MeshOutput::Send {
                             link,
