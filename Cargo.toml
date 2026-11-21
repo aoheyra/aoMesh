@@ -54,6 +54,10 @@ name = "sim_report"
 required-features = ["sim"]
 
 [[example]]
+name = "presence_report"
+required-features = ["sim"]
+
+[[example]]
 name = "sync_v2_report"
 required-features = ["sim"]
 

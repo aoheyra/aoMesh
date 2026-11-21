@@ -203,8 +203,10 @@ fn assert_delivered_once(events: &[(usize, AdapterEvent)], dst: usize) {
             AdapterEvent::SyncNeed { .. } | AdapterEvent::SyncItem { .. } => {
                 panic!("unexpected sync event in a forwarding test: {event:?}")
             }
-            AdapterEvent::Purge { .. } | AdapterEvent::Delivered { .. } => {
-                panic!("unexpected receipt event in a forwarding test: {event:?}")
+            AdapterEvent::Purge { .. }
+            | AdapterEvent::Delivered { .. }
+            | AdapterEvent::CardFetch { .. } => {
+                panic!("unexpected receipt or presence event in a forwarding test: {event:?}")
             }
         }
     }

@@ -341,10 +341,26 @@ fn an_expired_contact_is_released() {
         )
         .unwrap();
     let _ = service(&mut a, &store, 100, out);
-    let out = a.handle(20_100, MeshInput::Tick).unwrap();
+    let out = a
+        .handle(
+            20_100,
+            MeshInput::Tick {
+                identity: &owner,
+                card_hash: [0; 8],
+            },
+        )
+        .unwrap();
     let serviced = service(&mut a, &store, 20_100, out);
     assert_eq!(serviced.releases, 1, "the 20 second deadline releases once");
-    let out = a.handle(20_101, MeshInput::Tick).unwrap();
+    let out = a
+        .handle(
+            20_101,
+            MeshInput::Tick {
+                identity: &owner,
+                card_hash: [0; 8],
+            },
+        )
+        .unwrap();
     let serviced = service(&mut a, &store, 20_101, out);
     assert_eq!(serviced.releases, 0, "release is not repeated");
 }

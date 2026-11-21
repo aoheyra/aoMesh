@@ -7,6 +7,29 @@ change without notice until v0.1.0, and consumers pin by git tag
 
 ## Unreleased
 
+MSH-19 adds bounded presence announcements. An ordinary signed `Presence`
+packet carries a fixed 150-byte body with the origin's card hash, capabilities,
+sequence and existing public identity, so every relay can verify the binding
+and signature without storing keys or consulting a directory. `MeshHello`
+advertises `CAP_PRESENCE_V1` (`1 << 4`); legacy peers keep the previous Presence
+relay path. Trickle timing, latest-wins ordering, bounded learned entries and
+one-shot `CardFetch` host events are implemented in the new `presence` module.
+The fixed 50-node report on seed `1297304021` learns 49 of 49 peers in 50 ms,
+emits no card fetches, and uses 15,480 B/h per source at steady state against
+the 64 KiB/h budget. The one-copy cancellation in MSH-11 suppression is also
+fixed at the algorithm level: the effective threshold is floored at two
+distinct sending links for every flooded class, with a unit regression. The
+MSH-17 enabled 200-node report consequently sends 27,926 instead of 27,958
+packets on seed `1297303752`; delivery, receipts, purges and purge latency are
+unchanged.
+
+Breaking unreleased API change: `MeshInput::Tick` now takes a borrowed
+`Identity` and an eight-byte card hash. New host seams are
+`MeshInput::KnownCards` and `MeshOutput::CardFetch` (surfaced by the adapter as
+`AdapterEvent::CardFetch`); `poll_event` and `next_event` signatures are
+unchanged. `MeshConfig` gains a `presence: PresenceConfig` field and
+`MeshEngine::presence()` exposes read-only learned state.
+
 MSH-17 adds signed delivery receipts and bounded store immunity. An
 authenticated delivery emits a cap-gated receipt envelope carrying a signed
 Direct acknowledgement, the destination's public identity and the original

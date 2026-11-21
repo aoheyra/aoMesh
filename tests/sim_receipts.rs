@@ -3,7 +3,9 @@
 //! Values come from `cargo run --release --all-features --example
 //! receipt_report`. Both rows use spray so stores are populated; only the
 //! receipt capability differs. Seeds are fixed in
-//! [`ao_mesh::sim::receipt_scenarios`].
+//! [`ao_mesh::sim::receipt_scenarios`]. The enabled 200-node row dropped from
+//! 27,958 to 27,926 transmissions when MSH-19 floored suppression at two
+//! distinct sending links; delivery, receipts, purges and latency are unchanged.
 
 #![cfg(all(feature = "sim", not(miri)))]
 
@@ -65,7 +67,7 @@ fn expected() -> Vec<Expected> {
             purges: 1_341,
             remaining_copies: 0,
             max_purge_latency_ms: 1_750,
-            transmissions: 27_958,
+            transmissions: 27_926,
         },
     ]
 }

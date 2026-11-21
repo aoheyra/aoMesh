@@ -36,6 +36,7 @@ mod forward;
 pub mod hello;
 pub mod neighbor;
 pub mod packet;
+pub mod presence;
 pub mod receipt;
 pub mod seen;
 pub mod sign;
@@ -51,10 +52,15 @@ pub use adapter::{AdapterEvent, NetworkAdapter};
 pub use budget::{BudgetConfig, BudgetOutcome, BudgetTracker, ClassRate};
 pub use engine::{MeshEngine, MeshError, MeshInput, MeshOutput};
 pub use hello::{
-    CAP_RECEIPT_V1, CAP_SPRAY_V1, CAP_SYNC_V1, CAP_SYNC_V2, CAPS, HelloError, MeshHello,
+    CAP_PRESENCE_V1, CAP_RECEIPT_V1, CAP_SPRAY_V1, CAP_SYNC_V1, CAP_SYNC_V2, CAPS, HelloError,
+    MeshHello,
 };
 pub use neighbor::{MeshConfig, Neighbor, NeighborTable};
 pub use packet::{Header, MessageId, Packet, PacketClass, PacketError, SIGNATURE_LEN};
+pub use presence::{
+    ANNOUNCE_LEN, ANNOUNCE_MAGIC, ANNOUNCE_VERSION, Announcement, PresenceConfig, PresenceError,
+    PresenceTracker, encode_announcement, verify_announcement,
+};
 pub use receipt::{RECEIPT_MAGIC, RECEIPT_VERSION, ReceiptConfig, ReceiptError, ReceiptTracker};
 pub use seen::{Offer, SeenCache, SeenConfig};
 pub use sign::{

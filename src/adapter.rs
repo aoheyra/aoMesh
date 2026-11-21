@@ -55,6 +55,14 @@ pub enum AdapterEvent {
         /// Authenticated destination that issued the receipt.
         by: [u8; 16],
     },
+    /// The host must fetch an identity card it does not yet know (MSH-19).
+    /// The adapter neither resolves nor caches cards.
+    CardFetch {
+        /// Node whose signed announcement advertised the card.
+        node_id: [u8; 16],
+        /// Opaque hash to resolve out of band.
+        card_hash: [u8; 8],
+    },
     /// A peer's item is ready for the store owner to validate and insert.
     SyncItem {
         /// Full content address parsed from the packet.
@@ -166,6 +174,9 @@ impl<R: RngCore, T: Transport> NetworkAdapter<R, T> {
                 MeshOutput::Purge { id } => events.push(AdapterEvent::Purge { id }),
                 MeshOutput::Delivered { id, origin, by } => {
                     events.push(AdapterEvent::Delivered { id, origin, by })
+                }
+                MeshOutput::CardFetch { node_id, card_hash } => {
+                    events.push(AdapterEvent::CardFetch { node_id, card_hash })
                 }
             }
         }

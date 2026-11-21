@@ -4,6 +4,7 @@ use crate::budget::{BudgetOutcome, BudgetTracker};
 use crate::deliver;
 use crate::forward::{self, Action};
 use crate::neighbor::{MeshConfig, NeighborTable};
+use crate::presence::{self, PresenceError, PresenceTracker};
 use crate::receipt::{self, ReceiptError};
 use crate::seen::{Offer, SeenCache};
 use crate::suppress::{self, Sighting, SuppressionTable};
@@ -66,8 +67,24 @@ pub enum MeshInput<'a> {
         /// One item per requested prefix, in host order.
         items: &'a [SyncOffer<'a>],
     },
-    /// Time-driven step; fires MSH-11 timers and MSH-14 contact deadlines.
-    Tick,
+    /// Time-driven step; fires MSH-11 timers, MSH-14 contact deadlines and
+    /// MSH-19's presence trickle. The identity and card hash are borrowed for
+    /// this call only; a change produces an announcement after the quick
+    /// delay, then quiet refreshes back off to the steady interval.
+    Tick {
+        /// Borrowed signing identity; the engine retains no key.
+        identity: &'a Identity,
+        /// Opaque eight-byte hash of the host's current identity card.
+        card_hash: [u8; 8],
+    },
+    /// Card hashes the host already knows (MSH-19). An announcement carrying
+    /// any other hash produces a [`MeshOutput::CardFetch`]; the mesh never
+    /// fetches, stores or interprets cards.
+    KnownCards {
+        /// The host's complete known-hash set, bounded by
+        /// [`crate::PresenceConfig::max_known_cards`].
+        hashes: &'a [[u8; 8]],
+    },
     /// Originate a packet. This does not encrypt or deliver its payload.
     Submit {
         /// Borrowed only for this signing call; the engine retains no keys.
@@ -184,6 +201,15 @@ pub enum MeshOutput {
         /// Authenticated destination that issued the receipt.
         by: [u8; 16],
     },
+    /// Ask the host to fetch an identity card it does not yet know (MSH-19).
+    /// This is a host action, not a network send; the engine emits it once per
+    /// node and card hash and never interprets the card.
+    CardFetch {
+        /// Node whose announcement advertised the unknown card.
+        node_id: [u8; 16],
+        /// Opaque card hash to resolve.
+        card_hash: [u8; 8],
+    },
 }
 
 /// Submission failure; no packet is emitted on error.
@@ -197,6 +223,8 @@ pub enum MeshError {
     UnknownLink(LinkId),
     /// A locally generated receipt could not be signed or encoded.
     Receipt(ReceiptError),
+    /// Presence configuration or local announcement signing failed.
+    Presence(PresenceError),
 }
 impl core::fmt::Display for MeshError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -205,6 +233,7 @@ impl core::fmt::Display for MeshError {
             Self::Signing(e) => write!(f, "signing failed: {e}"),
             Self::UnknownLink(link) => write!(f, "unknown submission link: {link:?}"),
             Self::Receipt(error) => write!(f, "receipt failed: {error}"),
+            Self::Presence(error) => write!(f, "presence failed: {error}"),
         }
     }
 }
@@ -230,6 +259,7 @@ pub struct MeshEngine<R: RngCore> {
     sync: SyncTracker,
     spray: crate::spray::SprayTracker,
     receipt: crate::receipt::ReceiptTracker,
+    presence: PresenceTracker,
 }
 impl<R: RngCore> MeshEngine<R> {
     /// Creates an engine with the default limits (`MeshConfig::default`).
@@ -254,6 +284,7 @@ impl<R: RngCore> MeshEngine<R> {
             sync: SyncTracker::new(config.sync),
             spray: crate::spray::SprayTracker::new(config.spray),
             receipt: crate::receipt::ReceiptTracker::new(config.receipt),
+            presence: PresenceTracker::new(config.presence),
         }
     }
     /// Read-only bookkeeping, not a list of authenticated identities.
@@ -278,6 +309,10 @@ impl<R: RngCore> MeshEngine<R> {
     /// carry the same ticket the relay policy holds.
     pub fn spray_copies_left(&self, id: MessageId) -> u8 {
         self.spray.copies_left(id)
+    }
+    /// Read-only learned presence state (MSH-19), for host diagnostics.
+    pub fn presence(&self) -> &PresenceTracker {
+        &self.presence
     }
     /// Whether an acknowledged id is immune from store re-sync (MSH-17).
     #[cfg(feature = "sim")]
@@ -334,12 +369,22 @@ impl<R: RngCore> MeshEngine<R> {
                 let actions = self.sync.on_offers(link, items);
                 Ok(self.apply_sync_actions(now, actions))
             }
-            MeshInput::Tick => {
+            MeshInput::Tick {
+                identity,
+                card_hash,
+            } => {
                 let mut outputs = self.drain_due(now);
                 self.receipt.expire(now);
                 let actions = self.sync.expire(now);
                 outputs.extend(self.apply_sync_actions(now, actions));
+                outputs.extend(self.presence_tick(now, identity, card_hash)?);
                 Ok(outputs)
+            }
+            MeshInput::KnownCards { hashes } => {
+                self.presence
+                    .set_known_cards(hashes)
+                    .map_err(MeshError::Presence)?;
+                Ok(Vec::new())
             }
             MeshInput::LinkUp { link, remote_hello } => {
                 if self.neighbors.contains(link) {
@@ -371,6 +416,7 @@ impl<R: RngCore> MeshEngine<R> {
                 let spray = self.config.spray.enabled && caps & crate::hello::CAP_SPRAY_V1 != 0;
                 self.spray.set_caps(link, caps);
                 self.receipt.set_caps(link, caps);
+                self.presence.set_caps(link, caps);
                 let mut outputs = Vec::new();
                 for payload in self.receipt.pending_for(link) {
                     outputs.push(MeshOutput::Send {
@@ -396,6 +442,7 @@ impl<R: RngCore> MeshEngine<R> {
                 self.sync.link_down(link);
                 self.spray.link_down(link);
                 self.receipt.link_down(link);
+                self.presence.link_down(link);
                 Ok(Vec::new())
             }
             MeshInput::Data {
@@ -760,6 +807,12 @@ impl<R: RngCore> MeshEngine<R> {
                             Action::Relay { .. } => {}
                         }
                     }
+                    crate::PacketClass::Presence
+                        if self.presence.supports(link)
+                            && packet.payload.first() == Some(&presence::ANNOUNCE_MAGIC) =>
+                    {
+                        outputs.extend(self.on_presence_data(now, link, packet, outcome)?);
+                    }
                     crate::PacketClass::Broadcast | crate::PacketClass::Presence => {
                         if !suppress::content_valid(&packet) {
                             self.neighbors.reject(link);
@@ -922,6 +975,121 @@ impl<R: RngCore> MeshEngine<R> {
         }
     }
 
+    /// Emits the announcement due on this tick to links that negotiated
+    /// [`crate::CAP_PRESENCE_V1`]. Signing uses the borrowed host identity;
+    /// the tracker owns only the sequence number and deadline.
+    fn presence_tick(
+        &mut self,
+        now: u64,
+        identity: &Identity,
+        card_hash: [u8; 8],
+    ) -> Result<Vec<MeshOutput>, MeshError> {
+        let Some(announcement) = self.presence.on_tick(now, card_hash, crate::hello::CAPS) else {
+            return Ok(Vec::new());
+        };
+        let (id, payload) = presence::encode_announcement(
+            now,
+            identity,
+            announcement,
+            self.config.suppression.ttl(crate::PacketClass::Presence),
+            self.config.presence.lifetime_s,
+        )
+        .map_err(MeshError::Presence)?;
+        // Record the local send like any sighting so a looped copy is dropped.
+        let _ = self
+            .seen
+            .check_and_insert(now, crate::PacketClass::Presence, id);
+        Ok(self.send_to_capable_links(payload, &BTreeSet::new()))
+    }
+
+    /// Authenticates and gossips one announcement from a capability peer.
+    /// Direct packets are checked against the neighbour's verified hello key;
+    /// relayed packets are accepted only when their content address still
+    /// matches the signed bytes the ingress hop checked.
+    fn on_presence_data(
+        &mut self,
+        now: u64,
+        link: LinkId,
+        packet: Packet<'_>,
+        outcome: BudgetOutcome,
+    ) -> Result<Vec<MeshOutput>, MeshError> {
+        let mut outputs = Vec::new();
+        let announcement = match presence::verify_announcement(&packet) {
+            Ok(announcement) => announcement,
+            Err(_) => {
+                self.neighbors.reject(link);
+                let release = self
+                    .budgets
+                    .penalize(now, link, self.config.budgets.penalty_invalid);
+                outputs.extend(Self::release_if_penalised(link, release));
+                return Ok(outputs);
+            }
+        };
+        if let Some(card_hash) = self
+            .presence
+            .observe(now, packet.header.origin, announcement)
+        {
+            outputs.push(MeshOutput::CardFetch {
+                node_id: packet.header.origin,
+                card_hash,
+            });
+        }
+        if outcome != BudgetOutcome::Admitted || self.seen.is_duplicate(now, &packet.header.msg_id)
+        {
+            return Ok(outputs);
+        }
+        let msg_id = packet.header.msg_id;
+        let class = crate::PacketClass::Presence;
+        let Some(relay) = suppress::relay_bytes(packet, self.config.suppression.ttl(class)) else {
+            let _ = self.seen.check_and_insert(now, class, msg_id);
+            return Ok(outputs);
+        };
+        if !self.config.suppression.enabled {
+            let _ = self.seen.check_and_insert(now, class, msg_id);
+            let mut senders = BTreeSet::new();
+            senders.insert(link);
+            outputs.extend(self.send_to_capable_links(relay, &senders));
+            return Ok(outputs);
+        }
+        let degree = self
+            .neighbors
+            .iter()
+            .filter(|neighbor| {
+                neighbor.node_id.is_some()
+                    && neighbor.link != link
+                    && self.presence.supports(neighbor.link)
+            })
+            .count();
+        let threshold = self
+            .config
+            .suppression
+            .copy_threshold(degree, &mut self.rng);
+        let deadline_ms = now.saturating_add(
+            self.config
+                .suppression
+                .assessment_delay(degree, &mut self.rng),
+        );
+        match self.suppression.observe(Sighting {
+            now,
+            msg_id,
+            class,
+            sender: link,
+            threshold,
+            deadline_ms,
+            relay,
+        }) {
+            suppress::Observe::Pending => {}
+            suppress::Observe::Suppressed => {
+                let _ = self.seen.check_and_insert(now, class, msg_id);
+            }
+            suppress::Observe::RelayNow(due) => {
+                let _ = self.seen.check_and_insert(now, class, msg_id);
+                outputs.extend(self.send_to_capable_links(due.bytes, &due.senders));
+            }
+        }
+        Ok(outputs)
+    }
+
     /// Applies an authenticated receipt: purge locally, report sender status
     /// only to the origin, stop spraying the delivered id and gossip the
     /// receipt to other capable links.
@@ -971,7 +1139,11 @@ impl<R: RngCore> MeshEngine<R> {
         let mut outputs = Vec::new();
         for entry in due {
             let _ = self.seen.check_and_insert(now, entry.class, entry.msg_id);
-            outputs.extend(self.send_to_links(entry.bytes, &entry.senders));
+            if entry.class == crate::PacketClass::Presence {
+                outputs.extend(self.send_to_capable_links(entry.bytes, &entry.senders));
+            } else {
+                outputs.extend(self.send_to_links(entry.bytes, &entry.senders));
+            }
         }
         outputs
     }
@@ -1078,9 +1250,28 @@ impl<R: RngCore> MeshEngine<R> {
     /// already carry a copy. `BTreeSet` keeps the exclusion set bounded and
     /// deterministic, matching the MSH-10 link cap.
     fn send_to_links(&self, bytes: Vec<u8>, senders: &BTreeSet<LinkId>) -> Vec<MeshOutput> {
+        self.send_to_links_filtered(bytes, senders, false)
+    }
+
+    /// Announcements go only to links that negotiated MSH-19; older peers keep
+    /// the pre-MSH-19 Presence path and never learn from this body.
+    fn send_to_capable_links(&self, bytes: Vec<u8>, senders: &BTreeSet<LinkId>) -> Vec<MeshOutput> {
+        self.send_to_links_filtered(bytes, senders, true)
+    }
+
+    fn send_to_links_filtered(
+        &self,
+        bytes: Vec<u8>,
+        senders: &BTreeSet<LinkId>,
+        presence_only: bool,
+    ) -> Vec<MeshOutput> {
         self.neighbors
             .iter()
-            .filter(|neighbor| neighbor.node_id.is_some() && !senders.contains(&neighbor.link))
+            .filter(|neighbor| {
+                neighbor.node_id.is_some()
+                    && !senders.contains(&neighbor.link)
+                    && (!presence_only || self.presence.supports(neighbor.link))
+            })
             .map(|neighbor| MeshOutput::Send {
                 link: neighbor.link,
                 channel: Channel::Message,
