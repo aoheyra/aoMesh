@@ -7,6 +7,7 @@ use crate::forward::{self, Action};
 use crate::neighbor::{MeshConfig, NeighborTable};
 use crate::presence::{self, PresenceError, PresenceTracker};
 use crate::receipt::{self, ReceiptError};
+use crate::routehint::{RouteHintMode, RouteHintObservation, RouteHintTable};
 use crate::seen::{Offer, SeenCache};
 use crate::suppress::{self, Sighting, SuppressionTable};
 use crate::sync::{
@@ -68,10 +69,11 @@ pub enum MeshInput<'a> {
         /// One item per requested prefix, in host order.
         items: &'a [SyncOffer<'a>],
     },
-    /// Time-driven step; fires MSH-11 timers, MSH-14 contact deadlines and
-    /// MSH-19's presence trickle. The identity and card hash are borrowed for
-    /// this call only; a change produces an announcement after the quick
-    /// delay, then quiet refreshes back off to the steady interval.
+    /// Time-driven step; fires MSH-11 timers, MSH-14 contact deadlines,
+    /// MSH-19's presence trickle, MSH-20 directory expiry and MSH-21 hint
+    /// expiry. The identity and card hash are borrowed for this call only;
+    /// a change produces an announcement after the quick delay, then quiet
+    /// refreshes back off to the steady interval.
     Tick {
         /// Borrowed signing identity; the engine retains no key.
         identity: &'a Identity,
@@ -89,7 +91,9 @@ pub enum MeshInput<'a> {
     /// Record one typed presence fact in the node directory (MSH-20).
     ///
     /// Verified MSH-19 announcements feed this narrow seam; the engine does
-    /// not parse presence packets or fetch identity cards.
+    /// not parse presence packets or fetch identity cards. An accepted fact
+    /// also supplies an MSH-21 reverse-path hint when its `via` names a
+    /// verified neighbour.
     ObserveNode {
         /// The opaque observation to record.
         observation: NodeObservation<'a>,
@@ -281,6 +285,7 @@ pub struct MeshEngine<R: RngCore> {
     receipt: crate::receipt::ReceiptTracker,
     presence: PresenceTracker,
     directory: NodeDirectory,
+    hints: RouteHintTable,
 }
 impl<R: RngCore> MeshEngine<R> {
     /// Creates an engine with the default limits (`MeshConfig::default`).
@@ -307,6 +312,7 @@ impl<R: RngCore> MeshEngine<R> {
             receipt: crate::receipt::ReceiptTracker::new(config.receipt),
             presence: PresenceTracker::new(config.presence),
             directory: NodeDirectory::new(config.directory),
+            hints: RouteHintTable::new(config.route_hint),
         }
     }
     /// Read-only bookkeeping, not a list of authenticated identities.
@@ -341,6 +347,13 @@ impl<R: RngCore> MeshEngine<R> {
     pub fn presence(&self) -> &PresenceTracker {
         &self.presence
     }
+    /// Read-only reverse-path hint state (MSH-21).
+    ///
+    /// The simulator uses this to report latency for messages with a fresh
+    /// path; hosts may inspect it for diagnostics. No hint is a wire field.
+    pub fn route_hints(&self) -> &RouteHintTable {
+        &self.hints
+    }
     /// Whether an acknowledged id is immune from store re-sync (MSH-17).
     #[cfg(feature = "sim")]
     pub(crate) fn is_immune(&self, id: MessageId) -> bool {
@@ -372,9 +385,22 @@ impl<R: RngCore> MeshEngine<R> {
     pub fn handle(&mut self, now: u64, input: MeshInput<'_>) -> Result<Vec<MeshOutput>, MeshError> {
         match input {
             MeshInput::ObserveNode { observation } => {
+                let node = observation.node;
+                let via = observation.via;
+                let hops = observation.hops;
+                let seq = observation.seq;
                 self.directory
                     .observe(now, observation)
                     .map_err(MeshError::Directory)?;
+                // The directory ignores an older sequence. Only a fact it
+                // actually retained may mint or refresh a reverse-path hint.
+                if self
+                    .directory
+                    .get(now, node)
+                    .is_some_and(|entry| entry.seq == seq && entry.via == via && entry.hops == hops)
+                {
+                    self.observe_hint(now, node, via, hops, seq);
+                }
                 Ok(self.take_directory_changes())
             }
             MeshInput::StoreSummary { ids } => {
@@ -408,6 +434,7 @@ impl<R: RngCore> MeshEngine<R> {
             } => {
                 let mut outputs = self.drain_due(now);
                 self.receipt.expire(now);
+                self.hints.expire(now);
                 let actions = self.sync.expire(now);
                 outputs.extend(self.apply_sync_actions(now, actions));
                 outputs.extend(self.presence_tick(now, identity, card_hash)?);
@@ -481,6 +508,7 @@ impl<R: RngCore> MeshEngine<R> {
                 self.spray.link_down(link);
                 self.receipt.link_down(link);
                 self.presence.link_down(link);
+                self.hints.link_down(link);
                 Ok(Vec::new())
             }
             MeshInput::Data {
@@ -819,18 +847,31 @@ impl<R: RngCore> MeshEngine<R> {
                                                 .map(|id| (neighbor.link, *id.as_bytes()))
                                         })
                                         .collect();
-                                    let plan = self.spray.plan(now, msg_id, Some(link), candidates);
-                                    for (next, give) in plan {
+                                    let plan = self.spray_plan(
+                                        now,
+                                        msg_id,
+                                        Some(link),
+                                        &candidates,
+                                        destination,
+                                    );
+                                    for (next, give) in &plan {
                                         if let Some(payload) =
-                                            crate::spray::encode_frame(give, &bytes)
+                                            crate::spray::encode_frame(*give, &bytes)
                                         {
                                             outputs.push(MeshOutput::Send {
-                                                link: next,
+                                                link: *next,
                                                 channel: Channel::Message,
                                                 payload,
                                             });
                                         }
                                     }
+                                    outputs.extend(self.additive_hint_sends(
+                                        now,
+                                        Some(link),
+                                        &plan,
+                                        destination,
+                                        &bytes,
+                                    ));
                                     outputs.push(MeshOutput::SyncItem {
                                         id: msg_id,
                                         wire: wire.clone(),
@@ -977,11 +1018,12 @@ impl<R: RngCore> MeshEngine<R> {
                             })
                             .collect(),
                     };
-                    let plan = self.spray.plan(now, header.msg_id, None, candidates);
+                    let destination = header.dst.unwrap_or([0; 16]);
+                    let plan = self.spray_plan(now, header.msg_id, None, &candidates, destination);
                     let mut outputs = Vec::new();
-                    for (link, give) in plan {
-                        let payload = if self.spray.supports(link) {
-                            match crate::spray::encode_frame(give, &bytes) {
+                    for (link, give) in &plan {
+                        let payload = if self.spray.supports(*link) {
+                            match crate::spray::encode_frame(*give, &bytes) {
                                 Some(payload) => payload,
                                 None => bytes.clone(),
                             }
@@ -989,11 +1031,12 @@ impl<R: RngCore> MeshEngine<R> {
                             bytes.clone()
                         };
                         outputs.push(MeshOutput::Send {
-                            link,
+                            link: *link,
                             channel,
                             payload,
                         });
                     }
+                    outputs.extend(self.additive_hint_sends(now, None, &plan, destination, &bytes));
                     // The host submitted these bytes and already owns them;
                     // only received copies need a store event.
                     return Ok(outputs);
@@ -1091,6 +1134,25 @@ impl<R: RngCore> MeshEngine<R> {
                 self.directory
                     .observe(now, observation)
                     .map_err(MeshError::Directory)?;
+                // Match the host seam: only a fact the directory retained
+                // may mint or refresh a hint.
+                if self
+                    .directory
+                    .get(now, observation.node)
+                    .is_some_and(|entry| {
+                        entry.seq == observation.seq
+                            && entry.via == via
+                            && entry.hops == observation.hops
+                    })
+                {
+                    self.observe_hint(
+                        now,
+                        observation.node,
+                        via,
+                        observation.hops,
+                        observation.seq,
+                    );
+                }
                 outputs.extend(self.take_directory_changes());
             }
         }
@@ -1289,16 +1351,26 @@ impl<R: RngCore> MeshEngine<R> {
                                         neighbor.node_id.map(|id| (neighbor.link, *id.as_bytes()))
                                     })
                                     .collect();
-                                for (next, give) in self.spray.plan(now, id, Some(link), candidates)
-                                {
-                                    if let Some(payload) = crate::spray::encode_frame(give, &wire) {
+                                let destination = header.dst.unwrap_or([0; 16]);
+                                let plan =
+                                    self.spray_plan(now, id, Some(link), &candidates, destination);
+                                for (next, give) in &plan {
+                                    if let Some(payload) = crate::spray::encode_frame(*give, &wire)
+                                    {
                                         outputs.push(MeshOutput::Send {
-                                            link: next,
+                                            link: *next,
                                             channel: Channel::Message,
                                             payload,
                                         });
                                     }
                                 }
+                                outputs.extend(self.additive_hint_sends(
+                                    now,
+                                    Some(link),
+                                    &plan,
+                                    destination,
+                                    &wire,
+                                ));
                             }
                         }
                     }
@@ -1314,6 +1386,93 @@ impl<R: RngCore> MeshEngine<R> {
             }
         }
         outputs
+    }
+
+    /// Derives one reverse-path hint from an accepted directory observation.
+    ///
+    /// The directory records the via-neighbour as a `NodeId` because it must
+    /// survive link churn; a hint is only actionable while that identity is
+    /// reachable through a currently verified link. An unverified or departed
+    /// neighbour therefore cannot steer traffic.
+    fn observe_hint(&mut self, now: u64, destination: NodeId, via: NodeId, hops: u8, seq: u64) {
+        if self.config.route_hint.mode == RouteHintMode::Off {
+            return;
+        }
+        let Some(link) = self
+            .neighbors
+            .iter()
+            .find_map(|neighbor| (neighbor.node_id == Some(via)).then_some(neighbor.link))
+        else {
+            return;
+        };
+        let observation = RouteHintObservation {
+            destination,
+            neighbour: link,
+            hops,
+            seq,
+        };
+        let _ = self.hints.observe(now, observation, true);
+    }
+
+    /// The link named by a fresh hint, if hints are active. The table's
+    /// relative expiry decides freshness; no packet timestamp is consulted.
+    fn hint_link(&self, now: u64, destination: [u8; 16]) -> Option<LinkId> {
+        if self.config.route_hint.mode == RouteHintMode::Off {
+            return None;
+        }
+        self.hints
+            .hint(now, NodeId::from_bytes(destination))
+            .map(|hint| hint.neighbour)
+    }
+
+    /// MSH-16 spray plan, optionally steered by an MSH-21 hint.
+    fn spray_plan(
+        &mut self,
+        now: u64,
+        id: MessageId,
+        sender: Option<LinkId>,
+        candidates: &[(LinkId, [u8; 16])],
+        destination: [u8; 16],
+    ) -> Vec<(LinkId, u8)> {
+        let mode = self.config.route_hint.mode;
+        let hint = self.hint_link(now, destination);
+        if mode == RouteHintMode::SubstituteCopy {
+            self.spray
+                .plan_with_hint(now, id, sender, candidates.iter().copied(), hint)
+        } else {
+            self.spray.plan(now, id, sender, candidates.iter().copied())
+        }
+    }
+
+    /// Additive mode's extra unicast: one copy along the hint, only when the
+    /// base spray plan did not already choose that link.
+    fn additive_hint_sends(
+        &self,
+        now: u64,
+        sender: Option<LinkId>,
+        plan: &[(LinkId, u8)],
+        destination: [u8; 16],
+        bytes: &[u8],
+    ) -> Vec<MeshOutput> {
+        if self.config.route_hint.mode != RouteHintMode::AdditiveUnicast {
+            return Vec::new();
+        }
+        let Some(link) = self.hint_link(now, destination) else {
+            return Vec::new();
+        };
+        if Some(link) == sender || plan.iter().any(|(existing, _)| *existing == link) {
+            return Vec::new();
+        }
+        let payload = if self.spray.supports(link) {
+            crate::spray::encode_frame(1, bytes).unwrap_or_else(|| bytes.to_vec())
+        } else {
+            bytes.to_vec()
+        };
+        vec![MeshOutput::Send {
+            link,
+            channel: Channel::Message,
+            payload,
+        }]
     }
 
     /// Sends one relayed packet to every verified neighbour that did not

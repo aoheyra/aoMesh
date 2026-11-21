@@ -42,6 +42,22 @@ ingress neighbour. The fixed seed `1297304021` scenario peaks at
 the four-entry cap, expires all 24 timed-out entries and ends with zero live
 entries.
 
+MSH-21 adds bounded reverse-path route hints for Direct traffic, derived from
+MSH-20 directory observations: verified presence announcements feed them
+automatically and host facts use `MeshInput::ObserveNode`. No peer time is
+accepted, a backwards local clock is clamped to the table's floor, and
+observations whose via-node has no verified link are ignored. The bounded table
+ranks by hops, presence sequence and link id, expires on `Tick` and drops
+entries on `LinkDown`. The measured default `SubstituteCopy` makes a fresh hint
+one of the existing spray copies instead of adding a send; `AdditiveUnicast` is
+retained as a rejected option and `Off` keeps every published row unchanged. No
+packet, hello or sync wire field changes. On the paired random-20 case
+(seed `1297303632`) substitution cuts fresh-path mean latency from 356 ms to
+337 ms and overall mean latency from 360 ms to 345 ms with transmissions
+unchanged at 230 and overhead at 23.0000, while additive uses 231
+transmissions and 23.1000. The line-20 control (seed `1297303584`) is identical
+in all modes.
+
 MSH-17 adds signed delivery receipts and bounded store immunity. An
 authenticated delivery emits a cap-gated receipt envelope carrying a signed
 Direct acknowledgement, the destination's public identity and the original

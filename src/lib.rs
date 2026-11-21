@@ -21,9 +21,12 @@
 //! releases abusive links. MSH-11 suppresses Broadcast and Presence
 //! floods with seeded assessment delays and neighbour copy counters.
 //! MSH-13 canonicalises store ids into a compact summary and publishes a
-//! debounced four-byte digest through aoNetwork's beacon. MSH-20 keeps a
-//! bounded, ephemeral node directory from typed presence observations; its
-//! coalesced changes are UI events and never wire bytes.
+//! debounced four-byte digest through aoNetwork's beacon. MSH-19 signs
+//! presence announcements; MSH-20 keeps a bounded, ephemeral node directory
+//! from typed presence observations, whose coalesced changes are UI events
+//! and never wire bytes. MSH-21 derives bounded reverse-path hints from
+//! those directory observations and uses a fresh one to steer a Direct spray
+//! copy.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -41,6 +44,7 @@ pub mod neighbor;
 pub mod packet;
 pub mod presence;
 pub mod receipt;
+pub mod routehint;
 pub mod seen;
 pub mod sign;
 #[cfg(feature = "sim")]
@@ -69,6 +73,7 @@ pub use presence::{
     PresenceTracker, encode_announcement, verify_announcement,
 };
 pub use receipt::{RECEIPT_MAGIC, RECEIPT_VERSION, ReceiptConfig, ReceiptError, ReceiptTracker};
+pub use routehint::{RouteHint, RouteHintConfig, RouteHintMode, RouteHintTable};
 pub use seen::{Offer, SeenCache, SeenConfig};
 pub use sign::{
     RelayOutcome, VerifyError, derive_msg_id, sign_packet, verify_for_relay, verify_origin,

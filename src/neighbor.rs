@@ -9,6 +9,7 @@ use crate::budget::BudgetConfig;
 use crate::directory::DirectoryConfig;
 use crate::presence::PresenceConfig;
 use crate::receipt::ReceiptConfig;
+use crate::routehint::RouteHintConfig;
 use crate::spray::SprayConfig;
 use crate::suppress::SuppressionConfig;
 use crate::sync::{SummaryConfig, SyncConfig};
@@ -39,6 +40,8 @@ pub struct MeshConfig {
     /// Bounded mesh-wide directory capacity, staleness and event limits
     /// (MSH-20).
     pub directory: DirectoryConfig,
+    /// Reverse-path hint table and Direct forwarding mode (MSH-21).
+    pub route_hint: RouteHintConfig,
 }
 
 impl Default for MeshConfig {
@@ -68,6 +71,7 @@ impl Default for MeshConfig {
             receipt: ReceiptConfig::default(),
             presence: PresenceConfig::default(),
             directory: DirectoryConfig::default(),
+            route_hint: RouteHintConfig::default(),
         }
     }
 }

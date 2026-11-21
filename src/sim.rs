@@ -27,17 +27,17 @@ use crate::store::{MemoryStore, MessageStore, StoreLimits, StoreMetadata, Stored
 use crate::{
     CAP_PRESENCE_V1, CAP_RECEIPT_V1, CAP_SYNC_V1, CAPS, DirectoryChange, Header, MeshConfig,
     MeshEngine, MeshHello, MeshInput, MeshOutput, MessageId, NetworkAdapter, Packet, PacketClass,
-    PresenceConfig, SHORT_ID_BYTES, SYNC_MAGIC, SYNC_V2_VERSION, StoreSummary, SuppressionConfig,
-    SyncOffer, derive_msg_id, sign_packet,
+    PresenceConfig, RouteHintMode, SHORT_ID_BYTES, SYNC_MAGIC, SYNC_V2_VERSION, StoreSummary,
+    SuppressionConfig, SyncOffer, derive_msg_id, sign_packet,
 };
-use ao_idents::{Identity, SealedMessage};
+use ao_idents::{Identity, NodeId, SealedMessage};
 use ao_network::{
     AppHello, BeaconFlags, Channel, Hello, LinkId, LinkInfo, LocalTag, Network, NetworkConfig,
     NetworkEvent, SimConfig as WorldConfig, SimNode, SimTransport, SimWorld,
 };
 use rand::{SeedableRng as SeedableRng09, rngs::StdRng as EngineRng};
 use rand08::{SeedableRng as SeedableRng08, rngs::StdRng as SealRng};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -48,6 +48,10 @@ const TICK: Duration = Duration::from_millis(50);
 const MAX_STORE_SERVICE_ROUNDS: usize = 64;
 /// Radio range in the position units used by random and community layouts.
 const RADIUS: i64 = 100;
+/// How often the harness supplies MSH-20 directory observations for the
+/// MSH-21 paired report. These are host facts, not mesh packets; verified
+/// presence announcements feed the same seam automatically in other scenarios.
+const HINT_REFRESH: Duration = Duration::from_secs(5);
 
 /// Where nodes start and which pairs are in radio range.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -207,6 +211,8 @@ pub struct Scenario {
     /// Ablation runs keep this false so the effect of receipts can be
     /// measured without changing any other engine behaviour.
     pub receipts: bool,
+    /// MSH-21 route-hint mode. `Off` keeps every published row unchanged.
+    pub route_hint: RouteHintMode,
     /// Suppression bounds and timer parameters under test.
     pub suppression: SuppressionConfig,
     /// Whether links advertise and consume MSH-19 announcements.
@@ -347,6 +353,19 @@ pub struct Metrics {
     ///
     /// Not part of the MSH-27 CSV report.
     pub directory_live_entries: usize,
+    /// MSH-21 submissions that had a fresh hint for their destination.
+    ///
+    /// Not part of the CSV report; the denominator of the fresh-path
+    /// latency comparison.
+    pub fresh_hint_submissions: u64,
+    /// Deliveries of messages that had a fresh hint at submission.
+    ///
+    /// Not part of the CSV report.
+    pub fresh_hint_deliveries: u64,
+    /// Mean latency of fresh-hint deliveries in milliseconds.
+    ///
+    /// Not part of the CSV report; the MSH-21 acceptance measure.
+    pub fresh_hint_mean_latency_ms: u64,
 }
 
 impl Metrics {
@@ -406,6 +425,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             enforce_suppression: true,
             spray: false,
             receipts: false,
+            route_hint: RouteHintMode::Off,
             suppression: SuppressionConfig::default(),
             presence: false,
             presence_config: PresenceConfig::default(),
@@ -428,6 +448,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             enforce_suppression: true,
             spray: false,
             receipts: false,
+            route_hint: RouteHintMode::Off,
             suppression: SuppressionConfig::default(),
             presence: false,
             presence_config: PresenceConfig::default(),
@@ -450,6 +471,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             enforce_suppression: true,
             spray: false,
             receipts: false,
+            route_hint: RouteHintMode::Off,
             suppression: SuppressionConfig::default(),
             presence: false,
             presence_config: PresenceConfig::default(),
@@ -470,6 +492,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             enforce_suppression: true,
             spray: false,
             receipts: false,
+            route_hint: RouteHintMode::Off,
             suppression: SuppressionConfig::default(),
             presence: false,
             presence_config: PresenceConfig::default(),
@@ -505,6 +528,7 @@ pub fn flood_scenarios() -> Vec<Scenario> {
         enforce_suppression: true,
         spray: false,
         receipts: false,
+        route_hint: RouteHintMode::Off,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -539,6 +563,7 @@ pub fn suppression_scenarios() -> Vec<Scenario> {
         enforce_suppression: true,
         spray: false,
         receipts: false,
+        route_hint: RouteHintMode::Off,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -567,6 +592,7 @@ pub fn spray_scenarios() -> Vec<Scenario> {
         enforce_suppression: true,
         spray: false,
         receipts: false,
+        route_hint: RouteHintMode::Off,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -587,6 +613,7 @@ pub fn spray_scenarios() -> Vec<Scenario> {
         enforce_suppression: true,
         spray: false,
         receipts: false,
+        route_hint: RouteHintMode::Off,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -631,6 +658,7 @@ pub fn receipt_scenarios() -> Vec<Scenario> {
         enforce_suppression: true,
         spray: true,
         receipts: false,
+        route_hint: RouteHintMode::Off,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -651,6 +679,7 @@ pub fn receipt_scenarios() -> Vec<Scenario> {
         enforce_suppression: true,
         spray: true,
         receipts: false,
+        route_hint: RouteHintMode::Off,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -661,12 +690,14 @@ pub fn receipt_scenarios() -> Vec<Scenario> {
         Scenario {
             name: "receipt-enabled-line-20",
             receipts: true,
+            route_hint: RouteHintMode::Off,
             ..line
         },
         scripted.clone(),
         Scenario {
             name: "receipt-enabled-scripted-200",
             receipts: true,
+            route_hint: RouteHintMode::Off,
             ..scripted
         },
     ]
@@ -700,6 +731,7 @@ pub fn presence_scenarios() -> Vec<Scenario> {
         enforce_suppression: true,
         spray: false,
         receipts: false,
+        route_hint: RouteHintMode::Off,
         suppression: SuppressionConfig::default(),
         presence: true,
         presence_config: PresenceConfig {
@@ -735,6 +767,7 @@ pub fn directory_scenarios() -> Vec<Scenario> {
         enforce_suppression: true,
         spray: false,
         receipts: false,
+        route_hint: RouteHintMode::Off,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -750,6 +783,82 @@ pub fn directory_scenarios() -> Vec<Scenario> {
             observed_skew_ms: 5_000,
         }),
     }]
+}
+
+/// MSH-21's paired route-hint case.
+///
+/// All three rows share the MSH-16 spray seed, topology, traffic, budgets and
+/// receipt setting; only the hint mode differs. The harness supplies the same
+/// seeded facts through `MeshInput::ObserveNode` in every row, so the engine's
+/// MSH-20 directory derives identical hints and latency changes are attributable
+/// to how a fresh hint is used. `Off` is the unhinted spray baseline.
+pub fn route_hint_scenarios() -> Vec<Scenario> {
+    let line = Scenario {
+        name: "hint-spray-line-20",
+        seed: 1_297_303_584,
+        nodes: 20,
+        topology: Topology::Line,
+        mobility: Mobility::Static,
+        settle: Duration::from_secs(30),
+        run: Duration::from_secs(30),
+        messages: 20,
+        payload_len: 128,
+        traffic: Traffic::Balanced,
+        enforce_budgets: true,
+        enforce_suppression: true,
+        spray: true,
+        receipts: false,
+        route_hint: RouteHintMode::Off,
+        suppression: SuppressionConfig::default(),
+        presence: false,
+        presence_config: PresenceConfig::default(),
+        directory: None,
+    };
+    let random = Scenario {
+        name: "hint-spray-random-20",
+        seed: 1_297_303_632,
+        nodes: 20,
+        topology: Topology::Random,
+        mobility: Mobility::Static,
+        settle: Duration::from_secs(30),
+        run: Duration::from_secs(30),
+        messages: 20,
+        payload_len: 128,
+        traffic: Traffic::Balanced,
+        enforce_budgets: true,
+        enforce_suppression: true,
+        spray: true,
+        receipts: false,
+        route_hint: RouteHintMode::Off,
+        suppression: SuppressionConfig::default(),
+        presence: false,
+        presence_config: PresenceConfig::default(),
+        directory: None,
+    };
+    vec![
+        line.clone(),
+        Scenario {
+            name: "hint-additive-line-20",
+            route_hint: RouteHintMode::AdditiveUnicast,
+            ..line.clone()
+        },
+        Scenario {
+            name: "hint-substitute-line-20",
+            route_hint: RouteHintMode::SubstituteCopy,
+            ..line
+        },
+        random.clone(),
+        Scenario {
+            name: "hint-additive-random-20",
+            route_hint: RouteHintMode::AdditiveUnicast,
+            ..random.clone()
+        },
+        Scenario {
+            name: "hint-substitute-random-20",
+            route_hint: RouteHintMode::SubstituteCopy,
+            ..random
+        },
+    ]
 }
 
 /// A permanent chain plus short-lived shortcuts on a 200-node chain.
@@ -839,6 +948,12 @@ pub struct Simulation {
     directory_announcements: usize,
     directory_peak_entries: usize,
     directory_last_removal_ms: u64,
+    hint_seq: u64,
+    injected_fresh: Vec<BTreeSet<NodeId>>,
+    fresh_hint_ids: BTreeSet<MessageId>,
+    fresh_hint_submissions: u64,
+    fresh_hint_deliveries: u64,
+    fresh_latencies: Vec<u64>,
 }
 
 impl Simulation {
@@ -892,6 +1007,7 @@ impl Simulation {
             if let Some(plan) = &scenario.directory {
                 engine_config.directory = plan.config;
             }
+            engine_config.route_hint.mode = scenario.route_hint;
             engine_config.suppression = SuppressionConfig {
                 enabled: scenario.enforce_suppression,
                 ..scenario.suppression
@@ -1079,6 +1195,12 @@ impl Simulation {
             directory_announcements: 0,
             directory_peak_entries: 0,
             directory_last_removal_ms: 0,
+            hint_seq: 0,
+            injected_fresh: vec![BTreeSet::new(); n],
+            fresh_hint_ids: BTreeSet::new(),
+            fresh_hint_submissions: 0,
+            fresh_hint_deliveries: 0,
+            fresh_latencies: Vec::new(),
         };
         sim.apply_ranges();
         sim
@@ -1545,8 +1667,12 @@ impl Simulation {
                 MeshOutput::Deliver { header, .. } => {
                     if self.delivered_ids[node].insert(header.msg_id) {
                         self.delivered += 1;
-                        self.latencies
-                            .push(now_ms.saturating_sub(header.created_ms));
+                        let latency = now_ms.saturating_sub(header.created_ms);
+                        self.latencies.push(latency);
+                        if self.fresh_hint_ids.contains(&header.msg_id) {
+                            self.fresh_latencies.push(latency);
+                            self.fresh_hint_deliveries += 1;
+                        }
                         if let Some(origin) = self.origin_index.get(&header.origin) {
                             self.delivered_by_origin[*origin] += 1;
                         }
@@ -1643,6 +1769,118 @@ impl Simulation {
         }
     }
 
+    /// Hop counts over the current radio graph, used only to model MSH-20's
+    /// presence observation seam. No transmission or engine state is involved.
+    fn hop_distances(&self) -> Vec<Vec<u8>> {
+        let n = self.nodes.len();
+        let mut dist = vec![vec![u8::MAX; n]; n];
+        for (src, row) in dist.iter_mut().enumerate() {
+            let mut queue = VecDeque::new();
+            row[src] = 0;
+            queue.push_back(src);
+            while let Some(at) = queue.pop_front() {
+                let hops = row[at].saturating_add(1);
+                for (next, seen) in row.iter_mut().enumerate() {
+                    if self.ranges[at][next] && *seen == u8::MAX {
+                        *seen = hops;
+                        queue.push_back(next);
+                    }
+                }
+            }
+        }
+        dist
+    }
+
+    /// The neighbour on a shortest path, or `None` when the target is
+    /// unreachable at this instant.
+    fn first_hop(&self, from: usize, to: usize, dist: &[Vec<u8>]) -> Option<usize> {
+        let hops = dist[from][to];
+        if hops == 0 || hops == u8::MAX {
+            return None;
+        }
+        (0..self.nodes.len()).find(|&next| {
+            self.ranges[from][next]
+                && dist[next][to] != u8::MAX
+                && dist[next][to].saturating_add(1) == hops
+        })
+    }
+
+    /// Feeds one round of typed directory facts into every node.
+    ///
+    /// The BFS supplies the same facts the host would learn from presence:
+    /// destination, via-neighbour, hop count and a fresh sequence. They enter
+    /// the engine through MSH-20's `ObserveNode` seam, which both records the
+    /// directory entry and derives an MSH-21 hint when the via-node is a
+    /// verified neighbour. No mesh packet is generated. Off-mode rows get the
+    /// same facts, keeping the fresh-path denominator identical.
+    fn inject_route_hints(&mut self, now_ms: u64) {
+        self.hint_seq = self.hint_seq.saturating_add(1);
+        for set in &mut self.injected_fresh {
+            set.clear();
+        }
+        let dist = self.hop_distances();
+        let n = self.nodes.len();
+        let seq = self.hint_seq;
+        let world_now = self.world.now();
+        let mut observations = Vec::new();
+        let mut fresh_updates = Vec::new();
+        for i in 0..n {
+            let links: Vec<NodeId> = self.nodes[i]
+                .adapter
+                .engine()
+                .neighbors()
+                .iter()
+                .filter_map(|neighbor| neighbor.node_id)
+                .collect();
+            for dst in 0..n {
+                if dst == i || dist[i][dst] == u8::MAX {
+                    continue;
+                }
+                let Some(first) = self.first_hop(i, dst, &dist) else {
+                    continue;
+                };
+                let first_id = self.identities[first].node_id();
+                if !links.contains(&first_id) {
+                    continue;
+                }
+                let destination = self.identities[dst].node_id();
+                observations.push((
+                    i,
+                    NodeObservation {
+                        node: destination,
+                        card_hash: self.nodes[dst].card_hash,
+                        caps: 0,
+                        seq,
+                        hops: dist[i][dst],
+                        via: first_id,
+                        observed_at_ms: now_ms,
+                        location: &[],
+                    },
+                ));
+                fresh_updates.push((i, destination));
+            }
+        }
+        for (i, destination) in fresh_updates {
+            self.injected_fresh[i].insert(destination);
+        }
+        for (i, observation) in observations {
+            let outputs = self.nodes[i]
+                .adapter
+                .engine_mut()
+                .handle(now_ms, MeshInput::ObserveNode { observation })
+                .expect("directory observation is bounded");
+            self.note_directory_changes(&outputs, now_ms);
+            self.count_outputs(i, now_ms, &outputs);
+            self.service_stores(i, world_now, now_ms, outputs.clone());
+            let events = self.nodes[i].adapter.apply(world_now, outputs);
+            for event in events {
+                if let crate::AdapterEvent::SendFailed { .. } = event {
+                    self.send_failures += 1;
+                }
+            }
+        }
+    }
+
     /// Submits one sealed message at the current world time. Staggering
     /// these across the run phase is what lets mobility and scripted contacts
     /// affect delivery instead of finishing before the first contact changes.
@@ -1723,6 +1961,13 @@ impl Simulation {
             (packet.header, payload, wire)
         };
         let submitted_id = header.msg_id;
+        if !broadcast {
+            let destination = self.identities[dst].node_id();
+            if self.injected_fresh[origin].contains(&destination) {
+                self.fresh_hint_ids.insert(submitted_id);
+                self.fresh_hint_submissions += 1;
+            }
+        }
         let outputs = self.nodes[origin]
             .adapter
             .engine_mut()
@@ -1772,6 +2017,8 @@ impl Simulation {
         self.run_start_ms = self.world.now().as_millis() as u64;
         self.run_started = true;
         self.reset_queue_baseline();
+        let hint_every = HINT_REFRESH.as_millis() as u64;
+        self.inject_route_hints(self.world.now().as_millis() as u64);
         let run_steps = (self.scenario.run.as_millis() / TICK.as_millis()) as usize;
         let steps = run_steps.max(1);
         // Keep the last fifth of the run free so the final message can
@@ -1785,6 +2032,10 @@ impl Simulation {
                 }
             }
             self.pump(1);
+            let now_ms = self.world.now().as_millis() as u64;
+            if now_ms % hint_every == 0 {
+                self.inject_route_hints(now_ms);
+            }
         }
         let receptions = self
             .nodes
@@ -1814,6 +2065,11 @@ impl Simulation {
             self.direct_submitted
         } else {
             self.submitted
+        };
+        let fresh_mean = if self.fresh_latencies.is_empty() {
+            0
+        } else {
+            self.fresh_latencies.iter().sum::<u64>() / self.fresh_latencies.len() as u64
         };
         Metrics {
             scenario: self.scenario.name,
@@ -1882,6 +2138,9 @@ impl Simulation {
                         .live_len(self.world.now().as_millis() as u64)
                 })
                 .sum(),
+            fresh_hint_submissions: self.fresh_hint_submissions,
+            fresh_hint_deliveries: self.fresh_hint_deliveries,
+            fresh_hint_mean_latency_ms: fresh_mean,
             unique_receptions_by_node: self
                 .received_ids
                 .iter()
@@ -2367,6 +2626,9 @@ mod tests {
             directory_evictions: 0,
             directory_last_removal_ms: 0,
             directory_live_entries: 0,
+            fresh_hint_submissions: 1,
+            fresh_hint_deliveries: 1,
+            fresh_hint_mean_latency_ms: 12,
         };
         let row = m.csv_row();
         assert_eq!(row.lines().count(), 1);
