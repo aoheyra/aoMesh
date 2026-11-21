@@ -1868,21 +1868,41 @@ mod tests {
 
     #[test]
     fn summary_frames_reject_bytes_inside_the_declared_body() {
-        let mut frame = SyncFrame::Summary {
+        let frame = SyncFrame::Summary {
             digest: [0; BEACON_DIGEST_LEN],
             short_ids: vec![[1; SHORT_ID_BYTES]],
         }
         .encode()
         .expect("encodes");
-        frame.extend_from_slice(&[7; 16]);
-        assert_eq!(SyncFrame::decode(&frame), Err(SyncError::BadLength));
+        let declared = u16::try_from(frame.len() - FRAME_HEADER_LEN).expect("fits");
+
+        // Bytes after the declared frame are rejected as trailing bytes
+        // before the tag is parsed.
+        let mut with_extra = frame;
+        with_extra.extend_from_slice(&[7; 16]);
+        assert_eq!(
+            SyncFrame::decode(&with_extra),
+            Err(SyncError::TrailingBytes)
+        );
+        // Include them in the declared length so they sit inside the body:
+        // the summary's exact-length check must reject them here.
+        let inflated = declared + 16;
+        with_extra[3..5].copy_from_slice(&inflated.to_be_bytes());
+        assert_eq!(SyncFrame::decode(&with_extra), Err(SyncError::BadLength));
     }
 
     #[test]
     fn a_summary_never_holds_more_ids_than_the_store_bound() {
-        let ids: Vec<MessageId> = (0..MAX_SUMMARY_ENTRIES + 256)
-            .map(|i| id((i % 251) as u8))
-            .collect();
+        // The ids must be distinct: `StoreSummary` deduplicates, so reusing
+        // one of a handful of byte patterns would end the test with fewer
+        // ids than the bound before the cap is ever reached.
+        let distinct_id = |i: usize| {
+            let mut bytes = [0u8; MSG_ID_LEN];
+            let index = u16::try_from(i).expect("test range fits");
+            bytes[..2].copy_from_slice(&index.to_be_bytes());
+            MessageId::from_bytes(bytes)
+        };
+        let ids: Vec<MessageId> = (0..MAX_SUMMARY_ENTRIES + 256).map(distinct_id).collect();
         let summary = StoreSummary::from_ids(&ids);
         assert_eq!(summary.len(), MAX_SUMMARY_ENTRIES);
         assert_eq!(
