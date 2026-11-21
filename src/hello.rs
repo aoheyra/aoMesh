@@ -44,8 +44,20 @@ pub const PROTO: u8 = 1;
 /// common language and the introduction fails.
 pub const MIN_PROTO: u8 = 1;
 
-/// Feature bits this build sets. None yet; each bit needs an ADR.
-pub const CAPS: u32 = 0;
+/// Feature bits this build sets.
+///
+/// Bit 0 advertises MSH-14's anti-entropy sync frames. Bit 1 advertises
+/// MSH-15's range reconciliation. Bit 2 advertises MSH-16's bounded spray
+/// envelope. A peer that lacks all three keeps the plain forwarding path;
+/// a peer with only bit 0 gets the MSH-14 summary exchange. Every bit needs
+/// an ADR entry.
+pub const CAP_SYNC_V1: u32 = 1 << 0;
+/// Capability bit for MSH-15 range-based set reconciliation.
+pub const CAP_SYNC_V2: u32 = 1 << 1;
+/// Capability bit for MSH-16 binary spray copy tickets.
+pub const CAP_SPRAY_V1: u32 = 1 << 2;
+/// Feature bits this build sets (ADR-0001).
+pub const CAPS: u32 = CAP_SYNC_V1 | CAP_SYNC_V2 | CAP_SPRAY_V1;
 
 /// Encoded length of a v1 hello: fixed, so a wrong length is rejected
 /// before anything is read (ADR-0004).
@@ -161,6 +173,33 @@ impl MeshHello {
         Ok(hello)
     }
 
+    /// Builds and signs a hello with an explicit capability set.
+    ///
+    /// Hosts normally use [`Self::sign`]. This seam lets simulators and
+    /// compatibility tests advertise a subset of this build's capabilities
+    /// to exercise fallback without changing the signed layout.
+    pub fn sign_with_caps(
+        identity: &Identity,
+        card_hash: [u8; 8],
+        store_digest: [u8; 4],
+        caps: u32,
+    ) -> Result<Self, IdentError> {
+        let public = identity.public();
+        let mut hello = Self {
+            node_id: identity.node_id(),
+            card_hash,
+            proto: PROTO,
+            caps: caps & CAPS,
+            store_digest,
+            signing_pk: *public.signing_pk(),
+            agreement_pk: *public.agreement_pk(),
+            signature: [0; 64],
+        };
+        let body = hello.body();
+        hello.signature = *identity.sign(HELLO_DOMAIN, &body)?.as_bytes();
+        Ok(hello)
+    }
+
     /// The exact v1 bytes: [`HELLO_LEN`] of them, ready for
     /// `AppHello::new(hello.encode().to_vec())`.
     pub fn encode(&self) -> [u8; HELLO_LEN] {
@@ -243,10 +282,17 @@ impl MeshHello {
 /// verify and negotiate, yielding the verified [`NodeId`] or the typed
 /// reason the introduction was dropped.
 pub fn verified_node_id(bytes: &[u8]) -> Result<NodeId, HelloError> {
+    Ok(verified_hello(bytes)?.node_id)
+}
+
+/// The one admission gate for a received `app_hello`, returning the whole
+/// verified introduction so the engine can read negotiated caps and the
+/// advertised store digest without trusting the raw bytes twice.
+pub fn verified_hello(bytes: &[u8]) -> Result<MeshHello, HelloError> {
     let hello = MeshHello::decode(bytes)?;
-    let node_id = hello.verify()?;
+    hello.verify()?;
     hello.negotiate(PROTO, CAPS)?;
-    Ok(node_id)
+    Ok(hello)
 }
 
 /// One fixed-width field; the caller's length check makes failure
@@ -419,7 +465,32 @@ mod tests {
         );
         // An older peer of ours: common = its proto, still above the floor.
         let older = signed_under(&identity, HELLO_DOMAIN, |hello| hello.proto = PROTO);
-        assert_eq!(older.negotiate(PROTO + 1, u32::MAX).unwrap(), (PROTO, 0));
+        assert_eq!(older.negotiate(PROTO + 1, u32::MAX).unwrap(), (PROTO, CAPS));
+    }
+
+    /// MSH-14: an honest hello advertises sync v1 and a peer without the
+    /// bit negotiates it away, falling back to the MSH-13 beacon path.
+    #[test]
+    fn sync_v1_cap_is_advertised_and_can_be_negotiated_away() {
+        let identity = Identity::from_seed([11; 32]);
+        let hello = MeshHello::sign(&identity, [0; 8], [0; 4]).unwrap();
+        assert_ne!(hello.caps & CAP_SYNC_V1, 0);
+        assert_ne!(hello.negotiate(PROTO, CAPS).unwrap().1 & CAP_SYNC_V1, 0);
+        assert_eq!(hello.negotiate(PROTO, 0).unwrap().1 & CAP_SYNC_V1, 0);
+    }
+
+    /// MSH-15: an honest hello also advertises sync v2. A v1-only peer
+    /// negotiates it away and keeps the MSH-14 summary exchange.
+    #[test]
+    fn sync_v2_cap_is_advertised_and_negotiates_down_to_v1() {
+        let identity = Identity::from_seed([12; 32]);
+        let hello = MeshHello::sign(&identity, [0; 8], [0; 4]).unwrap();
+        assert_ne!(hello.caps & CAP_SYNC_V2, 0);
+        assert_ne!(hello.negotiate(PROTO, CAPS).unwrap().1 & CAP_SYNC_V2, 0);
+        let v1_only = MeshHello::sign_with_caps(&identity, [0; 8], [0; 4], CAP_SYNC_V1).unwrap();
+        let caps = v1_only.negotiate(PROTO, CAPS).unwrap().1;
+        assert_ne!(caps & CAP_SYNC_V1, 0);
+        assert_eq!(caps & CAP_SYNC_V2, 0);
     }
 
     /// Done when: the encoded hello carries exactly the v1 layout. The

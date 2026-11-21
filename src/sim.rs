@@ -21,14 +21,16 @@
 //! and `tests/sim_baseline.rs` enforces the published numbers. Per-origin
 //! delivery counts are kept off the CSV for the MSH-10 flood test.
 
+use crate::store::{MemoryStore, MessageStore, StoreLimits, StoreMetadata, StoredMessage};
 use crate::{
-    Header, MeshConfig, MeshEngine, MeshHello, MeshInput, MeshOutput, MessageId, NetworkAdapter,
-    PacketClass, SuppressionConfig, derive_msg_id, sign_packet,
+    CAP_SYNC_V1, CAPS, Header, MeshConfig, MeshEngine, MeshHello, MeshInput, MeshOutput, MessageId,
+    NetworkAdapter, Packet, PacketClass, SHORT_ID_BYTES, SYNC_MAGIC, SYNC_V2_VERSION, StoreSummary,
+    SuppressionConfig, SyncOffer, derive_msg_id, sign_packet,
 };
 use ao_idents::{Identity, SealedMessage};
 use ao_network::{
-    AppHello, BeaconFlags, LinkId, LinkInfo, LocalTag, Network, NetworkConfig, NetworkEvent,
-    SimConfig as WorldConfig, SimNode, SimTransport, SimWorld,
+    AppHello, BeaconFlags, Channel, Hello, LinkId, LinkInfo, LocalTag, Network, NetworkConfig,
+    NetworkEvent, SimConfig as WorldConfig, SimNode, SimTransport, SimWorld,
 };
 use rand::{SeedableRng as SeedableRng09, rngs::StdRng as EngineRng};
 use rand08::{SeedableRng as SeedableRng08, rngs::StdRng as SealRng};
@@ -39,6 +41,8 @@ use std::time::Duration;
 /// Poll step: the world runs scheduled events exactly, so this only bounds
 /// how late a node reacts to them.
 const TICK: Duration = Duration::from_millis(50);
+/// A sync offer can trigger another need; bound one input's host work.
+const MAX_STORE_SERVICE_ROUNDS: usize = 64;
 /// Radio range in the position units used by random and community layouts.
 const RADIUS: i64 = 100;
 
@@ -158,6 +162,11 @@ pub struct Scenario {
     ///
     /// Ablation runs set this to false to measure immediate flooding.
     pub enforce_suppression: bool,
+    /// Whether Direct traffic uses MSH-16 copy tickets.
+    ///
+    /// The published MSH-27 baselines keep this false so they remain the
+    /// relay-only MSH-08 reference; spray gets its own paired report.
+    pub spray: bool,
     /// Suppression bounds and timer parameters under test.
     pub suppression: SuppressionConfig,
 }
@@ -266,6 +275,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             traffic: Traffic::Balanced,
             enforce_budgets: true,
             enforce_suppression: true,
+            spray: false,
             suppression: SuppressionConfig::default(),
         },
         Scenario {
@@ -283,6 +293,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             traffic: Traffic::Balanced,
             enforce_budgets: true,
             enforce_suppression: true,
+            spray: false,
             suppression: SuppressionConfig::default(),
         },
         Scenario {
@@ -300,6 +311,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             traffic: Traffic::Balanced,
             enforce_budgets: true,
             enforce_suppression: true,
+            spray: false,
             suppression: SuppressionConfig::default(),
         },
         Scenario {
@@ -315,6 +327,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             traffic: Traffic::Balanced,
             enforce_budgets: true,
             enforce_suppression: true,
+            spray: false,
             suppression: SuppressionConfig::default(),
         },
     ]
@@ -345,6 +358,7 @@ pub fn flood_scenarios() -> Vec<Scenario> {
         },
         enforce_budgets: true,
         enforce_suppression: true,
+        spray: false,
         suppression: SuppressionConfig::default(),
     }]
 }
@@ -374,8 +388,63 @@ pub fn suppression_scenarios() -> Vec<Scenario> {
         },
         enforce_budgets: true,
         enforce_suppression: true,
+        spray: false,
         suppression: SuppressionConfig::default(),
     }]
+}
+
+/// MSH-16's paired mobility case.
+///
+/// Both scenarios share the MSH-27 waypoint seed, topology, traffic and
+/// budgets. The only difference is the spray bit, so the report isolates
+/// binary copy tickets from the relay-only MSH-08 baseline.
+pub fn spray_scenarios() -> Vec<Scenario> {
+    let line = Scenario {
+        name: "spray-relay-line-20",
+        seed: 1_297_303_584,
+        nodes: 20,
+        topology: Topology::Line,
+        mobility: Mobility::Static,
+        settle: Duration::from_secs(30),
+        run: Duration::from_secs(30),
+        messages: 20,
+        payload_len: 128,
+        traffic: Traffic::Balanced,
+        enforce_budgets: true,
+        enforce_suppression: true,
+        spray: false,
+        suppression: SuppressionConfig::default(),
+    };
+    let scripted = Scenario {
+        name: "spray-relay-scripted-200",
+        seed: 1_297_303_752,
+        nodes: 200,
+        topology: Topology::Scripted(scripted_contacts(200)),
+        mobility: Mobility::Scripted,
+        settle: Duration::from_secs(60),
+        run: Duration::from_secs(60),
+        messages: 100,
+        payload_len: 128,
+        traffic: Traffic::Balanced,
+        enforce_budgets: true,
+        enforce_suppression: true,
+        spray: false,
+        suppression: SuppressionConfig::default(),
+    };
+    vec![
+        line.clone(),
+        Scenario {
+            name: "spray-enabled-line-20",
+            spray: true,
+            ..line
+        },
+        scripted.clone(),
+        Scenario {
+            name: "spray-enabled-scripted-200",
+            spray: true,
+            ..scripted
+        },
+    ]
 }
 
 /// A permanent chain plus short-lived shortcuts on a 200-node chain.
@@ -420,6 +489,7 @@ pub struct Simulation {
     scenario: Scenario,
     world: SimWorld,
     nodes: Vec<Node>,
+    stores: Vec<MemoryStore>,
     identities: Vec<Identity>,
     ranges: Vec<Vec<bool>>,
     applied: Vec<Vec<bool>>,
@@ -483,11 +553,16 @@ impl Simulation {
             let engine_rng = EngineRng::seed_from_u64(scenario.seed ^ (i as u64 + 1));
             let mut engine_config = MeshConfig::default();
             engine_config.budgets.enforce = scenario.enforce_budgets;
+            engine_config.spray.enabled = scenario.spray;
             engine_config.suppression = SuppressionConfig {
                 enabled: scenario.enforce_suppression,
                 ..scenario.suppression
             };
             let engine = MeshEngine::with_config(engine_rng, engine_config);
+            // Baseline nodes have empty stores. The hello and beacon must
+            // advertise the engine's actual digest, otherwise every link
+            // looks different and MSH-14 starts a needless sync contact.
+            let store_digest = engine.sync().local_digest();
             let mut adapter =
                 NetworkAdapter::new(engine, Network::new(NetworkConfig::default(), radio));
             let tag = {
@@ -497,7 +572,8 @@ impl Simulation {
                 out.copy_from_slice(&t[..16]);
                 LocalTag::new(out)
             };
-            let signed = MeshHello::sign(&identity, [0; 8], [0; 4]).expect("fixed identity signs");
+            let signed =
+                MeshHello::sign(&identity, [0; 8], store_digest).expect("fixed identity signs");
             let applied = adapter.apply(
                 world.now(),
                 vec![
@@ -507,7 +583,7 @@ impl Simulation {
                     },
                     MeshOutput::SetBeacon {
                         hint: next(&mut rng).to_be_bytes(),
-                        digest: [0; 4],
+                        digest: store_digest,
                         flags: BeaconFlags {
                             accepting: true,
                             ..BeaconFlags::default()
@@ -557,6 +633,9 @@ impl Simulation {
             }
         }
         let applied = vec![vec![false; n]; n];
+        let stores = (0..n)
+            .map(|_| MemoryStore::new(StoreLimits::default()))
+            .collect();
         let delivered_ids = vec![BTreeSet::new(); n];
         let origin_index = identities
             .iter()
@@ -572,6 +651,7 @@ impl Simulation {
             scenario,
             world,
             nodes,
+            stores,
             identities,
             ranges,
             applied,
@@ -671,6 +751,126 @@ impl Simulation {
         self.radio_bytes_run = 0;
     }
 
+    fn store_item(&mut self, node: usize, now_ms: u64, wire: &[u8], copies_left: u8) {
+        let metadata = StoreMetadata {
+            copies_left: copies_left.max(1),
+            first_seen: now_ms,
+            received_at: now_ms,
+            priority: 0,
+            received_from: None,
+            age_ms: 0,
+        };
+        let Ok(message) = StoredMessage::new(wire, metadata) else {
+            return;
+        };
+        let _ = self.stores[node].put(now_ms, message);
+    }
+
+    fn refresh_store_summary(&mut self, node: usize, now: Duration, now_ms: u64) {
+        let ids = self.stores[node].summary(now_ms);
+        let outputs = self.nodes[node]
+            .adapter
+            .engine_mut()
+            .handle(now_ms, MeshInput::StoreSummary { ids: &ids })
+            .expect("store summary is valid");
+        if outputs.is_empty() {
+            return;
+        }
+        self.count_outputs(node, now_ms, &outputs);
+        let events = self.nodes[node].adapter.apply(now, outputs);
+        for event in events {
+            if let crate::AdapterEvent::SendFailed { .. } = event {
+                self.send_failures += 1;
+            }
+        }
+    }
+
+    /// Services the host side of MSH-14/15/16 outputs: persist received
+    /// items and answer sync needs from that node's bounded store.
+    fn service_stores(
+        &mut self,
+        node: usize,
+        now: Duration,
+        now_ms: u64,
+        outputs: Vec<MeshOutput>,
+    ) {
+        let mut pending = outputs;
+        for _ in 0..MAX_STORE_SERVICE_ROUNDS {
+            let mut needs = Vec::new();
+            let mut items = Vec::new();
+            for output in &pending {
+                match output {
+                    MeshOutput::SyncNeed { link, prefixes } => {
+                        needs.push((*link, prefixes.clone()));
+                    }
+                    MeshOutput::SyncItem {
+                        id,
+                        wire,
+                        copies_left,
+                    } => items.push((*id, wire.clone(), *copies_left)),
+                    _ => {}
+                }
+            }
+            let mut stored = false;
+            for (id, wire, copies_left) in items {
+                debug_assert_eq!(
+                    crate::Packet::decode(&wire).map(|packet| packet.header.msg_id),
+                    Ok(id)
+                );
+                self.store_item(node, now_ms, &wire, copies_left);
+                stored = true;
+            }
+            if stored {
+                self.refresh_store_summary(node, now, now_ms);
+            }
+            let mut extra = Vec::new();
+            for (link, prefixes) in needs {
+                let store = &self.stores[node];
+                let ids = store.summary(now_ms);
+                let offers: Vec<SyncOffer<'_>> = prefixes
+                    .iter()
+                    .filter_map(|prefix| {
+                        let id = ids
+                            .iter()
+                            .find(|id| id.as_bytes()[..SHORT_ID_BYTES] == prefix[..])?;
+                        let message = store.get(now_ms, id)?;
+                        Some(SyncOffer {
+                            prefix: *prefix,
+                            wire: message.wire(),
+                            copies_left: message.metadata().copies_left,
+                        })
+                    })
+                    .collect();
+                if offers.is_empty() {
+                    continue;
+                }
+                let produced = self.nodes[node]
+                    .adapter
+                    .engine_mut()
+                    .handle(
+                        now_ms,
+                        MeshInput::SyncItems {
+                            link,
+                            items: &offers,
+                        },
+                    )
+                    .expect("host sync offers are valid");
+                extra.extend(produced);
+            }
+            if extra.is_empty() {
+                return;
+            }
+            self.count_outputs(node, now_ms, &extra);
+            let events = self.nodes[node].adapter.apply(now, extra.clone());
+            for event in events {
+                if let crate::AdapterEvent::SendFailed { .. } = event {
+                    self.send_failures += 1;
+                }
+            }
+            pending = extra;
+        }
+    }
+
     /// Advances the world, drives every node and samples queue occupancy.
     fn pump(&mut self, steps: usize) {
         let mut cx = Context::from_waker(Waker::noop());
@@ -742,6 +942,7 @@ impl Simulation {
                         .handle(now_ms, input)
                         .expect("engine inputs are well formed");
                     self.count_outputs(i, now_ms, &outputs);
+                    self.service_stores(i, now, now_ms, outputs.clone());
                     let events = self.nodes[i].adapter.apply(now, outputs);
                     for event in events {
                         if let crate::AdapterEvent::SendFailed { .. } = event {
@@ -897,7 +1098,7 @@ impl Simulation {
         let now_ms = self.world.now().as_millis() as u64;
         let mut rng = SealRng::seed_from_u64(self.scenario.seed ^ (m as u64 + 1));
         let plaintext = vec![(m % 251) as u8; self.scenario.payload_len];
-        let (header, payload) = if broadcast {
+        let (header, payload, wire) = if broadcast {
             // Plain Broadcast: the engine caps TTL at ADR-0001's six hops
             // on submission. Payload is opaque to the mesh.
             let sender = &self.identities[origin];
@@ -914,7 +1115,8 @@ impl Simulation {
             };
             let signature = sign_packet(sender, &mut header, &plaintext).expect("fixed key signs");
             let packet = crate::Packet::new(header, signature, &plaintext).expect("lengths agree");
-            (packet.header, plaintext)
+            let wire = packet.encode();
+            (packet.header, plaintext, wire)
         } else {
             let sender = &self.identities[origin];
             let recipient = &self.identities[dst];
@@ -923,7 +1125,8 @@ impl Simulation {
                     .expect("fixed identities seal");
             let signature = sign_packet(sender, &mut header, &payload).expect("fixed key signs");
             let packet = crate::Packet::new(header, signature, &payload).expect("lengths agree");
-            (packet.header, payload)
+            let wire = packet.encode();
+            (packet.header, payload, wire)
         };
         let submitted_id = header.msg_id;
         let outputs = self.nodes[origin]
@@ -945,7 +1148,16 @@ impl Simulation {
         } else {
             self.direct_submitted += 1;
         }
+        if self.scenario.spray && !broadcast {
+            let copies = self.nodes[origin]
+                .adapter
+                .engine()
+                .spray_copies_left(submitted_id);
+            self.store_item(origin, now_ms, &wire, copies);
+            self.refresh_store_summary(origin, self.world.now(), now_ms);
+        }
         self.count_outputs(origin, now_ms, &outputs);
+        self.service_stores(origin, self.world.now(), now_ms, outputs.clone());
         let events = self.nodes[origin].adapter.apply(self.world.now(), outputs);
         for event in events {
             if let crate::AdapterEvent::SendFailed { .. } = event {
@@ -1098,6 +1310,361 @@ fn seal_delivery<R: rand08::RngCore + rand08::CryptoRng>(
     Ok((header, payload))
 }
 
+/// Measured cost of one MSH-14 or MSH-15 contact.
+///
+/// Bytes are counted on the Bulk frames both engines emit, so the report is
+/// the wire cost a radio would carry. Item packets are separated from the
+/// control frames that discover them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncComparison {
+    /// Negotiated sync protocol: `v1` or `v2`.
+    pub mode: &'static str,
+    /// Reproduction seed.
+    pub seed: u64,
+    /// Ids in the local store.
+    pub local_ids: usize,
+    /// Ids in the remote store.
+    pub remote_ids: usize,
+    /// Ids present in exactly one store.
+    pub difference: usize,
+    /// Bytes of summary, request and range frames.
+    pub control_bytes: usize,
+    /// Bytes of packet items sent to reconcile the stores.
+    pub item_bytes: usize,
+    /// Control plus item bytes in both directions.
+    pub total_bytes: usize,
+    /// Number of MSH-14 control frames.
+    pub v1_frames: usize,
+    /// Number of MSH-15 control frames.
+    pub v2_frames: usize,
+    /// Whether both stores ended with the same summary.
+    pub converged: bool,
+}
+
+impl SyncComparison {
+    /// CSV column names, in the same order as [`Self::csv_row`].
+    pub fn csv_header() -> &'static str {
+        "mode,seed,local_ids,remote_ids,difference,control_bytes,item_bytes,total_bytes,v1_frames,v2_frames,converged"
+    }
+
+    /// One CSV line for this measured contact.
+    pub fn csv_row(&self) -> String {
+        format!(
+            "{},{},{},{},{},{},{},{},{},{},{}",
+            self.mode,
+            self.seed,
+            self.local_ids,
+            self.remote_ids,
+            self.difference,
+            self.control_bytes,
+            self.item_bytes,
+            self.total_bytes,
+            self.v1_frames,
+            self.v2_frames,
+            self.converged,
+        )
+    }
+}
+
+const BENCH_LINK_A: LinkId = LinkId::new(91);
+const BENCH_LINK_B: LinkId = LinkId::new(92);
+/// MSH-14 `SyncFrame::Item` tag; item frames share the sync magic byte.
+const BENCH_TAG_ITEM: u8 = 3;
+
+fn bench_hello(identity: &Identity, digest: [u8; 4], caps: u32) -> Hello {
+    let signed = MeshHello::sign_with_caps(identity, [0; 8], digest, caps)
+        .expect("benchmark identity signs");
+    Hello {
+        proto_min: 1,
+        proto_max: 1,
+        caps: 0,
+        max_frame: 16_384,
+        tag: LocalTag::new([1; 16]),
+        app_hello: AppHello::new(signed.encode().to_vec()).expect("hello fits"),
+    }
+}
+
+fn bench_wire(owner: &Identity, tag: u32) -> Vec<u8> {
+    let payload = format!("sync-comparison-{tag}").into_bytes();
+    let mut header = Header {
+        class: PacketClass::Broadcast,
+        dst: None,
+        msg_id: [0; 16].into(),
+        origin: [0; 16],
+        created_ms: 0,
+        lifetime_s: 3_600,
+        payload_len: payload.len() as u64,
+        ttl: 6,
+        hops: 0,
+    };
+    let signature = sign_packet(owner, &mut header, &payload).expect("benchmark packet signs");
+    Packet::new(header, signature, &payload)
+        .expect("benchmark packet fields agree")
+        .encode()
+}
+
+fn bench_put(store: &mut MemoryStore, now: u64, bytes: &[u8]) {
+    let metadata = StoreMetadata {
+        copies_left: 1,
+        first_seen: now,
+        received_at: now,
+        priority: 0,
+        received_from: None,
+        age_ms: 0,
+    };
+    let message = StoredMessage::new(bytes, metadata).expect("bounded benchmark item");
+    store.put(now, message).expect("store has room");
+}
+
+#[derive(Default)]
+struct BenchService {
+    frames: Vec<Vec<u8>>,
+    items: Vec<Vec<u8>>,
+    releases: usize,
+    control_bytes: usize,
+    item_bytes: usize,
+    v1_frames: usize,
+    v2_frames: usize,
+}
+
+fn bench_service(
+    engine: &mut MeshEngine<EngineRng>,
+    store: &MemoryStore,
+    now: u64,
+    outputs: Vec<MeshOutput>,
+) -> BenchService {
+    let mut result = BenchService::default();
+    for output in outputs {
+        match output {
+            MeshOutput::Send {
+                channel: Channel::Bulk,
+                payload,
+                ..
+            } => {
+                if payload.first() == Some(&SYNC_MAGIC)
+                    && payload.get(1) != Some(&SYNC_V2_VERSION)
+                    && payload.get(2) == Some(&BENCH_TAG_ITEM)
+                {
+                    result.item_bytes += payload.len();
+                } else if payload.first() == Some(&SYNC_MAGIC) {
+                    result.control_bytes += payload.len();
+                    if payload.get(1) == Some(&SYNC_V2_VERSION) {
+                        result.v2_frames += 1;
+                    } else {
+                        result.v1_frames += 1;
+                    }
+                } else {
+                    result.item_bytes += payload.len();
+                }
+                result.frames.push(payload);
+            }
+            MeshOutput::SyncItem { wire, .. } => result.items.push(wire),
+            MeshOutput::ReleaseOpportunistic { .. } => result.releases += 1,
+            MeshOutput::SyncNeed { link, prefixes } => {
+                let ids = store.summary(now);
+                let offers: Vec<SyncOffer<'_>> = prefixes
+                    .iter()
+                    .filter_map(|prefix| {
+                        let id = ids
+                            .iter()
+                            .find(|id| id.as_bytes()[..SHORT_ID_BYTES] == prefix[..])?;
+                        let message = store.get(now, id)?;
+                        Some(SyncOffer {
+                            prefix: *prefix,
+                            wire: message.wire(),
+                            copies_left: message.metadata().copies_left,
+                        })
+                    })
+                    .collect();
+                let extra = engine
+                    .handle(
+                        now,
+                        MeshInput::SyncItems {
+                            link,
+                            items: &offers,
+                        },
+                    )
+                    .expect("host offers are valid");
+                let nested = bench_service(engine, store, now, extra);
+                result.frames.extend(nested.frames);
+                result.items.extend(nested.items);
+                result.releases += nested.releases;
+                result.control_bytes += nested.control_bytes;
+                result.item_bytes += nested.item_bytes;
+                result.v1_frames += nested.v1_frames;
+                result.v2_frames += nested.v2_frames;
+            }
+            _ => {}
+        }
+    }
+    result
+}
+
+/// Runs one deterministic contact with either negotiated protocol.
+///
+/// Both runs use identical stores, identities and wires; only the advertised
+/// capability bit changes, so the byte difference is the protocol's cost.
+#[must_use]
+pub fn run_sync_comparison(
+    mode: &'static str,
+    seed: u64,
+    local_ids: usize,
+    remote_ids: usize,
+) -> SyncComparison {
+    let caps = if mode == "v2" { CAPS } else { CAP_SYNC_V1 };
+    let mut owner_seed = [0u8; 32];
+    owner_seed.copy_from_slice(blake3::hash(&seed.to_be_bytes()).as_bytes());
+    let owner = Identity::from_seed(owner_seed);
+    let mut peer_seed = [0u8; 32];
+    peer_seed.copy_from_slice(blake3::hash(&(seed ^ 0x515f_2026).to_be_bytes()).as_bytes());
+    let peer = Identity::from_seed(peer_seed);
+
+    let mut a_store = MemoryStore::new(Default::default());
+    let mut b_store = MemoryStore::new(Default::default());
+    let wires: Vec<Vec<u8>> = (0..local_ids.max(remote_ids))
+        .map(|tag| bench_wire(&owner, tag as u32))
+        .collect();
+    for wire in &wires[..local_ids] {
+        bench_put(&mut a_store, 0, wire);
+    }
+    for wire in &wires[..remote_ids] {
+        bench_put(&mut b_store, 0, wire);
+    }
+    let a_ids = a_store.summary(0);
+    let b_ids = b_store.summary(0);
+
+    let config = MeshConfig {
+        max_neighbors: 4,
+        ..MeshConfig::default()
+    };
+    let mut a = MeshEngine::with_config(EngineRng::seed_from_u64(seed), config);
+    let mut b = MeshEngine::with_config(EngineRng::seed_from_u64(seed ^ 1), config);
+    a.handle(0, MeshInput::StoreSummary { ids: &a_ids })
+        .expect("local summary");
+    b.handle(0, MeshInput::StoreSummary { ids: &b_ids })
+        .expect("remote summary");
+
+    let mut report = SyncComparison {
+        mode,
+        seed,
+        local_ids,
+        remote_ids,
+        difference: local_ids.max(remote_ids) - local_ids.min(remote_ids),
+        control_bytes: 0,
+        item_bytes: 0,
+        total_bytes: 0,
+        v1_frames: 0,
+        v2_frames: 0,
+        converged: false,
+    };
+
+    let mut a_frames = Vec::new();
+    let mut b_frames = Vec::new();
+    let mut a_releases = 0;
+    let mut b_releases = 0;
+
+    let out = a
+        .handle(
+            0,
+            MeshInput::LinkUp {
+                link: BENCH_LINK_A,
+                remote_hello: bench_hello(
+                    &peer,
+                    StoreSummary::from_store(&b_store, 0).digest(),
+                    caps,
+                ),
+            },
+        )
+        .expect("link up");
+    let serviced = bench_service(&mut a, &a_store, 0, out);
+    a_frames.extend(serviced.frames);
+    a_releases += serviced.releases;
+    report.control_bytes += serviced.control_bytes;
+    report.item_bytes += serviced.item_bytes;
+    report.v1_frames += serviced.v1_frames;
+    report.v2_frames += serviced.v2_frames;
+
+    let out = b
+        .handle(
+            0,
+            MeshInput::LinkUp {
+                link: BENCH_LINK_B,
+                remote_hello: bench_hello(
+                    &owner,
+                    StoreSummary::from_store(&a_store, 0).digest(),
+                    caps,
+                ),
+            },
+        )
+        .expect("link up");
+    let serviced = bench_service(&mut b, &b_store, 0, out);
+    b_frames.extend(serviced.frames);
+    b_releases += serviced.releases;
+    report.control_bytes += serviced.control_bytes;
+    report.item_bytes += serviced.item_bytes;
+    report.v1_frames += serviced.v1_frames;
+    report.v2_frames += serviced.v2_frames;
+
+    for round in 0..256u64 {
+        let outgoing = std::mem::take(&mut a_frames);
+        for payload in outgoing {
+            let now = round + 1;
+            let outputs = b
+                .handle(
+                    now,
+                    MeshInput::Data {
+                        link: BENCH_LINK_B,
+                        channel: Channel::Bulk,
+                        identity: &peer,
+                        payload: &payload,
+                    },
+                )
+                .expect("sync frame");
+            let serviced = bench_service(&mut b, &b_store, now, outputs);
+            b_frames.extend(serviced.frames);
+            for item in serviced.items {
+                bench_put(&mut b_store, now, &item);
+            }
+            b_releases += serviced.releases;
+            report.control_bytes += serviced.control_bytes;
+            report.item_bytes += serviced.item_bytes;
+            report.v1_frames += serviced.v1_frames;
+            report.v2_frames += serviced.v2_frames;
+        }
+        let outgoing = std::mem::take(&mut b_frames);
+        for payload in outgoing {
+            let now = round + 1;
+            let outputs = a
+                .handle(
+                    now,
+                    MeshInput::Data {
+                        link: BENCH_LINK_A,
+                        channel: Channel::Bulk,
+                        identity: &owner,
+                        payload: &payload,
+                    },
+                )
+                .expect("sync frame");
+            let serviced = bench_service(&mut a, &a_store, now, outputs);
+            a_frames.extend(serviced.frames);
+            for item in serviced.items {
+                bench_put(&mut a_store, now, &item);
+            }
+            a_releases += serviced.releases;
+            report.control_bytes += serviced.control_bytes;
+            report.item_bytes += serviced.item_bytes;
+            report.v1_frames += serviced.v1_frames;
+            report.v2_frames += serviced.v2_frames;
+        }
+        if a_frames.is_empty() && b_frames.is_empty() && a_releases > 0 && b_releases > 0 {
+            break;
+        }
+    }
+    report.converged = a_store.summary(0) == b_store.summary(0);
+    report.total_bytes = report.control_bytes + report.item_bytes;
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1136,6 +1703,23 @@ mod tests {
         assert_eq!(
             row,
             "test,1,2,3,2,0,8,6,0,1024,12,20,0.6667,4.0000,0.0000,100,1"
+        );
+    }
+
+    #[test]
+    fn v2_contact_cost_drops_for_large_stores() {
+        const SEED: u64 = 0x515f_2026;
+        let v1 = run_sync_comparison("v1", SEED, 1_000, 1_001);
+        let v2 = run_sync_comparison("v2", SEED, 1_000, 1_001);
+        assert!(v1.converged, "v1 must converge");
+        assert!(v2.converged, "v2 must converge");
+        assert_eq!(v1.difference, 1);
+        assert_eq!(v2.difference, 1);
+        assert!(
+            v2.total_bytes * 2 < v1.total_bytes,
+            "v2 must use less than half the bytes of v1: {} vs {}",
+            v2.total_bytes,
+            v1.total_bytes
         );
     }
 }

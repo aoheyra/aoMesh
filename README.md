@@ -2,7 +2,7 @@
 
 **The routing and store-and-forward engine of the aoheyra mesh.** A sans-IO Rust crate that decides what happens to a packet: forward it, hold it, suppress it, deliver it, or drop it, across a phone-to-phone mesh where links come and go.
 
-> **Status: pre-alpha, through MSH-11.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, and counter-based Broadcast/Presence suppression with seeded assessment delays are implemented.
+> **Status: pre-alpha, through MSH-16.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest, bounded anti-entropy sync, range-based reconciliation on meeting links and binary spray-and-wait for Direct traffic are implemented.
 
 Cargo package name: `ao_mesh`.
 
@@ -78,13 +78,14 @@ Lifetimes, TTLs, copy counts and budgets are **defaults with documented reasons*
    aoNetwork  (NetworkEvent in, actions out)      aoIdents (sign, open, replay)
 ```
 
-**Engine inputs:** `LinkUp`, `LinkDown`, `Data`, `Tick`, `Submit`. **Outputs:** `Send`, `Broadcast`, `Release`, `Deliver`, `SetHello`, `SetBeacon`.
+**Engine inputs:** `LinkUp`, `LinkDown`, `Data`, `Tick`, `Submit`, `StoreSummary`, `SyncItems`. **Outputs:** `Send`, `Broadcast`, `Release`, `Deliver`, `SetHello`, `SetBeacon`, `SyncNeed`, `SyncItem`, `ReleaseOpportunistic`.
 
 ### Engine and adapter (MSH-06)
 
 `MeshEngine::new(rng)` uses `MeshConfig::default()`: 32 neighbour entries, the
 MSH-09 replay guard (1024 ids per sender, 24 h tolerance, 64 senders), the
-budget fields below and the MSH-11 suppression fields below. `with_config`
+budget fields below, the MSH-11 suppression fields, the MSH-13 summary
+fields and the MSH-14/15 sync fields below. `with_config`
 accepts explicit bounds; zero neighbours
 refuses all new links. Excess links emit `Release`, duplicate link-up events
 preserve counters, and link-down removes the entry. These are bookkeeping
@@ -109,8 +110,11 @@ guard accepts. Refusals and forged content addresses are counted against the
 sending neighbour.
 
 With feature `adapter`, `NetworkAdapter` owns the facade and engine in one
-caller task. All seven output variants map to commands or host events;
-`SendFailed` returns the link and original payload through `SendError`.
+caller task. All nine output variants map to network commands or host events;
+`SyncNeed` asks the host to resolve store ids, `SyncItem` hands an incoming
+packet to the host store, and `ReleaseOpportunistic` calls aoNetwork's
+`Network::release`, which closes only opportunistic links. `SendFailed`
+returns the link and original payload through `SendError`.
 `poll_event` and its `next_event` future need no runtime dependency and work
 in a Tokio-owned task. Each pump takes the local `Identity` by borrow so
 MSH-09 can open deliveries; the engine retains no key. The host supplies
@@ -352,6 +356,14 @@ cargo run --release --features sim --example sim_report
 cargo test --release --all-features --test sim_baseline
 ```
 
+MSH-16 adds a separate paired report; the four published rows above stay the
+relay-only MSH-08 reference:
+
+```bash
+cargo run --release --all-features --example spray_report
+cargo test --release --all-features --test sim_spray
+```
+
 Tests are `cargo test` only: no Miri or callgrind locally. CI runs fmt, clippy, tests on three operating systems, `cargo doc`, cargo-deny, an MSRV build and miri on every pull request.
 
 ### Sibling crates
@@ -395,3 +407,131 @@ opaque wire bytes and local metadata, never keys or application data models.
 See [the storage decision](docs/adr/message-store.md) for limits and ordering.
 The app's SQLite backend must run `store::conformance::check` against a fresh
 backend factory. SQLite itself and engine integration are separate tasks.
+
+## Store summary and beacon digest (MSH-13)
+
+`sync::StoreSummary` canonicalises the store's live message ids: input order and
+duplicates are ignored, the exposed vector holds eight-byte prefixes, and the
+four-byte digest hashes every full id plus the entry count. Two stores with the
+same live content therefore produce equal digests; adding, removing or replacing
+one message changes it with overwhelming probability. The digest is a change
+detector, not a set proof: MSH-14 confirms differences with a full summary
+exchange.
+
+| Setting | Default | Why |
+|---|---|---|
+| Short id bytes | 8 | Compact enough for a bounded store, low collision risk |
+| Beacon debounce | 200 ms | Coalesces a write burst without delaying a link-up comparison |
+| Beacon hint | `[0; 8]` | Opaque to the mesh; the app may replace it |
+
+The host remains the store owner. It submits `MeshInput::StoreSummary` with the
+ids returned by `MessageStore::summary(now)`. The engine debounces changes for
+`SummaryConfig::debounce_ms` (default 200 ms) and emits one `MeshOutput::SetBeacon`
+with the digest and the configured opaque hint. Reverting to the published value
+cancels a pending change, and a backwards clock never shortens the window. No
+wire format changes: aoNetwork's beacon already carries the four-byte digest.
+`tests/sync_summary.rs` proves the equality/change property with two
+`MemoryStore` instances and the beacon behaviour through the engine.
+
+## Anti-entropy sync v1 (MSH-14)
+
+When two nodes meet, a link whose MeshHello advertises `CAP_SYNC_V1` starts a
+bounded anti-entropy exchange on aoNetwork's Bulk channel. The engine never
+opens the host's store: it compares the peer's four-byte beacon digest with its
+cached summary, exchanges sorted eight-byte id prefixes, and emits `SyncNeed`
+for the missing prefixes. The host resolves each prefix through
+`MessageStore::get` and submits the encoded packet with `MeshInput::SyncItems`.
+Incoming `SyncItem` events carry complete encoded packets for the host to
+insert; the engine verifies bounds, the content address and the storable class,
+while final signature verification and insertion policy stay with the store
+owner. Telemetry is never synced.
+
+| Setting | Default | Why |
+|---|---|---|
+| Per-contact byte budget | 256 KiB | Bounds work and airtime for one meeting |
+| Per-frame byte budget | 15 KiB | Fits inside aoNetwork's 16 KiB Bulk frame |
+| Summary entries | 1024 | Matches the store bound; larger summaries are rejected |
+| Contact deadline | 20 s | Long enough for a slow contact, bounded against a stalled peer |
+
+`SyncFrame` uses a five-byte header: magic `0x53`, version `1`, a tag for
+Digest/Summary/Item/Done and a two-byte body length. A peer without the sync
+capability bit is ignored by the sync path and keeps the MSH-13 beacon path; no
+sync frames are sent. Equal digests end the contact without a release, since
+the link may still carry ordinary forwarding traffic. Each side sends only the
+ids the other lacks and waits for the peer's `Done` before emitting
+`ReleaseOpportunistic`, so the link is not closed while packets are still in
+flight. The deadline releases a stalled
+contact once, and a link drop clears its session so a later encounter restarts
+cleanly.
+
+`tests/sync_v1.rs` covers bounded frames, host seams, drop recovery and
+both-direction release; `src/hello.rs` covers the capability bit and its
+negotiated fallback. `tests/sync_convergence.rs` drives the
+real adapter over aoNetwork `SimWorld` with seed `0x5147_2026`: after a 20-second
+contact the two stores converge on the same four ids and the opportunistic link
+is released.
+
+## Range-based reconciliation (MSH-15)
+
+A link whose MeshHello negotiates `CAP_SYNC_V2` uses Negentropy-style binary
+range reconciliation instead of the MSH-14 summary vector. Both sides hash the
+full ids in each range of the canonical 128-bit id space. Equal summaries end
+the branch; differing summaries split into two child ranges until a leaf is
+small enough to exchange as full ids. The engine then computes the same
+`SyncNeed` / `SyncItems` transfer as MSH-14, so the host still owns the store
+and v1 remains the fallback for peers without the new capability bit.
+
+| Setting | Default | Why |
+|---|---|---|
+| Range leaf size | 32 ids | 512 bytes of ids per leaf frame, well inside the frame budget |
+| Maximum range depth | 128 bits | A fully split range has at most one id |
+| Range entries per frame | 8 | Bounds response frames without many tiny sends |
+
+`SyncFrameV2` reuses the sync magic and five-byte header with version `2` and
+tags for Root, Ranges, Request, Ids and Ready. Once both sides send Ready, the
+contact switches to MSH-14 `Item` and `Done` frames, so the existing per-contact
+byte budget, timeout and release rules still apply. `tests/sync_v2.rs` covers
+convergence, codec bounds and the v1-only fallback. The simulator report
+`cargo run --release --all-features --example sync_v2_report` uses seed
+`0x515f_2026` with stores of 1000 and 1001 messages: v2 exchanges 2,018 bytes
+against v1's 16,188 bytes, with both stores converging.
+
+## Binary spray-and-wait (MSH-16)
+
+Direct packets now carry a copy ticket in a small additive envelope on the same
+Message channel as the packet. The envelope is six bytes: magic `0x54`, version
+`1`, tag `1` for Direct, a one-byte remaining-copy count and a two-byte inner
+length. The packet header and its signed immutable part are unchanged; relays
+may lower the hop-mutable ticket without forging origin content. Both peers must
+advertise `CAP_SPRAY_V1` (`1 << 2`); a peer without it receives the ordinary
+packet bytes, so this is a negotiated wire addition, not a packet version bump.
+Receiving a stray envelope on a link that did not negotiate the bit is an
+attributable protocol error.
+
+Each new Direct message starts with 255 tickets. On contact with a non-destination
+peer the node hands over half of its remaining tickets and keeps the rest; a
+destination always receives one copy and ends the spray. At one ticket a node
+waits and only hands that copy to the destination, which is also how a stored
+copy reaches a later contact through MSH-14/15 sync. The tracker is bounded to
+4096 live ids, and tickets, store metadata and sync frames carry the count
+without adding a header field.
+
+| Setting | Default | Why |
+|---|---|---|
+| Initial copies | 255 | Halving across an eight-hop TTL still leaves a copy for the destination; measured below |
+| Maximum tracked ids | 4096 | Bounds memory across overlapping contact windows |
+| Envelope header | 6 bytes | Magic, version, tag, count and a bounded inner length |
+
+The paired report keeps topology, mobility, traffic and budgets identical:
+
+| Scenario | Seed | Delivered / submitted | Delivery ratio | Transmissions | Overhead |
+|---|---:|---:|---:|---:|---:|
+| `spray-relay-line-20` | 1297303584 | 20 / 20 | 1.0000 | 193 | 9.6500 |
+| `spray-enabled-line-20` | 1297303584 | 20 / 20 | 1.0000 | 186 | 9.3000 |
+| `spray-relay-scripted-200` | 1297303752 | 100 / 100 | 1.0000 | 3455 | 34.5500 |
+| `spray-enabled-scripted-200` | 1297303752 | 99 / 100 | 0.9900 | 1786 | 18.0404 |
+
+The scripted-200 case keeps 99 percent delivery while using 48 percent fewer
+transmissions. `tests/spray.rs` covers envelope bounds, the binary split, the
+destination shortcut, wait-phase delivery, tracker eviction and capability
+fallback; `tests/sim_spray.rs` locks the fixed-seed numbers.

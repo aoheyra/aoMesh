@@ -6,7 +6,11 @@ use crate::forward::{self, Action};
 use crate::neighbor::{MeshConfig, NeighborTable};
 use crate::seen::{Offer, SeenCache};
 use crate::suppress::{self, Sighting, SuppressionTable};
-use crate::{Header, Packet, PacketError, sign_packet};
+use crate::sync::{
+    BeaconTracker, SHORT_ID_BYTES, StoreSummary, SyncAction, SyncFrame, SyncFrameV2, SyncOffer,
+    SyncTracker,
+};
+use crate::{Header, MessageId, Packet, PacketError, sign_packet};
 use ao_idents::{IdentError, Identity, ReplayGuard, Signature};
 use ao_network::{AppHello, BeaconFlags, Channel, DisconnectReason, Hello, LinkId, LocalTag};
 use rand_core::RngCore;
@@ -45,7 +49,23 @@ pub enum MeshInput<'a> {
         /// delivers, and the engine retains no key.
         identity: &'a Identity,
     },
-    /// Time-driven step; fires completed MSH-11 assessment timers.
+    /// The host's current live store ids (MSH-13).
+    ///
+    /// The engine never opens or persists the store; it canonicalises the
+    /// ids into a compact summary and debounces the beacon digest.
+    StoreSummary {
+        /// Live message ids from [`crate::store::MessageStore::summary`].
+        ids: &'a [MessageId],
+    },
+    /// Host-encoded packets for prefixes requested by a sync contact
+    /// (MSH-14). The host owns the store; only the borrowed bytes are read.
+    SyncItems {
+        /// The contact's link.
+        link: LinkId,
+        /// One item per requested prefix, in host order.
+        items: &'a [SyncOffer<'a>],
+    },
+    /// Time-driven step; fires MSH-11 timers and MSH-14 contact deadlines.
     Tick,
     /// Originate a packet. This does not encrypt or deliver its payload.
     Submit {
@@ -118,6 +138,34 @@ pub enum MeshOutput {
         /// Advertisement flags.
         flags: BeaconFlags,
     },
+    /// Ask the host to resolve short ids to encoded store packets.
+    /// This is a host action, not a network send.
+    SyncNeed {
+        /// The contact's link.
+        link: LinkId,
+        /// Prefixes the peer is missing.
+        prefixes: Vec<[u8; SHORT_ID_BYTES]>,
+    },
+    /// An item from a peer or a local submission, ready for the host to
+    /// insert in its store. The engine checked bounds and the content
+    /// address, not the origin signature: final authenticity remains the
+    /// store owner's job. Locally submitted Direct items appear here too,
+    /// so the host can persist the same metadata the spray policy uses.
+    SyncItem {
+        /// Full content address parsed from the packet.
+        id: MessageId,
+        /// Complete encoded mesh packet.
+        wire: Vec<u8>,
+        /// Remaining spray copies to record with the item. Non-spray items
+        /// and peers without the spray capability use one.
+        copies_left: u8,
+    },
+    /// End an MSH-14 contact. The adapter uses aoNetwork's `release`, which
+    /// only closes opportunistic links and leaves stable ones alone.
+    ReleaseOpportunistic {
+        /// Link to release.
+        link: LinkId,
+    },
 }
 
 /// Submission failure; no packet is emitted on error.
@@ -157,6 +205,9 @@ pub struct MeshEngine<R: RngCore> {
     replay: ReplayGuard,
     budgets: BudgetTracker,
     suppression: SuppressionTable,
+    beacon: BeaconTracker,
+    sync: SyncTracker,
+    spray: crate::spray::SprayTracker,
 }
 impl<R: RngCore> MeshEngine<R> {
     /// Creates an engine with the default limits (`MeshConfig::default`).
@@ -177,6 +228,9 @@ impl<R: RngCore> MeshEngine<R> {
             replay: ReplayGuard::new(config.replay),
             budgets,
             suppression: SuppressionTable::new(config.suppression),
+            beacon: BeaconTracker::new(config.summary),
+            sync: SyncTracker::new(config.sync),
+            spray: crate::spray::SprayTracker::new(config.spray),
         }
     }
     /// Read-only bookkeeping, not a list of authenticated identities.
@@ -186,6 +240,21 @@ impl<R: RngCore> MeshEngine<R> {
     /// Read-only relay budget and penalty state (MSH-10).
     pub fn budgets(&self) -> &BudgetTracker {
         &self.budgets
+    }
+    /// Digest currently advertised in the beacon, if one was published.
+    pub fn published_store_digest(&self) -> Option<[u8; 4]> {
+        self.beacon.published_digest()
+    }
+    /// Read-only anti-entropy state (MSH-14).
+    pub fn sync(&self) -> &SyncTracker {
+        &self.sync
+    }
+    /// Remaining MSH-16 copies for one id, or one when spray is inactive.
+    ///
+    /// The host persists this with the packet bytes so later sync offers
+    /// carry the same ticket the relay policy holds.
+    pub fn spray_copies_left(&self, id: MessageId) -> u8 {
+        self.spray.copies_left(id)
     }
     /// Processes one input at caller-supplied milliseconds.
     ///
@@ -206,11 +275,43 @@ impl<R: RngCore> MeshEngine<R> {
     /// threshold; local delivery is never suppressed by a budget.
     /// Broadcast and Presence use MSH-11's seeded assessment delay and
     /// cancel their relay when enough distinct neighbours carried the
-    /// same content address. Submission errors are typed and the caller
-    /// still owns the input bytes.
+    /// same content address. `StoreSummary` canonicalises host-provided
+    /// ids and emits a debounced `SetBeacon` when the digest changes
+    /// (MSH-13). Submission errors are typed and the caller still owns
+    /// the input bytes.
     pub fn handle(&mut self, now: u64, input: MeshInput<'_>) -> Result<Vec<MeshOutput>, MeshError> {
         match input {
-            MeshInput::Tick => Ok(self.drain_due(now)),
+            MeshInput::StoreSummary { ids } => {
+                let digest = StoreSummary::from_ids(ids).digest();
+                self.sync.set_local(ids);
+                Ok(self
+                    .beacon
+                    .observe(now, digest)
+                    .map(|digest| MeshOutput::SetBeacon {
+                        hint: self.config.summary.beacon_hint,
+                        digest,
+                        flags: BeaconFlags {
+                            accepting: true,
+                            relay_willing: true,
+                            low_battery: false,
+                        },
+                    })
+                    .into_iter()
+                    .collect())
+            }
+            MeshInput::SyncItems { link, items } => {
+                if !self.neighbors.contains(link) {
+                    return Ok(Vec::new());
+                }
+                let actions = self.sync.on_offers(link, items);
+                Ok(self.apply_sync_actions(now, actions))
+            }
+            MeshInput::Tick => {
+                let mut outputs = self.drain_due(now);
+                let actions = self.sync.expire(now);
+                outputs.extend(self.apply_sync_actions(now, actions));
+                Ok(outputs)
+            }
             MeshInput::LinkUp { link, remote_hello } => {
                 if self.neighbors.contains(link) {
                     // A repeated LinkUp keeps the existing entry, counters
@@ -226,30 +327,151 @@ impl<R: RngCore> MeshEngine<R> {
                 // A failed introduction is dropped, not penalised here:
                 // the entry observes the peer and MSH-10's penalties
                 // decide its fate (ADR-0004).
-                let node_id =
-                    crate::hello::verified_node_id(remote_hello.app_hello.as_bytes()).ok();
+                let hello = crate::hello::verified_hello(remote_hello.app_hello.as_bytes()).ok();
+                let node_id = hello.map(|hello| hello.node_id);
                 self.neighbors.insert(now, link, remote_hello, node_id);
-                Ok(Vec::new())
+                let caps = hello.and_then(|hello| {
+                    hello
+                        .negotiate(crate::hello::PROTO, crate::hello::CAPS)
+                        .ok()
+                        .map(|(_, caps)| caps)
+                });
+                let Some(caps) = caps else {
+                    return Ok(Vec::new());
+                };
+                let spray = self.config.spray.enabled && caps & crate::hello::CAP_SPRAY_V1 != 0;
+                self.spray.set_caps(link, caps);
+                let remote_digest = hello.map_or([0; 4], |hello| hello.store_digest);
+                let actions = if caps & crate::hello::CAP_SYNC_V2 != 0 {
+                    self.sync.start_v2(now, link, remote_digest, spray)
+                } else if caps & crate::hello::CAP_SYNC_V1 != 0 {
+                    self.sync.start(now, link, remote_digest, spray)
+                } else {
+                    Vec::new()
+                };
+                Ok(self.apply_sync_actions(now, actions))
             }
             MeshInput::LinkDown { link, .. } => {
                 self.neighbors.remove(link);
                 self.budgets.link_down(link);
+                self.sync.link_down(link);
+                self.spray.link_down(link);
                 Ok(Vec::new())
             }
             MeshInput::Data {
                 link,
+                channel,
                 identity,
                 payload,
-                ..
             } => {
                 // An untracked link has no counters or penalty state; do not
                 // let arbitrary link ids create either.
                 if !self.neighbors.contains(link) {
                     return Ok(Vec::new());
                 }
+                if channel == Channel::Bulk
+                    && payload.first() == Some(&crate::sync::SYNC_MAGIC)
+                    && payload.get(1) == Some(&crate::sync::SYNC_V2_VERSION)
+                {
+                    match SyncFrameV2::decode(payload) {
+                        Ok(Some(frame)) => {
+                            let verified = self
+                                .neighbors
+                                .get(link)
+                                .is_some_and(|neighbor| neighbor.node_id.is_some());
+                            if !verified {
+                                return Ok(Self::release_if_penalised(
+                                    link,
+                                    self.budgets.penalize(
+                                        now,
+                                        link,
+                                        self.config.budgets.penalty_unverified,
+                                    ),
+                                ));
+                            }
+                            let actions = self.sync.on_v2_frame(now, link, frame, payload.len());
+                            return Ok(self.apply_sync_actions(now, actions));
+                        }
+                        Ok(None) => {}
+                        Err(_) => {
+                            self.neighbors.reject(link);
+                            return Ok(Self::release_if_penalised(
+                                link,
+                                self.budgets.penalize(
+                                    now,
+                                    link,
+                                    self.config.budgets.penalty_invalid,
+                                ),
+                            ));
+                        }
+                    }
+                }
+                if channel == Channel::Bulk {
+                    match SyncFrame::decode(payload) {
+                        Ok(Some(frame)) => {
+                            let verified = self
+                                .neighbors
+                                .get(link)
+                                .is_some_and(|neighbor| neighbor.node_id.is_some());
+                            if !verified {
+                                return Ok(Self::release_if_penalised(
+                                    link,
+                                    self.budgets.penalize(
+                                        now,
+                                        link,
+                                        self.config.budgets.penalty_unverified,
+                                    ),
+                                ));
+                            }
+                            let actions = self.sync.on_frame(now, link, frame);
+                            return Ok(self.apply_sync_actions(now, actions));
+                        }
+                        Ok(None) => {}
+                        Err(_) => {
+                            self.neighbors.reject(link);
+                            return Ok(Self::release_if_penalised(
+                                link,
+                                self.budgets.penalize(
+                                    now,
+                                    link,
+                                    self.config.budgets.penalty_invalid,
+                                ),
+                            ));
+                        }
+                    }
+                }
+                // A spray envelope is parsed header-first and never allocates
+                // its inner packet. It is only meaningful on a link that
+                // negotiated the capability, so a stray envelope is an
+                // attributable protocol error.
+                let (packet_bytes, incoming_copies) = match crate::spray::decode_frame(payload) {
+                    Ok(Some((copies, inner))) => {
+                        if !self.spray.supports(link) {
+                            self.neighbors.reject(link);
+                            return Ok(Self::release_if_penalised(
+                                link,
+                                self.budgets.penalize(
+                                    now,
+                                    link,
+                                    self.config.budgets.penalty_invalid,
+                                ),
+                            ));
+                        }
+                        (inner, Some(copies))
+                    }
+                    Ok(None) => (payload, None),
+                    Err(_) => {
+                        self.neighbors.reject(link);
+                        return Ok(Self::release_if_penalised(
+                            link,
+                            self.budgets
+                                .penalize(now, link, self.config.budgets.penalty_invalid),
+                        ));
+                    }
+                };
                 // Packet::decode parses the bounded header before inspecting or
                 // borrowing the payload, and allocates nothing on either path.
-                let packet = Packet::decode(payload);
+                let packet = Packet::decode(packet_bytes);
                 self.neighbors
                     .received(now, link, payload.len(), packet.is_ok());
                 let verified = self
@@ -304,6 +526,10 @@ impl<R: RngCore> MeshEngine<R> {
                 // Complete timers that expired while this packet was in
                 // flight before adding a new sighting for the same id.
                 let mut outputs = self.drain_due(now);
+                let wire = packet.encode();
+                let msg_id = packet.header.msg_id;
+                let destination = packet.header.dst.unwrap_or([0; 16]);
+                let lifetime_s = packet.header.lifetime_s;
                 match packet.header.class {
                     crate::PacketClass::Direct => {
                         match forward::on_data(identity.node_id(), &mut self.seen, now, packet) {
@@ -347,6 +573,13 @@ impl<R: RngCore> MeshEngine<R> {
                                         header,
                                         payload: plaintext,
                                     });
+                                    if self.config.spray.enabled {
+                                        outputs.push(MeshOutput::SyncItem {
+                                            id: msg_id,
+                                            wire: wire.clone(),
+                                            copies_left: incoming_copies.unwrap_or(1),
+                                        });
+                                    }
                                 }
                                 Err(_) => {
                                     self.neighbors.reject(link);
@@ -360,9 +593,46 @@ impl<R: RngCore> MeshEngine<R> {
                                 }
                             },
                             Action::Relay { bytes } if outcome == BudgetOutcome::Admitted => {
-                                let mut senders = BTreeSet::new();
-                                senders.insert(link);
-                                outputs.extend(self.send_to_links(bytes, &senders));
+                                if self.config.spray.enabled && incoming_copies.is_some() {
+                                    self.spray.observe(
+                                        now,
+                                        msg_id,
+                                        crate::PacketClass::Direct,
+                                        destination,
+                                        lifetime_s,
+                                        incoming_copies.unwrap_or(1),
+                                    );
+                                    let candidates: Vec<(LinkId, [u8; 16])> = self
+                                        .neighbors
+                                        .iter()
+                                        .filter_map(|neighbor| {
+                                            neighbor
+                                                .node_id
+                                                .map(|id| (neighbor.link, *id.as_bytes()))
+                                        })
+                                        .collect();
+                                    let plan = self.spray.plan(now, msg_id, Some(link), candidates);
+                                    for (next, give) in plan {
+                                        if let Some(payload) =
+                                            crate::spray::encode_frame(give, &bytes)
+                                        {
+                                            outputs.push(MeshOutput::Send {
+                                                link: next,
+                                                channel: Channel::Message,
+                                                payload,
+                                            });
+                                        }
+                                    }
+                                    outputs.push(MeshOutput::SyncItem {
+                                        id: msg_id,
+                                        wire: wire.clone(),
+                                        copies_left: self.spray.copies_left(msg_id),
+                                    });
+                                } else {
+                                    let mut senders = BTreeSet::new();
+                                    senders.insert(link);
+                                    outputs.extend(self.send_to_links(bytes, &senders));
+                                }
                             }
                             Action::Relay { .. } => {}
                         }
@@ -469,6 +739,51 @@ impl<R: RngCore> MeshEngine<R> {
                 let bytes = Packet::new(header, signature, payload)
                     .map_err(MeshError::Packet)?
                     .encode();
+                if header.class == crate::PacketClass::Direct && self.config.spray.enabled {
+                    self.spray.observe(
+                        now,
+                        header.msg_id,
+                        header.class,
+                        header.dst.unwrap_or([0; 16]),
+                        header.lifetime_s,
+                        self.config.spray.copies,
+                    );
+                    let candidates: Vec<(LinkId, [u8; 16])> = match via {
+                        Some(link) => self
+                            .neighbors
+                            .get(link)
+                            .and_then(|neighbor| neighbor.node_id)
+                            .map(|id| vec![(link, *id.as_bytes())])
+                            .unwrap_or_default(),
+                        None => self
+                            .neighbors
+                            .iter()
+                            .filter_map(|neighbor| {
+                                neighbor.node_id.map(|id| (neighbor.link, *id.as_bytes()))
+                            })
+                            .collect(),
+                    };
+                    let plan = self.spray.plan(now, header.msg_id, None, candidates);
+                    let mut outputs = Vec::new();
+                    for (link, give) in plan {
+                        let payload = if self.spray.supports(link) {
+                            match crate::spray::encode_frame(give, &bytes) {
+                                Some(payload) => payload,
+                                None => bytes.clone(),
+                            }
+                        } else {
+                            bytes.clone()
+                        };
+                        outputs.push(MeshOutput::Send {
+                            link,
+                            channel,
+                            payload,
+                        });
+                    }
+                    // The host submitted these bytes and already owns them;
+                    // only received copies need a store event.
+                    return Ok(outputs);
+                }
                 Ok(vec![match via {
                     Some(link) => MeshOutput::Send {
                         link,
@@ -489,10 +804,106 @@ impl<R: RngCore> MeshEngine<R> {
     /// cancel nothing but will be recognised as a duplicate.
     fn drain_due(&mut self, now: u64) -> Vec<MeshOutput> {
         let due = self.suppression.take_due(now);
+        self.spray.expire(now);
         let mut outputs = Vec::new();
         for entry in due {
             let _ = self.seen.check_and_insert(now, entry.class, entry.msg_id);
             outputs.extend(self.send_to_links(entry.bytes, &entry.senders));
+        }
+        outputs
+    }
+
+    /// Translates sync state changes into host actions and Bulk sends.
+    /// A frame that cannot fit the two-byte length field is simply not
+    /// emitted; every tracker-produced frame is already bounded by config.
+    fn apply_sync_actions(&mut self, now: u64, actions: Vec<SyncAction>) -> Vec<MeshOutput> {
+        let mut outputs = Vec::new();
+        for action in actions {
+            match action {
+                SyncAction::Send { link, frame } => {
+                    if let Some(payload) = frame.encode() {
+                        outputs.push(MeshOutput::Send {
+                            link,
+                            channel: Channel::Bulk,
+                            payload,
+                        });
+                    }
+                }
+                SyncAction::SendV2 { link, frame } => {
+                    if let Some(payload) = frame.encode() {
+                        outputs.push(MeshOutput::Send {
+                            link,
+                            channel: Channel::Bulk,
+                            payload,
+                        });
+                    }
+                }
+                SyncAction::Need { link, prefixes } => {
+                    let peer = self
+                        .neighbors
+                        .get(link)
+                        .and_then(|neighbor| neighbor.node_id)
+                        .map(|id| *id.as_bytes())
+                        .unwrap_or([0; 16]);
+                    let prefixes: Vec<_> = prefixes
+                        .into_iter()
+                        .filter(|prefix| {
+                            self.sync
+                                .local_id_for_prefix(*prefix)
+                                .is_none_or(|id| self.spray.can_sync(id, peer))
+                        })
+                        .collect();
+                    if !prefixes.is_empty() {
+                        outputs.push(MeshOutput::SyncNeed { link, prefixes });
+                    }
+                }
+                SyncAction::Item {
+                    link,
+                    id,
+                    wire,
+                    copies_left,
+                } => {
+                    if self.config.spray.enabled && copies_left > 1 {
+                        if let Ok(header) = crate::Header::decode(&wire) {
+                            if header.class == crate::PacketClass::Direct {
+                                self.spray.observe(
+                                    now,
+                                    id,
+                                    header.class,
+                                    header.dst.unwrap_or([0; 16]),
+                                    header.lifetime_s,
+                                    copies_left,
+                                );
+                                let candidates: Vec<(LinkId, [u8; 16])> = self
+                                    .neighbors
+                                    .iter()
+                                    .filter_map(|neighbor| {
+                                        neighbor.node_id.map(|id| (neighbor.link, *id.as_bytes()))
+                                    })
+                                    .collect();
+                                for (next, give) in self.spray.plan(now, id, Some(link), candidates)
+                                {
+                                    if let Some(payload) = crate::spray::encode_frame(give, &wire) {
+                                        outputs.push(MeshOutput::Send {
+                                            link: next,
+                                            channel: Channel::Message,
+                                            payload,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    outputs.push(MeshOutput::SyncItem {
+                        id,
+                        wire,
+                        copies_left,
+                    });
+                }
+                SyncAction::Release { link } => {
+                    outputs.push(MeshOutput::ReleaseOpportunistic { link })
+                }
+            }
         }
         outputs
     }

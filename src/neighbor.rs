@@ -6,7 +6,9 @@ use ao_network::{Hello, LinkId};
 use std::collections::BTreeMap;
 
 use crate::budget::BudgetConfig;
+use crate::spray::SprayConfig;
 use crate::suppress::SuppressionConfig;
+use crate::sync::{SummaryConfig, SyncConfig};
 
 /// Limits for engine-owned state. These do not enforce radio topology policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +23,12 @@ pub struct MeshConfig {
     pub budgets: BudgetConfig,
     /// Counter-based suppression, assessment timers and class TTLs (MSH-11).
     pub suppression: SuppressionConfig,
+    /// Store-summary debounce and discovery hint (MSH-13).
+    pub summary: SummaryConfig,
+    /// Anti-entropy contact bounds and timeout (MSH-14).
+    pub sync: SyncConfig,
+    /// Binary spray-and-wait policy for Direct traffic (MSH-16).
+    pub spray: SprayConfig,
 }
 
 impl Default for MeshConfig {
@@ -33,8 +41,9 @@ impl Default for MeshConfig {
     /// ids, is aoIdents' entry cap (about 1.5 MiB only if every slot
     /// holds one, which per-link rate limiting and the 24 h expiry
     /// keep far out of reach in normal use). The budget defaults are
-    /// ADR-0001's class rates (MSH-10) and suppression defaults are its
-    /// per-class TTLs plus the measured 50-node sweep (MSH-11).
+    /// ADR-0001's class rates (MSH-10), suppression defaults are its
+    /// per-class TTLs plus the measured 50-node sweep (MSH-11), and the
+    /// store beacon waits 200 ms after a change (MSH-13).
     fn default() -> Self {
         Self {
             max_neighbors: 32,
@@ -42,6 +51,9 @@ impl Default for MeshConfig {
                 .expect("the documented defaults are within aoIdents' bounds"),
             budgets: BudgetConfig::default(),
             suppression: SuppressionConfig::default(),
+            summary: SummaryConfig::default(),
+            sync: SyncConfig::default(),
+            spray: SprayConfig::default(),
         }
     }
 }

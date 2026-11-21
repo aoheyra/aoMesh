@@ -7,6 +7,40 @@ change without notice until v0.1.0, and consumers pin by git tag
 
 ## Unreleased
 
+MSH-16 adds binary spray-and-wait for Direct traffic. Packets keep their signed
+header; a six-byte capability-negotiated envelope carries a remaining-copy
+ticket on the Message channel. Peers without `CAP_SPRAY_V1` receive the raw
+packet. Each message starts with 255 tickets, hands half to a non-destination
+contact, gives one to the destination and otherwise waits with its last copy;
+tickets also travel through MSH-14/15 sync and are bounded by a 4096-id tracker.
+The paired `spray_report` uses the fixed MSH-27 seeds: scripted-200 delivers
+99/100 with 1,786 transmissions against relay-only 100/100 with 3,455, and
+line-20 keeps 20/20 with 186 transmissions against 193. The published
+MSH-27 baselines remain relay-only and unchanged.
+
+MSH-15 adds range-based reconciliation for links that advertise both sync
+capability bits. Each side hashes binary ranges of the canonical id space,
+splits only differing ranges and exchanges full ids in small leaves. The
+existing `SyncNeed` / `SyncItems` transfer then moves the actual packets, so
+the host still owns the store and peers with only `CAP_SYNC_V1` keep the
+MSH-14 summary path. Version-2 sync frames use the same magic and five-byte
+header with tags for Root, Ranges, Request, Ids and Ready; after both sides
+send Ready the contact uses the existing `Item` and `Done` frames. The
+`sync_v2_report` example measures 2,018 bytes for v2 against 16,188 bytes for
+v1 on stores of 1000 and 1001 messages with seed `0x515f_2026`.
+
+MSH-14 adds bounded anti-entropy sync for links that advertise `CAP_SYNC_V1`.
+The engine compares store digests, exchanges eight-byte id prefixes and asks
+the host for the encoded packets it owes through `SyncNeed`/`SyncItems`.
+Incoming `SyncItem` packets are bounds- and content-address-checked before the
+host inserts them; final authenticity stays with the store owner. A two-phase
+`Done` handshake releases the opportunistic link only after both directions
+have finished, and a 20-second deadline releases a stalled contact. The sync
+frames use magic `0x53`, version `1` and a five-byte header on aoNetwork's Bulk
+channel; peers without the capability bit keep the MSH-13 beacon path. A
+SimWorld acceptance case with seed `0x5147_2026` converges two stores on the
+same four ids after a 20-second meeting and observes the link release.
+
 The MSH-27 baseline fixture was regenerated against aoNetwork `492e148c`
 (Net 25 flow control). The refreshed sibling changed simulated link formation:
 waypoint and community delivery improved, waypoint overhead fell, community
@@ -47,6 +81,14 @@ budget denial cannot start a timer or blame its carrier. On the seeded 50-node
 mixed case transmissions fall from 5801 to 3316 (42.84%) with the Direct
 delivery ratio unchanged at 0.2000; the Broadcast-reception diagnostic and
 seeds are in the README and ADR-0001.
+
+MSH-13 adds a canonical store summary and a debounced four-byte beacon digest.
+`StoreSummary` ignores input order and duplicates, exposes eight-byte id
+prefixes and hashes every full id. `MeshInput::StoreSummary` lets the host
+supply live store ids without giving the engine a store; `MeshConfig` gains a
+`summary: SummaryConfig` field and the engine emits `SetBeacon` after a 200 ms
+change debounce. Tests show equal digests for identical stores and a different
+digest after one message changes. No wire format changes.
 
 MSH-27 adds a deterministic SimWorld harness behind feature `sim`. It drives
 signed hellos, link events and the engine through the adapter across a 20-node

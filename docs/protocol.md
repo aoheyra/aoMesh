@@ -246,6 +246,112 @@ signing. `SuppressionConfig::enabled` is a simulator ablation switch only.
 The pending table never holds payload bytes borrowed from a neighbour: the
 relay bytes are encoded once when the first copy arrives.
 
+## Store summary and beacon digest (MSH-13)
+
+Before anti-entropy starts, a node compares a four-byte summary digest with
+neighbours. `StoreSummary` sorts and deduplicates the live `MessageId`s, exposes
+eight-byte prefixes as the compact vector MSH-14 will exchange, and hashes the
+full ids plus the count into the beacon digest. Identical live sets give equal
+digests; one differing id changes it with overwhelming probability. The digest
+is a change detector, not a proof of equality, so MSH-14 still compares full
+summaries before transferring packets.
+
+The engine does not own or open the store. The host submits
+`MeshInput::StoreSummary` with ids from `MessageStore::summary(now)`. A changed
+digest waits `SummaryConfig::debounce_ms` (200 ms by default) before one
+`SetBeacon` output is emitted; a change back to the published value cancels the
+pending beacon, and a backwards clock cannot shorten the wait. The hint bytes
+are opaque to the mesh, and the four-byte digest uses the beacon field already
+defined by aoNetwork, so no packet or hello layout changes.
+
+## Anti-entropy sync v1 (MSH-14)
+
+MSH-14 adds engine-to-engine control frames on aoNetwork's `Channel::Bulk`.
+They are not mesh packets: they carry no origin signature. The items inside
+them are complete encoded mesh packets, checked by the receiving engine for
+bounded decode, a matching content address and a storable class before they
+are handed to the host store. The store owner remains responsible for final
+signature verification and insertion policy.
+
+A `MeshHello` advertises `CAP_SYNC_V1` in its capability bits. The bit uses an
+existing hello field, so the wire layout is unchanged. If the negotiated caps
+do not include it, the engine sends no sync frames and both nodes continue to
+use the MSH-13 beacon digest only. A peer speaking a different sync version is
+rejected by the frame decoder and leaves the session to its deadline.
+
+Every frame starts with a five-byte header:
+
+| Offset | Length | Meaning |
+|---|---|---|
+| 0 | 1 | Magic `0x53` |
+| 1 | 1 | Sync version (`1`) |
+| 2 | 1 | Tag: `1` Digest, `2` Summary, `3` Item, `4` Done |
+| 3..5 | 2 | Body length, big endian |
+
+`Digest` carries the four-byte summary digest. `Summary` carries that digest,
+a two-byte entry count and that many sorted eight-byte id prefixes; a count
+above 1024 is rejected before any allocation. `Item` carries one complete
+encoded mesh packet, bounded by the 15 KiB per-frame limit and the 256 KiB
+per-contact budget. `Done` has an empty body.
+
+The exchange is symmetric. Each side compares the peer's summary with its
+cached local summary, computes the prefixes the peer lacks, and asks its host
+for those packets with `MeshOutput::SyncNeed`. The host answers with
+`MeshInput::SyncItems`. Equal digests end the exchange without a release,
+because the link may still carry ordinary traffic. A node sends `Done` only
+after it has sent everything it owes and received everything it expected; it
+emits `MeshOutput::ReleaseOpportunistic` only after the peer's `Done`. The
+adapter maps that output to aoNetwork's `Network::release`, which closes
+opportunistic links and leaves stable links alone. A 20-second deadline
+releases a stalled contact once, and a link drop removes the session so a
+later meeting starts from a fresh digest.
+
+## Range-based reconciliation (MSH-15)
+
+`MeshHello` sets `CAP_SYNC_V2` in addition to `CAP_SYNC_V1`. The engine prefers
+v2 when both peers advertise it; a peer with only bit 0 gets the MSH-14 summary
+exchange, and a peer with neither gets no sync frames. The hello layout does
+not change. Version-2 frames reuse magic `0x53` and the five-byte header, with
+version `2` and tags `1` Root, `2` Ranges, `3` Request, `4` Ids and `5` Ready.
+
+A range key is a 16-byte prefix plus one bit-count from 0 to 128; trailing bits
+are zero so every range has one encoding. A `RangeSummary` adds a four-byte
+count and a 16-byte BLAKE3 digest of the sorted full ids in that range. Both
+sides send Root on link-up. When summaries differ and the range holds more
+than 32 ids, each side sends Request for its two children and answers peer
+Requests with Ranges. At 32 ids or fewer, each side sends every full id in the
+leaf through Ids. Counts, entry lists and frame bytes are bounded by config and
+the decoder rejects non-canonical keys and ids outside their range.
+
+After both sides have exchanged every leaf, each sends Ready. The first peer
+to see both Ready flags inserts an ordinary MSH-14 session with the missing
+prefixes in each direction, emits `SyncNeed` if it owes any packets, and from
+then on uses the version-1 `Item` and `Done` frames. The existing 256 KiB
+per-contact budget, 20-second deadline and two-phase release therefore still
+apply. A stalled v2 contact is released once; a link drop removes the session
+so the next meeting starts from a fresh digest.
+
+## Binary spray-and-wait (MSH-16)
+
+`MeshHello` adds `CAP_SPRAY_V1` (`1 << 2`). The packet header and signature
+layout do not change: a copy ticket travels in a six-byte envelope before the
+ordinary encoded packet, on the same Message channel. The bytes are magic
+`0x54`, version `1`, tag `1` for Direct, one byte of remaining copies (1 to 255)
+and a little-endian two-byte inner length. The decoder checks the fixed header
+before reading the inner packet, rejects bad versions, tags, tickets, lengths
+and trailing bytes, and never allocates before those checks pass. A link that
+did not negotiate the capability receives the raw packet from its peer and
+rejects an unexpected envelope as attributable invalid traffic.
+
+A local Direct submission or a received spray copy creates a bounded tracker
+entry containing the destination, expiry and remaining tickets. For each
+non-destination contact the engine hands over `floor(copies_left / 2)` and keeps
+the rest; a destination contact receives one ticket and ends the spray. At one
+ticket the node waits and only hands that copy to the destination. Sync frames
+carry the same count in `SprayItem`, so a stored copy received through
+MSH-14/15 can continue spraying on a later contact. The host persists the count
+as `StoreMetadata::copies_left`; the engine keeps at most 4096 live tickets.
+
 ## Simulation evidence (MSH-27)
 
 No wire format changes. Feature `sim` drives the codec and engine over aoNetwork's

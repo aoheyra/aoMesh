@@ -10,14 +10,14 @@ Units: TTL = hop limit; Copies = copies in the network; Lifetime = how long a co
 
 | Class | Mechanism | TTL | Copies | Lifetime | Relay budget | Priority |
 |---|---|---|---|---|---|---|
-| Direct | spray-and-wait with reverse-path hints | 8 | 6 | 24 h | 1 MiB/h | 1 |
+| Direct | spray-and-wait with reverse-path hints | 8 | 255 | 24 h | 1 MiB/h | 1 |
 | Broadcast and channels | counter-based suppression | 6 | 1 per node (forward once) | 6 h | 256 KiB/h | 2 |
 | Presence | trickle-timed gossip | 3 | 1 per node | 30 min | 64 KiB/h | 3 |
 | Telemetry (location) | announce, latest-wins, no storage | 3 | 1 per node | 5 min | 32 KiB/h | 4 |
 
 ## Reasons
 
-**Direct — TTL 8, 6 copies, 24 h, 1 MiB/h.** Room and building diameters stay well under 8 hops at a degree cap of 8; six copies survive two relay failures without approaching flood cost (sweep 2–10 in MSH-27); 24 h covers an overnight-offline recipient inside a bounded store; the budget lets a relay carry roughly 500 messages of 2 KiB per hour for neighbours before shedding, so one busy conversation cannot evict everything else.
+**Direct — TTL 8, 255 copies, 24 h, 1 MiB/h.** Room and building diameters stay well under 8 hops at a degree cap of 8; binary splitting halves the ticket, so 255 is the smallest bounded value that still leaves a copy after eight splits and approaches flooding delivery in the scripted-200 sweep (8 copies delivered 0.09, 64 delivered 0.28, 255 delivered 0.45 in the older community case, and 255 delivers 0.99 in the paired scripted-200 case at 48 percent fewer transmissions); 24 h covers an overnight-offline recipient inside a bounded store; the budget lets a relay carry roughly 500 messages of 2 KiB per hour for neighbours before shedding, so one busy conversation cannot evict everything else.
 
 **Broadcast and channels — TTL 6, forward once, 6 h, 256 KiB/h.** Each node forwards at most once and the counter suppresses re-floods, so the copy count is bounded by topology rather than by the sender; six hours outlives a suppressed flood (the origin re-announces newer content anyway); the budget is a quarter of Direct's because every duplicate is re-relayed by many nodes.
 
@@ -131,3 +131,139 @@ Direct delivery ratio stays at 0.2000. Unique Broadcast receptions fall from
 so that diagnostic is reported alongside the acceptance numbers rather than
 hidden. The four published MSH-27 baselines are unchanged because they carry no
 flooded classes.
+
+## MSH-13 implementation
+
+The store owner supplies live message ids to `MeshInput::StoreSummary`; the
+engine never persists packets or interprets payloads. `StoreSummary` sorts and
+deduplicates ids, exposes eight-byte prefixes for MSH-14's summary exchange,
+and hashes the full ids plus the entry count with a domain separator into the
+four-byte beacon digest. Canonical ordering makes the digest independent of
+backend iteration order, and full-id hashing prevents a prefix collision from
+hiding a change.
+
+Three summary representations were considered. Full 16-byte ids are exact but
+make every contact exchange large. A Bloom filter is compact but reports false
+positives, which would make MSH-14 request unnecessary transfers. Sorted
+eight-byte prefixes are deterministic, small enough for the bounded 1024-entry
+store, and safe because MSH-14 confirms with full ids before transferring. The
+digest itself is only a change detector; a four-byte collision cannot be ruled
+out, so a matching digest ends the exchange and a differing one starts full
+comparison.
+
+The beacon waits 200 ms after a change is first observed. Zero delay publishes
+every store write and wastes airtime on batches; one second delays a link-up
+comparison enough to be noticeable. A change back to the published digest
+cancels the pending beacon, so transient churn does not flap the advertisement.
+A backwards clock is treated as time zero inside the debounce window and never
+mints an early publication. No wire field changes: aoNetwork's beacon already
+carries the opaque four-byte digest.
+
+## MSH-14 implementation
+
+A meeting link whose MeshHello negotiates `CAP_SYNC_V1` starts a bounded
+anti-entropy exchange over aoNetwork's Bulk channel. The engine compares the
+peer's four-byte digest with its cached `StoreSummary`, exchanges sorted
+eight-byte prefixes, and asks the host to resolve missing prefixes through
+`MeshOutput::SyncNeed` / `MeshInput::SyncItems`. Incoming `SyncItem` packets are
+checked for bounded decode, a content address that matches the claimed id, and
+a storable class; the store owner still verifies signatures and decides
+insertion. Telemetry is never synced.
+
+Three transfer designs were compared. An engine-owned store would unify the
+API but duplicate aoheyra's SQLite backend and break the sans-IO boundary
+MSH-12 established. A pure push of the whole store is simple but wastes
+airtime when digests differ by one item. A summary-driven request/offer
+exchange keeps the engine store-free and transfers only the symmetric
+difference; its extra round trip is acceptable because a contact is already
+open and the exchange is bounded. The host therefore supplies encoded items
+through `SyncItems` and inserts received items itself.
+
+The frame format was chosen over full-id vectors and Bloom filters for the
+same reasons as MSH-13: full ids are exact but too large, Bloom filters create
+false requests, and prefixes are deterministic and bounded. A five-byte header
+(magic `0x53`, version `1`, tag, two-byte length) keeps the decoder small. The
+wire limit is 15 KiB per frame so the default 16 KiB Bulk frame still fits, and
+256 KiB per contact bounds the work a hostile or merely large peer can demand.
+A summary with more than 1024 entries is rejected before allocation.
+
+Release uses a two-phase `Done` handshake. An early design released as soon as
+the local side had sent its items and received the ones it expected, but the
+simulator showed the peer still had queued frames when aoNetwork closed the
+link: two of three items were lost. Requiring `Done` from both sides before
+`ReleaseOpportunistic` fixed the loss without adding retries or delays. An
+equal digest ends the exchange with no release: a simulator run that released
+those links cut waypoint delivery from 31/50 to 27/50 by closing links that
+were still useful for ordinary forwarding. The 20-second deadline is a
+fallback for a stalled peer; it releases once, and a
+link drop clears the session so the next encounter restarts from a fresh
+digest. Peers without the capability bit stay on the MSH-13 beacon path, so
+this is an additive wire change: no packet or hello layout moved.
+
+Acceptance uses aoNetwork `SimWorld` seed `0x5147_2026` with four stable filler
+links before the target node appears. Over a 20-second meeting the two stores
+converge on the same four live ids (3 seeded locally, 1 from the peer) and the
+opportunistic contact is closed. `tests/sync_v1.rs` covers frame bounds, the
+per-contact byte budget, link-drop recovery and the release handshake.
+
+## MSH-15 implementation
+
+MSH-15 replaces the MSH-14 summary vector with Negentropy-style binary range
+reconciliation when both peers set `CAP_SYNC_V2`. A range is a leading prefix
+of the canonical 128-bit id space. Each side hashes its sorted ids in a range
+and sends only summaries for ranges the peer requests; differing ranges split
+until they hold at most 32 ids, at which point the full ids are exchanged.
+The engine then computes the missing prefixes and reuses MSH-14's
+`SyncNeed` / `SyncItems` transfer, byte budget, deadline and two-phase release.
+Caching canonical full ids in `StoreSummary` costs 16 KiB at the 1024-entry
+store bound; no dependency is needed because BLAKE3 is already a dependency.
+
+Two alternatives were considered. An IBLT gives a fixed one- or two-round
+exchange but needs careful table sizing, has probabilistic failure modes and
+would add a new decoder and dependency. A fixed 64-bucket vector is simpler
+but its descriptor cost is constant while the ids sent per differing bucket
+still grow with store size. Adaptive binary ranges have neither problem: only
+differing branches cost bytes, so a 1000-id store with one missing message
+exchanges a handful of summaries rather than 8000 bytes of prefixes. The
+deterministic split also avoids false requests and is easy to test.
+
+A canonicalisation bug found by the large-store harness zeroed the byte that
+held a range's meaningful bit, collapsing both children into one and leaving
+the contact stuck. `range_children_survive_encoding_as_distinct_ranges` now
+reproduces that seed-independent failure. The `sync_v2_report` example with
+seed `0x515f_2026` and stores of 1000 and 1001 messages measures 2,018 bytes
+for v2 against 16,188 bytes for v1, an 87.5% reduction, with both stores
+converging. The published MSH-27 baselines are unchanged because empty stores
+have equal digests and open no sync contact.
+
+## MSH-16 implementation
+
+MSH-16 carries a copy ticket beside the packet instead of in the header. Three
+designs were compared: extending the signed header would change signature
+coverage and break every peer; a side-channel key would need a new frame type
+and a separate store seam; an additive envelope before the packet on the same
+Message channel leaves the header, signature and store key unchanged. The
+envelope is six bytes with magic `0x54`, version `1`, Direct tag `1`, a one-byte
+ticket and a bounded two-byte inner length. `CAP_SPRAY_V1` is negotiated in
+MeshHello; a peer without it receives the raw packet. A stray envelope on a link
+without the capability is attributable invalid traffic.
+
+The split is binary: a non-destination contact gets `floor(copies_left / 2)`,
+the destination gets one copy, and a node at one ticket waits for the
+destination. Fixed fan-out was rejected because it cannot adapt to the number
+of contacts and would either over-send in dense meetings or starve sparse ones.
+Header-based tickets were rejected because hop-mutable fields must stay outside
+the signature and the header is already at its fixed layout. The tracker holds
+at most 4096 live ids, and tickets survive store/sync through
+`StoreMetadata::copies_left` and `SyncFrame::SprayItem`, so a stored copy can
+continue spraying after a later encounter.
+
+Seeds and paired scenarios are fixed in `spray_scenarios()`. With seed
+`1297303752` on scripted-200, flooding delivers 100/100 with 3,455
+transmissions (34.5500 per delivery); spraying with 255 initial tickets
+delivers 99/100 with 1,786 transmissions (18.0404 per delivery), a 48 percent
+transmission reduction. With seed `1297303584` on line-20, both deliver 20/20
+while spraying uses 186 transmissions against 193. Earlier sweeps with 8 and
+64 tickets delivered far below flooding, so the default moved from the ADR's
+original six-copy estimate to 255; the published MSH-27 rows remain the
+relay-only reference.

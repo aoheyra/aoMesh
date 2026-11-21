@@ -6,7 +6,8 @@
 mod common;
 use ao_idents::Identity;
 use ao_mesh::{
-    AdapterEvent, MeshEngine, MeshHello, MeshInput, MeshOutput, NetworkAdapter, PacketClass,
+    AdapterEvent, MeshConfig, MeshEngine, MeshHello, MeshInput, MeshOutput, NetworkAdapter,
+    PacketClass, SprayConfig,
 };
 use ao_network::{
     AppHello, BeaconFlags, LocalTag, Network, NetworkConfig, SimConfig, SimNode, SimTransport,
@@ -31,7 +32,16 @@ fn node(world: &SimWorld, index: usize) -> Adapter {
     let own = identity(index);
     let radio = world.add_node(SimNode::default()).unwrap();
     let network = Network::new(NetworkConfig::default(), radio);
-    let engine = MeshEngine::new(StdRng::seed_from_u64(SEED));
+    let engine = MeshEngine::with_config(
+        StdRng::seed_from_u64(SEED),
+        MeshConfig {
+            spray: SprayConfig {
+                enabled: false,
+                ..SprayConfig::default()
+            },
+            ..MeshConfig::default()
+        },
+    );
     let mut adapter = NetworkAdapter::new(engine, network);
     let signed = MeshHello::sign(&own, [0; 8], [0; 4]).unwrap();
     let applied = adapter.apply(
@@ -185,6 +195,9 @@ fn assert_delivered_once(events: &[(usize, AdapterEvent)], dst: usize) {
             }
             AdapterEvent::SendFailed { link, error } => {
                 panic!("send failed on {link:?}: {error:?}")
+            }
+            AdapterEvent::SyncNeed { .. } | AdapterEvent::SyncItem { .. } => {
+                panic!("unexpected sync event in a forwarding test: {event:?}")
             }
         }
     }
