@@ -991,3 +991,10 @@ covers the forwarding seen-cache, receipt immunity and spray tickets;
 stored packets, RNG state, config and radio sessions remain with the host.
 See the engine `Snapshot` trait and the paired restart report described in
 the seen-cache section above.
+
+For a process/device restart with a new monotonic epoch, prefer `TimedSnapshot`:
+call `snapshot_at(now, owner)` and restore a fresh engine using
+`restore_at(new_now, owner, elapsed_ms, &bytes)`. This identity-bound format stores
+remaining lifetimes and discards old transport LinkIds. Legacy `Snapshot` bytes
+require the original clock epoch and link namespace. See
+[the clock-safe restart contract](docs/adr/clock-safe-restart.md).
