@@ -11,7 +11,7 @@
 //! [`crate::packet`] rejects non-canonical input, so a decoded header
 //! re-encodes to the exact bytes that were received.
 
-use ao_idents::{IdentError, Identity, PublicIdentity, Signature};
+use ao_idents::{IdentError, Identity, PublicIdentity, Signature, verify_signing_pk};
 
 use crate::packet::{Header, MAX_IMMUTABLE_LEN, MSG_ID_LEN, MSG_ID_OFFSET, MessageId, PacketClass};
 
@@ -146,6 +146,35 @@ pub fn verify_origin(
     payload: &[u8],
     signature: &Signature,
 ) -> Result<(), VerifyError> {
+    check_msg_id(header, payload)?;
+    let mut prefix = [0u8; MAX_IMMUTABLE_LEN];
+    let n = header.encode_immutable_into(&mut prefix);
+    origin_pk
+        .verify(SIGN_DOMAIN, &prefix[..n], signature)
+        .map_err(|_| VerifyError::BadSignature)
+}
+
+/// Verifies a packet when only the origin's signing key is available.
+///
+/// MSH-07's signed `MeshHello` carries that key, so a recipient can
+/// authenticate a signed Broadcast such as an MSH-23 public-channel message
+/// without the agreement key or an identity-card lookup. The derivation and
+/// domain are byte-for-byte the ones [`verify_origin`] uses; only the key
+/// representation differs. This is not a new signature scheme.
+pub fn verify_origin_with_signing_pk(
+    signing_pk: &[u8; 32],
+    header: &Header,
+    payload: &[u8],
+    signature: &Signature,
+) -> Result<(), VerifyError> {
+    check_msg_id(header, payload)?;
+    let mut prefix = [0u8; MAX_IMMUTABLE_LEN];
+    let n = header.encode_immutable_into(&mut prefix);
+    verify_signing_pk(signing_pk, SIGN_DOMAIN, &prefix[..n], signature)
+        .map_err(|_| VerifyError::BadSignature)
+}
+
+fn check_msg_id(header: &Header, payload: &[u8]) -> Result<(), VerifyError> {
     let expected = derive_msg_id(header, payload);
     if header.msg_id != expected {
         return Err(VerifyError::MsgIdMismatch {
@@ -153,11 +182,7 @@ pub fn verify_origin(
             found: header.msg_id,
         });
     }
-    let mut prefix = [0u8; MAX_IMMUTABLE_LEN];
-    let n = header.encode_immutable_into(&mut prefix);
-    origin_pk
-        .verify(SIGN_DOMAIN, &prefix[..n], signature)
-        .map_err(|_| VerifyError::BadSignature)
+    Ok(())
 }
 
 /// What a relay does with a packet's signature check.
@@ -259,6 +284,30 @@ mod tests {
             &packet.signature,
         )
         .expect("honest packet verifies");
+    }
+
+    #[test]
+    fn signing_key_only_verification_uses_the_same_domain() {
+        let id = identity(11);
+        let bytes = signed_bytes(&id, PacketClass::Broadcast, b"channel");
+        let packet = Packet::decode(&bytes).expect("decodes");
+        verify_origin_with_signing_pk(
+            id.public().signing_pk(),
+            &packet.header,
+            packet.payload,
+            &packet.signature,
+        )
+        .expect("hello-carried key verifies");
+        let other = identity(12);
+        assert_eq!(
+            verify_origin_with_signing_pk(
+                other.public().signing_pk(),
+                &packet.header,
+                packet.payload,
+                &packet.signature,
+            ),
+            Err(VerifyError::BadSignature)
+        );
     }
 
     #[test]

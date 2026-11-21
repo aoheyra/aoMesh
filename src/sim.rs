@@ -25,11 +25,11 @@ use crate::directory::{DirectoryConfig, NodeObservation};
 use crate::presence::{ANNOUNCE_LEN, ANNOUNCE_MAGIC};
 use crate::store::{MemoryStore, MessageStore, StoreLimits, StoreMetadata, StoredMessage};
 use crate::{
-    CAP_PRESENCE_V1, CAP_RECEIPT_V1, CAP_SYNC_V1, CAPS, DirectoryChange, Header, MeshConfig,
-    MeshEngine, MeshHello, MeshInput, MeshOutput, MessageId, NetworkAdapter, Packet, PacketClass,
-    PresenceConfig, RouteHintMode, SHORT_ID_BYTES, SYNC_MAGIC, SYNC_V2_VERSION, StoreSummary,
-    SuppressionConfig, SyncOffer, TelemetryConfig, TelemetryFrame, TelemetryKind, derive_msg_id,
-    sign_packet,
+    CAP_PRESENCE_V1, CAP_RECEIPT_V1, CAP_SYNC_V1, CAPS, CHANNEL_MAGIC, ChannelEnvelope,
+    DirectoryChange, Header, MeshConfig, MeshEngine, MeshHello, MeshInput, MeshOutput, MessageId,
+    NetworkAdapter, Packet, PacketClass, PresenceConfig, RouteHintMode, SHORT_ID_BYTES, SYNC_MAGIC,
+    SYNC_V2_VERSION, StoreSummary, SuppressionConfig, SyncOffer, TelemetryConfig, TelemetryFrame,
+    TelemetryKind, derive_channel_id, derive_msg_id, sign_packet,
 };
 use ao_idents::{Identity, NodeId, SealedMessage};
 use ao_network::{
@@ -165,6 +165,20 @@ pub enum Traffic {
         /// The burst is what makes a send queue the bottleneck: NET-21's
         /// coalescing key must leave one pending update for the stream.
         burst: bool,
+    },
+    /// Submit signed public-channel Broadcasts (MSH-23).
+    ///
+    /// Only the listed nodes subscribe locally; every other node is a relay
+    /// with no channel state. The message must reach every subscriber in
+    /// direct radio range of `origin`, while all channel traffic stays inside
+    /// the Broadcast relay budget.
+    Channel {
+        /// Node index of the channel's origin.
+        origin: usize,
+        /// Channel name, hashed locally by subscribers and the origin.
+        name: &'static str,
+        /// Nodes with a local subscription.
+        subscribers: &'static [usize],
     },
 }
 
@@ -401,6 +415,27 @@ pub struct Metrics {
     ///
     /// Not part of the CSV report; the MSH-21 acceptance measure.
     pub fresh_hint_mean_latency_ms: u64,
+    /// Nodes with a local channel subscription (MSH-23).
+    ///
+    /// Not part of the published MSH-27 CSV; `channel_csv_row` reports it.
+    pub channel_subscribers: usize,
+    /// Signed channel envelopes accepted by local subscribers (MSH-23).
+    ///
+    /// Not part of the published MSH-27 CSV; `channel_csv_row` reports it.
+    pub channel_deliveries: u64,
+    /// Unique channel messages accepted at each local subscriber.
+    ///
+    /// Not part of the published MSH-27 CSV.
+    pub channel_delivered_ids: Vec<BTreeSet<MessageId>>,
+    /// Mesh sends whose payload was a channel envelope.
+    ///
+    /// Not part of the published MSH-27 CSV; this is the numerator of the
+    /// Broadcast-budget gate.
+    pub channel_transmissions: u64,
+    /// Radio bytes in channel-envelope sends.
+    ///
+    /// Not part of the published MSH-27 CSV.
+    pub channel_bytes: u64,
 }
 
 impl Metrics {
@@ -460,6 +495,36 @@ impl Metrics {
             self.telemetry_max_seq,
             self.transmissions,
             self.radio_bytes,
+        )
+    }
+
+    /// MSH-23 columns, outside the published MSH-27 radio schema.
+    ///
+    /// `broadcast_burst_bytes` is the full MSH-10 Broadcast allowance for
+    /// `burst_seconds`. `within_broadcast_budget` is true when every channel
+    /// transmission this run could fit in that one bucket, which is the
+    /// channel issue's "without exceeding the Broadcast budget" gate.
+    pub fn channel_csv_header() -> &'static str {
+        "scenario,seed,nodes,submitted,subscribers,channel_deliveries,channel_transmissions,channel_bytes,broadcast_burst_bytes,within_broadcast_budget"
+    }
+
+    /// One MSH-23 CSV line.
+    pub fn channel_csv_row(&self) -> String {
+        let burst = crate::BudgetConfig::default().rates
+            [crate::PacketClass::Broadcast as usize - 1]
+            .burst_bytes();
+        format!(
+            "{},{},{},{},{},{},{},{},{},{}",
+            self.scenario,
+            self.seed,
+            self.nodes,
+            self.submitted,
+            self.channel_subscribers,
+            self.channel_deliveries,
+            self.channel_transmissions,
+            self.channel_bytes,
+            burst,
+            self.channel_bytes <= burst,
         )
     }
 }
@@ -621,6 +686,42 @@ pub fn suppression_scenarios() -> Vec<Scenario> {
         traffic: Traffic::MixedBroadcast {
             origin: 0,
             direct_every: 10,
+        },
+        enforce_budgets: true,
+        enforce_suppression: true,
+        spray: false,
+        receipts: false,
+        route_hint: RouteHintMode::Off,
+        suppression: SuppressionConfig::default(),
+        presence: false,
+        presence_config: PresenceConfig::default(),
+        directory: None,
+        telemetry: TelemetryConfig::default(),
+    }]
+}
+
+/// MSH-23's fixed public-channel case.
+///
+/// A line gives an exact, topology-independent expectation: nodes 9 and 11
+/// are the only subscribers in node 10's radio range. Only those two nodes
+/// receive a `ChannelSubscribe`; every other node stays a subscription-free
+/// relay. One signed envelope is enough to check reachability and the
+/// Broadcast-budget ceiling without a long run.
+pub fn channel_scenarios() -> Vec<Scenario> {
+    vec![Scenario {
+        name: "channel-line-20",
+        seed: 1_297_304_023,
+        nodes: 20,
+        topology: Topology::Line,
+        mobility: Mobility::Static,
+        settle: Duration::from_secs(30),
+        run: Duration::from_secs(30),
+        messages: 1,
+        payload_len: 128,
+        traffic: Traffic::Channel {
+            origin: 10,
+            name: "town-square",
+            subscribers: &[9, 11],
         },
         enforce_budgets: true,
         enforce_suppression: true,
@@ -1097,6 +1198,11 @@ pub struct Simulation {
     fresh_hint_submissions: u64,
     fresh_hint_deliveries: u64,
     fresh_latencies: Vec<u64>,
+    channel_delivered_ids: Vec<BTreeSet<MessageId>>,
+    channel_deliveries: u64,
+    channel_transmissions: u64,
+    channel_bytes: u64,
+    channel_subscribers: usize,
 }
 
 impl Simulation {
@@ -1156,7 +1262,29 @@ impl Simulation {
                 ..scenario.suppression
             };
             engine_config.telemetry = scenario.telemetry;
-            let engine = MeshEngine::with_config(engine_rng, engine_config);
+            let mut engine = MeshEngine::with_config(engine_rng, engine_config);
+            // Subscription is a local host declaration. Only configured
+            // subscribers get one; relays keep an empty channel registry and
+            // forward from the ordinary Broadcast path.
+            if let Traffic::Channel {
+                name, subscribers, ..
+            } = scenario.traffic
+            {
+                if subscribers.contains(&i) {
+                    let outputs = engine
+                        .handle(
+                            0,
+                            MeshInput::ChannelSubscribe {
+                                name: name.as_bytes(),
+                            },
+                        )
+                        .expect("fixed subscription is valid");
+                    assert!(
+                        outputs.is_empty(),
+                        "subscribing emits no host action: {outputs:?}"
+                    );
+                }
+            }
             // Baseline nodes have empty stores. The hello and beacon must
             // advertise the engine's actual digest, otherwise every link
             // looks different and MSH-14 starts a needless sync contact.
@@ -1291,6 +1419,10 @@ impl Simulation {
             _ => Vec::new(),
         };
         contacts.sort_by_key(|contact| contact.at_ms);
+        let channel_subscribers = match scenario.traffic {
+            Traffic::Channel { subscribers, .. } => subscribers.len(),
+            _ => 0,
+        };
         let mut sim = Self {
             scenario,
             world,
@@ -1350,6 +1482,11 @@ impl Simulation {
             fresh_hint_submissions: 0,
             fresh_hint_deliveries: 0,
             fresh_latencies: Vec::new(),
+            channel_delivered_ids: vec![BTreeSet::new(); n],
+            channel_deliveries: 0,
+            channel_transmissions: 0,
+            channel_bytes: 0,
+            channel_subscribers,
         };
         sim.apply_ranges();
         sim
@@ -1825,10 +1962,18 @@ impl Simulation {
                             self.steady_announcement_bytes += payload.len() as u64;
                         }
                     }
+                    if is_channel_payload(payload) {
+                        self.channel_transmissions += 1;
+                        self.channel_bytes += payload.len() as u64;
+                    }
                 }
                 MeshOutput::Broadcast { payload, .. } => {
                     let links = self.nodes[node].adapter.network().links();
                     self.transmissions += links.len() as u64;
+                    if is_channel_payload(payload) {
+                        self.channel_transmissions += links.len() as u64;
+                        self.channel_bytes += payload.len() as u64 * links.len() as u64;
+                    }
                     for info in links {
                         *self.pending[node].entry(info.link).or_insert(0) += payload.len() as u64;
                     }
@@ -1869,6 +2014,11 @@ impl Simulation {
                         }
                     } else {
                         self.duplicate_deliveries += 1;
+                    }
+                }
+                MeshOutput::ChannelDeliver { header, .. } => {
+                    if self.channel_delivered_ids[node].insert(header.msg_id) {
+                        self.channel_deliveries += 1;
                     }
                 }
                 MeshOutput::Delivered { origin, .. }
@@ -2104,30 +2254,30 @@ impl Simulation {
             }
             return;
         }
-        let (origin, broadcast) = match self.scenario.traffic {
-            Traffic::Balanced => (m % n, false),
+        let (origin, broadcast, channel_name) = match self.scenario.traffic {
+            Traffic::Balanced => (m % n, false, None),
             Traffic::Flood {
                 origin: flood,
                 weight,
             } => {
                 let round = weight.max(1) + 1;
                 if m % round == 0 {
-                    (flood.min(n - 1), false)
+                    (flood.min(n - 1), false, None)
                 } else {
                     let honest = n - 1;
                     let slot = (m / round) * weight + (m % round) - 1;
-                    ((flood.min(n - 1) + 1 + slot % honest) % n, false)
+                    ((flood.min(n - 1) + 1 + slot % honest) % n, false, None)
                 }
             }
-            Traffic::Broadcast { origin } => (origin.min(n - 1), true),
+            Traffic::Broadcast { origin } => (origin.min(n - 1), true, None),
             Traffic::MixedBroadcast {
                 origin,
                 direct_every,
             } => {
                 if m % direct_every.max(1) == 0 {
-                    (m % n, false)
+                    (m % n, false, None)
                 } else {
-                    (origin.min(n - 1), true)
+                    (origin.min(n - 1), true, None)
                 }
             }
             // Presence scenarios submit no application messages, so this is
@@ -2136,7 +2286,8 @@ impl Simulation {
             Traffic::Presence => return,
             // The typed path returned above; this keeps the match total
             // without a simulator-only panic.
-            Traffic::Telemetry { origin, .. } => (origin.min(n - 1), false),
+            Traffic::Telemetry { origin, .. } => (origin.min(n - 1), false, None),
+            Traffic::Channel { origin, name, .. } => (origin.min(n - 1), true, Some(name)),
         };
         // Destinations stay inside the packet's eight-hop TTL so the
         // baseline measures forwarding, not expiry at an impossible
@@ -2152,9 +2303,19 @@ impl Simulation {
         let mut rng = SealRng::seed_from_u64(self.scenario.seed ^ (m as u64 + 1));
         let plaintext = vec![(m % 251) as u8; self.scenario.payload_len];
         let (header, payload, wire) = if broadcast {
-            // Plain Broadcast: the engine caps TTL at ADR-0001's six hops
-            // on submission. Payload is opaque to the mesh.
+            // Broadcast payloads are opaque to the mesh: a channel is a v1
+            // envelope around the same host bytes. The engine caps TTL at
+            // ADR-0001's six hops on submission.
             let sender = &self.identities[origin];
+            let wire_payload = match channel_name {
+                Some(name) => {
+                    let id = derive_channel_id(name.as_bytes()).expect("fixed channel name");
+                    ChannelEnvelope::new(id, &plaintext)
+                        .expect("fixed opaque payload fits")
+                        .encode()
+                }
+                None => plaintext.clone(),
+            };
             let mut header = Header {
                 class: PacketClass::Broadcast,
                 dst: None,
@@ -2162,14 +2323,16 @@ impl Simulation {
                 origin: *sender.node_id().as_bytes(),
                 created_ms: now_ms,
                 lifetime_s: 600,
-                payload_len: plaintext.len() as u64,
+                payload_len: wire_payload.len() as u64,
                 ttl: 255,
                 hops: 0,
             };
-            let signature = sign_packet(sender, &mut header, &plaintext).expect("fixed key signs");
-            let packet = crate::Packet::new(header, signature, &plaintext).expect("lengths agree");
+            let signature =
+                sign_packet(sender, &mut header, &wire_payload).expect("fixed key signs");
+            let packet =
+                crate::Packet::new(header, signature, &wire_payload).expect("lengths agree");
             let wire = packet.encode();
-            (packet.header, plaintext, wire)
+            (packet.header, wire_payload, wire)
         } else {
             let sender = &self.identities[origin];
             let recipient = &self.identities[dst];
@@ -2395,6 +2558,11 @@ impl Simulation {
             fresh_hint_submissions: self.fresh_hint_submissions,
             fresh_hint_deliveries: self.fresh_hint_deliveries,
             fresh_hint_mean_latency_ms: fresh_mean,
+            channel_subscribers: self.channel_subscribers,
+            channel_deliveries: self.channel_deliveries,
+            channel_delivered_ids: self.channel_delivered_ids,
+            channel_transmissions: self.channel_transmissions,
+            channel_bytes: self.channel_bytes,
             unique_receptions_by_node: self
                 .received_ids
                 .iter()
@@ -2424,6 +2592,15 @@ impl Simulation {
 /// share exactly the same path.
 pub fn run(scenario: Scenario) -> Metrics {
     Simulation::new(scenario).run()
+}
+
+/// Whether a mesh send payload is a v1 channel envelope. Used only by the
+/// harness's MSH-23 accounting; the engine keeps no such counter.
+fn is_channel_payload(wire: &[u8]) -> bool {
+    Packet::decode(wire).is_ok_and(|packet| {
+        packet.header.class == PacketClass::Broadcast
+            && packet.payload.first() == Some(&CHANNEL_MAGIC)
+    })
 }
 
 fn near(a: (i64, i64), b: (i64, i64), radius: i64) -> bool {
@@ -2897,6 +3074,11 @@ mod tests {
             fresh_hint_submissions: 1,
             fresh_hint_deliveries: 1,
             fresh_hint_mean_latency_ms: 12,
+            channel_subscribers: 2,
+            channel_deliveries: 1,
+            channel_delivered_ids: vec![BTreeSet::new(), BTreeSet::new()],
+            channel_transmissions: 3,
+            channel_bytes: 6_144,
         };
         let row = m.csv_row();
         assert_eq!(row.lines().count(), 1);

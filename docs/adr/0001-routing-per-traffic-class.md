@@ -475,6 +475,7 @@ default: it meets the issue's latency goal without increasing transmissions.
 | Maximum entries | 1024 | Bounded per-destination state at the documented directory scale |
 | Lifetime | 300,000 ms | Shorter than the 10-15 min presence refresh, so stale paths age out |
 | Fresh hop ceiling | 8 | Matches Direct's TTL; longer paths are not trusted |
+
 ## MSH-22 implementation
 
 Telemetry keeps class 4 and the registered packet signature domain; the
@@ -514,3 +515,60 @@ frame and the newest pending replacement: six total receptions, at most two
 sequences at any node, maximum sequence 8, 12 transmissions. The chatty row
 (seed `1297304029`) accepts one of twelve attempts, emits no telemetry frame,
 and records no store copy. `tests/sim_telemetry.rs` locks both exact CSV rows.
+
+## MSH-23 implementation
+
+Public channels stay in the Broadcast row above: TTL 6, at most one forward per
+node, 6 h lifetime, 256 KiB/h and priority 2. Three envelope designs were
+compared. A new packet class would duplicate the budget, suppression, seen,
+store and relay-verification tables for no routing benefit. A separate control
+frame would lose the signed Broadcast content address and need its own dedupe
+and fan-out. An 18-byte envelope inside the opaque Broadcast payload was
+chosen: magic, version, a 16-byte BLAKE3-128 channel id and opaque app bytes.
+The header, signature domain and class set are untouched, and a legacy peer
+relays the bytes as ordinary Broadcast data.
+
+The channel id uses domain `aoheyra/mesh/v1/channel-id`, a one-byte name length,
+tag `0x01` and the bounded name. A distinct `aoheyra/mesh/v1/channel-budget`
+domain derives a 16-byte synthetic key for the existing MSH-10 bucket table.
+Three rate-limit options were considered. One shared Broadcast origin bucket is
+simplest but lets a hot channel starve every other Broadcast from the same
+origin. A second bucket table with its own timers and eviction would be
+precise but duplicates MSH-10 and adds unbounded state to maintain. The chosen
+design debits a domain-separated synthetic key in the existing bounded table,
+in addition to the claimed origin and the normal sending-link bucket. It keeps
+one rate model, one eviction policy and one set of class rates; no per-link
+channel state is added because relays do not track subscriptions.
+
+Subscriptions are local host inputs, bounded at 32 by default with a hard cap
+of 256; names are capped at 64 bytes. Options were a mesh-wide subscription
+gossip, which would let relays learn who listens and create targetable
+metadata, or this local registry, which leaves a relay's `ChannelRules` empty.
+The registry also fails closed on the infeasible event of two names deriving
+one id. Delivery verifies the signature with the key from the direct sender's
+signed hello and uses the recipient replay guard. Trusting a relayed origin
+claim, or carrying a full key proof in every envelope, was rejected: the first
+breaks authentication and the second duplicates an identity card on the air. The
+MSH-20 directory carries card hashes and capabilities but no signed packet key,
+so a relayed copy is still forwarded without local delivery. Extending the
+directory with a key proved under the packet domain is a separate change; the
+envelope and verification rules need not be relaxed.
+
+| Setting | Default | Hard cap | Reason |
+|---|---:|---:|---|
+| Local subscriptions | 32 | 256 | Bounds local name state; no relay state |
+| Channel name bytes | 64 | 64 | One-byte length and bounded hash input |
+| Channel id bytes | 16 | - | 128-bit collision resistance plus typed collision detection |
+| Envelope header | 18 | - | Fixed, header-only parse before app bytes |
+
+The fixed 20-node line case (seed `1297304023`) submits one 128-byte envelope
+from node 10 with subscribers at 9 and 11. Both in-range subscribers receive it
+and no other node does. Twelve one-link transmissions carry 3,048 envelope
+bytes, inside the 43,690-byte Broadcast burst (256 KiB/hour with the ten-minute
+burst). This is a remeasurement after rebasing onto MSH-22: MSH-19's two-link
+suppression floor makes each line relay forward once, replacing the old
+two-transmission expectation from the pre-MSH-19 tree. Reachability and the
+budget gate are unchanged; no published MSH-27 threshold was lowered. The exact
+CSV row and command are in the README; `tests/sim_channels.rs` locks the row, so
+reachability or budget regressions fail as exact changes. The four published
+MSH-27 rows are unchanged.

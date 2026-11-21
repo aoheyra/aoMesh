@@ -555,6 +555,61 @@ Changes reach the host as `MeshOutput::DirectoryChanged` /
 `AdapterEvent::DirectoryChanged` with at most one coalesced event per node;
 the UI queries the directory for details instead of receiving payloads.
 
+## Public channels (MSH-23)
+
+A public channel is an envelope inside the opaque payload of a normal signed
+`Broadcast` packet. The packet header, signature coverage, class set and
+`msg_id` derivation are unchanged, and legacy peers can relay the bytes without
+understanding them.
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 1 | Magic `0xC4` |
+| 1 | 1 | Version `1` |
+| 2 | 16 | Channel id |
+| 18 | .. | Opaque application bytes |
+
+The 18-byte header is parsed before any application bytes are read. The total
+envelope must fit the existing 2048-byte packet payload cap. Magic `0xC4` is
+reserved: a Broadcast payload that starts with it but cannot decode as a v1
+envelope is attributable invalid traffic and feeds the neighbour penalty.
+Payloads with any other first byte remain ordinary Broadcast data.
+
+The channel id is derived locally from a bounded name:
+
+```
+id = BLAKE3("aoheyra/mesh/v1/channel-id" || len(name) || 0x01 || name)[..16]
+```
+
+The one-byte length and form tag avoid ambiguity between names and other
+domain-separated hashes. The name is never encoded on the wire. A 128-bit digest
+can collide in principle, so the local registry binds each id to the name that
+claimed it and returns `ChannelError::IdCollision` if a different name claims
+the same id. This is a local host-state check, not a wire field.
+
+For the existing MSH-10 bucket table, the synthetic budget key is:
+
+```
+key = BLAKE3("aoheyra/mesh/v1/channel-budget" || 16 || id)[..16]
+```
+
+It is a bucket index, never a node identity. The extra domain prevents a real
+`NodeId` and a channel id from being interchangeable. A submission or relay
+debited for the Broadcast class pays both the claimed origin and this channel
+key, in addition to the normal per-link bucket on receive. This reuses the same
+bounded table and class rates; it is not a second limiter.
+
+Verification is unchanged: the origin signature covers the immutable header,
+and `msg_id` binds the envelope bytes, under `aoheyra/mesh/v1/packet` and
+`aoheyra/mesh/v1/msg-id` respectively. A subscriber verifies a direct copy with
+the `signing_pk` proved by the sending link's signed `MeshHello`, then runs the
+recipient replay guard before `MeshOutput::ChannelDeliver` is emitted with the
+opaque bytes after byte 18. A relayed copy is forwarded but not delivered
+locally: the directory's typed observations do not carry a signing key proved
+under the packet domain, so no signature check is relaxed. No new hello
+capability bit is required because old peers already treat the payload as
+opaque Broadcast bytes.
+
 ## Simulation evidence (MSH-27)
 
 No wire format changes. Feature `sim` drives the codec and engine over aoNetwork's

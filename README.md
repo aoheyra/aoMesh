@@ -2,7 +2,7 @@
 
 **The routing and store-and-forward engine of the aoheyra mesh.** A sans-IO Rust crate that decides what happens to a packet: forward it, hold it, suppress it, deliver it, or drop it, across a phone-to-phone mesh where links come and go.
 
-> **Status: pre-alpha, through MSH-21.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest, bounded anti-entropy sync, range-based reconciliation on meeting links, binary spray-and-wait for Direct traffic, signed delivery receipts with bounded store purging, relative-age lifetime ceilings, bounded presence announcements with trickle timing, a bounded ephemeral NodeDirectory with coalesced UI events, and bounded reverse-path route hints derived from directory observations are implemented.
+> **Status: pre-alpha, through MSH-23.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest, bounded anti-entropy sync, range-based reconciliation on meeting links, binary spray-and-wait for Direct traffic, signed delivery receipts with bounded store purging, relative-age lifetime ceilings, bounded presence announcements with trickle timing, a bounded ephemeral NodeDirectory with coalesced UI events, bounded reverse-path route hints derived from directory observations, the latest-wins Telemetry class, and local public-channel subscriptions over signed Broadcast envelopes are implemented.
 
 Cargo package name: `ao_mesh`.
 
@@ -32,7 +32,8 @@ aoMesh consumes **aoNetwork** (links and frames) and **aoIdents** (signatures, s
 - **Stores and forwards**: `MessageStore` trait with quotas and eviction, store summary and beacon digest, anti-entropy sync when two nodes meet.
 - **Controls abuse mesh-wide**: per-origin and per-class relay budgets, neighbour penalty scores.
 - Handles **delivery receipts and immunity** so copies are purged after delivery.
-- Maintains a bounded mesh-wide **NodeDirectory** from typed presence observations, with LRU eviction, relative-time expiry and coalesced UI changes; derives bounded **reverse-path route hints** from those facts, while public channels follow in a later issue.
+- Maintains a bounded mesh-wide **NodeDirectory** from typed presence observations, with LRU eviction, relative-time expiry and coalesced UI changes; derives bounded **reverse-path route hints** from those facts.
+- Publishes **Telemetry** as latest-wins ambient state with NET-21 coalescing, and carries **public channels** as bounded envelopes inside signed Broadcast packets with local-only subscriptions.
 - Ships a **simulator harness** with mobility models and metrics, so every routing parameter can be swept and every claim measured.
 
 ## What it deliberately does not do
@@ -78,14 +79,15 @@ Lifetimes, TTLs, copy counts and budgets are **defaults with documented reasons*
    aoNetwork  (NetworkEvent in, actions out)      aoIdents (sign, open, replay)
 ```
 
-**Engine inputs:** `LinkUp`, `LinkDown`, `Data`, `Tick`, `Submit`, `SubmitTelemetry`, `KnownCards`, `ObserveNode`, `StoreSummary`, `SyncItems`. **Outputs:** `Send`, `Broadcast`, `TelemetrySend`, `TelemetryBroadcast`, `Release`, `Deliver`, `SetHello`, `SetBeacon`, `SyncNeed`, `SyncItem`, `ReleaseOpportunistic`, `Purge`, `Delivered`, `CardFetch`, `DirectoryChanged`.
+**Engine inputs:** `LinkUp`, `LinkDown`, `Data`, `Tick`, `Submit`, `SubmitTelemetry`, `KnownCards`, `ObserveNode`, `StoreSummary`, `SyncItems`, `ChannelSubscribe`, `ChannelUnsubscribe`. **Outputs:** `Send`, `Broadcast`, `TelemetrySend`, `TelemetryBroadcast`, `Release`, `Deliver`, `ChannelDeliver`, `SetHello`, `SetBeacon`, `SyncNeed`, `SyncItem`, `ReleaseOpportunistic`, `Purge`, `Delivered`, `CardFetch`, `DirectoryChanged`.
 
 ### Engine and adapter (MSH-06)
 
 `MeshEngine::new(rng)` uses `MeshConfig::default()`: 32 neighbour entries, the
 MSH-09 replay guard (1024 ids per sender, 24 h tolerance, 64 senders), the
 budget fields below, the MSH-11 suppression fields, the MSH-13 summary
-fields and the MSH-14/15 sync fields below. `with_config`
+fields, the MSH-14/15 sync fields and the MSH-23 channel bounds below.
+`with_config`
 accepts explicit bounds; zero neighbours
 refuses all new links. Excess links emit `Release`, duplicate link-up events
 preserve counters, and link-down removes the entry. These are bookkeeping
@@ -96,8 +98,13 @@ Link-up verifies the peer's signed MeshHello, so each entry carries a verified
 `Submit` borrows an `Identity`, header and opaque payload. The engine retains
 no keys, validates lengths before signing, and emits `Send` to a selected
 admitted link or `Broadcast` to all up links. Telemetry uses the Telemetry
-channel; other packet classes use Message. Packet and signing failures return
-typed `MeshError`s while the caller retains its payload. Incoming Data also
+channel; other packet classes use Message. A Broadcast payload carrying the
+reserved channel magic is validated as a channel envelope and charged to both
+the origin's Broadcast bucket and the channel's own bucket before signing.
+`ChannelSubscribe` and `ChannelUnsubscribe` change only that node's bounded
+local registry; relays never send either input. Packet, channel and signing
+failures return typed `MeshError`s while the caller retains its payload.
+Incoming Data also
 borrows the local `Identity`; the engine keeps no keys. It is parsed without
 copying and counted: a fresh Direct packet whose `dst` is that identity's
 node id becomes a delivery candidate, any other fresh Direct packet relays
@@ -111,6 +118,7 @@ sending neighbour.
 
 With feature `adapter`, `NetworkAdapter` owns the facade and engine in one
 caller task. Every output variant maps to a network command or host event;
+`ChannelDeliver` reports a signed channel message to a local subscriber,
 `SyncNeed` asks the host to resolve store ids, `SyncItem` hands an incoming
 packet to the host store, `ReleaseOpportunistic` calls aoNetwork's
 `Network::release`, which closes only opportunistic links, and `CardFetch`
@@ -829,3 +837,80 @@ previous encounters plus local monotonic elapsed time determines expiry;
 remote timestamps are ignored. `expiry::age_at` carries consumed age between
 encounters with different local epochs. See [the expiry decision](docs/adr/lifetime-expiry.md)
 for the caller contract and restart/sync boundaries.
+
+## Public channels (MSH-23)
+
+A public channel is a fixed envelope inside the opaque payload of an ordinary
+signed `Broadcast` packet:
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 1 | Magic `0xC4` |
+| 1 | 1 | Version `1` |
+| 2 | 16 | Channel id |
+| 18 | .. | Opaque application bytes |
+
+There is no new packet class, header field or signature domain. The channel id
+is BLAKE3-128 over `aoheyra/mesh/v1/channel-id`, a one-byte name length, tag
+`0x01` and the name; the name itself is never sent. A separate
+`aoheyra/mesh/v1/channel-budget` hash turns the id into a synthetic key for the
+existing MSH-10 origin-bucket table. A hot channel is therefore limited without
+a second budget table and without eating the origin's general Broadcast
+allowance.
+
+| Setting | Default | Hard cap | Why |
+|---|---:|---:|---|
+| Local subscriptions | 32 | 256 | Bounds local name state; relays keep zero |
+| Channel name bytes | 64 | 64 | Fits one length byte and bounds hash input |
+| Envelope header | 18 | - | Magic, version and a 16-byte id |
+| Channel id bytes | 16 | - | 128-bit collision resistance with typed collision detection |
+
+`MeshInput::ChannelSubscribe` and `ChannelUnsubscribe` mutate only the node's
+bounded `ChannelRules` registry. Relays never receive them, so an uninvolved
+relay keeps an empty registry and forwards channel packets like any other
+Broadcast. A Broadcast payload starting with the reserved magic must be a
+complete envelope; a truncated or wrong-version one is rejected and counted
+against the sending link. Ordinary Broadcast payloads keep the MSH-11 path.
+
+For a copy arriving directly from the origin, a subscriber verifies the origin
+signature with the key proved by the sender's signed `MeshHello`, accepts the
+content id in the replay guard, and receives `MeshOutput::ChannelDeliver` with
+the envelope's opaque inner bytes. Relayed copies still forward under MSH-10
+and MSH-11 but are not delivered locally: the MSH-20 directory carries typed
+presence observations and no signed packet key, so a remote origin cannot be
+authenticated for local delivery. Verification is not relaxed to make a
+delivery happen. Extending the directory with a key proved under the packet
+domain can extend delivery beyond direct neighbours without changing the
+envelope.
+
+Locally submitted envelopes are validated before signing, then debited from the
+origin's Broadcast bucket and the channel bucket; the origin is refunded if the
+channel bucket refuses. Relays pay the normal origin and link buckets plus the
+channel bucket before suppression starts. All rejections are typed
+`ChannelError` values exposed as `MeshError::Channel`; no packet-driven path
+panics, and no payload is interpreted as text or an app schema.
+
+The fixed 20-node line case puts subscribers 9 and 11 in origin 10's radio
+range and leaves the other 17 nodes subscription-free. One signed message is
+submitted with seed `1297304023`:
+
+```bash
+cargo run --release --all-features --example channel_report
+cargo test --release --all-features --test sim_channels
+```
+
+The report CSV columns are `scenario,seed,nodes,submitted,subscribers,
+channel_deliveries,channel_transmissions,channel_bytes,broadcast_burst_bytes,
+within_broadcast_budget`. Its exact row is:
+
+| Scenario | Seed | Nodes | Submitted | Subscribers | Deliveries | Transmissions | Envelope bytes | Burst bytes | Within budget |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `channel-line-20` | 1297304023 | 20 | 1 | 2 | 2 | 12 | 3048 | 43690 | yes |
+
+Both in-range subscribers receive the message; no other node does. Twelve
+one-link transmissions carry 3,048 bytes against the 43,690-byte Broadcast
+burst allowance from ADR-0001. This row was remeasured after rebasing onto
+MSH-22: MSH-19's two-link suppression floor makes each line relay forward once,
+replacing the old two-transmission expectation from the pre-MSH-19 tree.
+Reachability and the budget gate are unchanged, and no published MSH-27
+threshold was lowered. The four published MSH-27 baselines are unchanged.

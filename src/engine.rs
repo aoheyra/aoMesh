@@ -1,6 +1,10 @@
 //! Sans-IO command dispatch with borrowed submissions and bounded neighbours.
 
 use crate::budget::{BudgetOutcome, BudgetTracker};
+use crate::channel::{
+    CHANNEL_MAGIC, ChannelBudgetScope, ChannelEnvelope, ChannelError, ChannelId, ChannelRules,
+    channel_budget_origin,
+};
 use crate::deliver;
 use crate::directory::{DirectoryChange, DirectoryError, NodeDirectory, NodeObservation};
 use crate::forward::{self, Action};
@@ -15,7 +19,9 @@ use crate::sync::{
     SyncTracker,
 };
 use crate::telemetry::{TelemetryAdvisory, TelemetryFrame, TelemetryTracker};
-use crate::{Header, MessageId, Packet, PacketError, sign_packet};
+use crate::{
+    Header, MessageId, Packet, PacketClass, PacketError, sign_packet, verify_origin_with_signing_pk,
+};
 use ao_idents::{IdentError, Identity, NodeId, ReplayGuard, Signature};
 use ao_network::{AppHello, BeaconFlags, Channel, DisconnectReason, Hello, LinkId, LocalTag};
 use rand_core::RngCore;
@@ -128,6 +134,20 @@ pub enum MeshInput<'a> {
         /// A selected neighbour, or all current neighbours.
         via: Option<LinkId>,
     },
+    /// Declares a local public-channel subscription by name.
+    ///
+    /// Subscription is a host/UI concern: relays forward channel packets
+    /// without ever receiving one of these inputs. The name is bounded by
+    /// `MeshConfig::channels` and copied only into that local registry.
+    ChannelSubscribe {
+        /// Channel name, opaque to the mesh except for id derivation.
+        name: &'a [u8],
+    },
+    /// Removes a local public-channel subscription by name.
+    ChannelUnsubscribe {
+        /// Channel name previously passed to [`Self::ChannelSubscribe`].
+        name: &'a [u8],
+    },
 }
 
 /// Actions for the host. The MSH-08 baseline emits `Send` relays;
@@ -193,6 +213,19 @@ pub enum MeshOutput {
         /// Packet header, as received.
         header: Header,
         /// The opened application payload.
+        payload: Vec<u8>,
+    },
+    /// A signed public-channel Broadcast accepted for a local subscriber.
+    ///
+    /// The origin signature was checked with the key from the sender's
+    /// verified hello, and the recipient's replay guard accepted the id.
+    /// Relays never emit this: only a node with a local subscription does.
+    ChannelDeliver {
+        /// The channel the message was addressed to.
+        channel_id: ChannelId,
+        /// Packet header, as received.
+        header: Header,
+        /// Opaque application bytes from the envelope, unmodified.
         payload: Vec<u8>,
     },
     /// Replace the introduction used by new links.
@@ -290,6 +323,8 @@ pub enum MeshError {
     Directory(DirectoryError),
     /// A Telemetry policy or framing failure; no packet is emitted.
     Telemetry(crate::telemetry::TelemetryError),
+    /// A channel name, envelope or budget limit was rejected (MSH-23).
+    Channel(ChannelError),
 }
 impl core::fmt::Display for MeshError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -301,6 +336,7 @@ impl core::fmt::Display for MeshError {
             Self::Presence(error) => write!(f, "presence failed: {error}"),
             Self::Directory(error) => write!(f, "directory observation failed: {error}"),
             Self::Telemetry(error) => write!(f, "telemetry rejected: {error}"),
+            Self::Channel(error) => write!(f, "channel rejected: {error}"),
         }
     }
 }
@@ -332,6 +368,7 @@ pub struct MeshEngine<R: RngCore> {
     directory: NodeDirectory,
     hints: RouteHintTable,
     telemetry: TelemetryTracker,
+    channels: ChannelRules,
 }
 impl<R: RngCore> MeshEngine<R> {
     /// Creates an engine with the default limits (`MeshConfig::default`).
@@ -366,6 +403,7 @@ impl<R: RngCore> MeshEngine<R> {
             directory: NodeDirectory::new(config.directory),
             hints: RouteHintTable::new(config.route_hint),
             telemetry: TelemetryTracker::new(config.telemetry),
+            channels: ChannelRules::new(config.channels),
         }
     }
     /// Read-only bookkeeping, not a list of authenticated identities.
@@ -418,6 +456,11 @@ impl<R: RngCore> MeshEngine<R> {
     /// Read-only latest-wins state, for diagnostics and resource-bound tests.
     pub fn telemetry(&self) -> &TelemetryTracker {
         &self.telemetry
+    }
+    /// Read-only local channel registry (MSH-23). Relays keep it empty.
+    #[must_use]
+    pub fn channels(&self) -> &ChannelRules {
+        &self.channels
     }
     /// Whether an acknowledged id is immune from store re-sync (MSH-17).
     #[cfg(feature = "sim")]
@@ -534,7 +577,12 @@ impl<R: RngCore> MeshEngine<R> {
                 // decide its fate (ADR-0004).
                 let hello = crate::hello::verified_hello(remote_hello.app_hello.as_bytes()).ok();
                 let node_id = hello.map(|hello| hello.node_id);
-                self.neighbors.insert(now, link, remote_hello, node_id);
+                // The same verified introduction proves this signing key, so
+                // a channel recipient can authenticate a Broadcast without
+                // holding an identity or querying a directory.
+                let signing_pk = hello.map(|hello| hello.signing_pk);
+                self.neighbors
+                    .insert(now, link, remote_hello, node_id, signing_pk);
                 let caps = hello.and_then(|hello| {
                     hello
                         .negotiate(crate::hello::PROTO, crate::hello::CAPS)
@@ -738,10 +786,11 @@ impl<R: RngCore> MeshEngine<R> {
                 let packet = Packet::decode(packet_bytes);
                 self.neighbors
                     .received(now, link, payload.len(), packet.is_ok());
-                let verified = self
-                    .neighbors
-                    .get(link)
-                    .is_some_and(|neighbor| neighbor.node_id.is_some());
+                let (sender_id, sender_signing_pk) =
+                    self.neighbors.get(link).map_or((None, None), |neighbor| {
+                        (neighbor.node_id, neighbor.signing_pk)
+                    });
+                let verified = sender_id.is_some();
                 let packet = match packet {
                     Ok(packet) => packet,
                     Err(_) => {
@@ -770,13 +819,80 @@ impl<R: RngCore> MeshEngine<R> {
                 // policy runs before the relay budget so superseded, stale
                 // or throttled updates cost neither a token nor a state
                 // change beyond the signed packet's traffic counters.
-                if packet.header.class == crate::PacketClass::Telemetry {
+                if packet.header.class == PacketClass::Telemetry {
                     return Ok(self.on_telemetry_data(now, link, packet));
+                }
+                // Complete timers that expired while this packet was in
+                // flight before adding a new sighting for the same id. Done
+                // before early returns so an expired relay is never lost.
+                let mut outputs = self.drain_due(now);
+                // A channel envelope is recognised only inside Broadcast.
+                // The magic byte is reserved, so a truncated or wrong-version
+                // envelope is an attributable protocol error, not ordinary
+                // Broadcast data. Decoding borrows; it allocates no payload.
+                let envelope = match parse_channel_envelope(packet.header.class, packet.payload) {
+                    Ok(envelope) => envelope,
+                    Err(_) => {
+                        self.neighbors.reject(link);
+                        return Ok(Self::release_if_penalised(
+                            link,
+                            self.budgets
+                                .penalize(now, link, self.config.budgets.penalty_invalid),
+                        ));
+                    }
+                };
+                // Only the origin's own hello proves the key that signed this
+                // envelope. A relayed copy cannot be authenticated locally
+                // without a directory lookup, so it is forwarded as ordinary
+                // Broadcast but not delivered to this node's subscriber.
+                if let Some(envelope) = envelope {
+                    let origin = NodeId::from_bytes(packet.header.origin);
+                    if self.channels.contains(envelope.channel_id) && sender_id == Some(origin) {
+                        match sender_signing_pk {
+                            Some(signing_pk)
+                                if verify_origin_with_signing_pk(
+                                    &signing_pk,
+                                    &packet.header,
+                                    packet.payload,
+                                    &packet.signature,
+                                )
+                                .is_ok() =>
+                            {
+                                if self
+                                    .replay
+                                    .accept(
+                                        origin,
+                                        packet.header.msg_id.as_bytes(),
+                                        packet.header.created_ms,
+                                        now,
+                                    )
+                                    .is_ok()
+                                {
+                                    outputs.push(MeshOutput::ChannelDeliver {
+                                        channel_id: envelope.channel_id,
+                                        header: packet.header,
+                                        payload: envelope.payload.to_vec(),
+                                    });
+                                }
+                            }
+                            _ => {
+                                self.neighbors.reject(link);
+                                return Ok(Self::release_if_penalised(
+                                    link,
+                                    self.budgets.penalize(
+                                        now,
+                                        link,
+                                        self.config.budgets.penalty_invalid,
+                                    ),
+                                ));
+                            }
+                        }
+                    }
                 }
                 // Both the claimed origin and the sending link pay for a
                 // relay. A local delivery still happens; only its onward
                 // copies are withheld when either bucket is empty.
-                let origin = ao_idents::NodeId::from_bytes(packet.header.origin);
+                let origin = NodeId::from_bytes(packet.header.origin);
                 let outcome =
                     self.budgets
                         .admit(now, link, origin, packet.header.class, payload.len());
@@ -792,11 +908,26 @@ impl<R: RngCore> MeshEngine<R> {
                     }
                 };
                 if release {
-                    return Ok(Self::release_if_penalised(link, true));
+                    outputs.push(MeshOutput::Release {
+                        link,
+                        reason: DisconnectReason::AbuseDetected,
+                    });
+                    return Ok(outputs);
                 }
-                // Complete timers that expired while this packet was in
-                // flight before adding a new sighting for the same id.
-                let mut outputs = self.drain_due(now);
+                // A hot channel gets its own bucket under a domain-separated
+                // synthetic key. This is the same bounded MSH-10 table, not a
+                // second limiter; a refusal withholds only this relay.
+                if let Some(envelope) = envelope {
+                    if self.budgets.admit_channel(
+                        now,
+                        channel_budget_origin(envelope.channel_id),
+                        packet.header.class,
+                        payload.len(),
+                    ) != BudgetOutcome::Admitted
+                    {
+                        return Ok(outputs);
+                    }
+                }
                 let wire = packet.encode();
                 let msg_id = packet.header.msg_id;
                 let destination = packet.header.dst.unwrap_or([0; 16]);
@@ -1109,6 +1240,41 @@ impl<R: RngCore> MeshEngine<R> {
                 // Reject caller mistakes before signing or allocating the wire packet.
                 Packet::new(header, Signature::from_bytes([0; 64]), payload)
                     .map_err(MeshError::Packet)?;
+                // A Broadcast payload carrying the reserved magic must be a
+                // complete channel envelope. Validate and budget it before
+                // signing so a denied submission emits no packet and consumes
+                // no dedupe key.
+                let channel_envelope = match parse_channel_envelope(header.class, payload) {
+                    Ok(envelope) => envelope,
+                    Err(error) => return Err(MeshError::Channel(error)),
+                };
+                if let Some(envelope) = channel_envelope {
+                    let origin = NodeId::from_bytes(*identity.node_id().as_bytes());
+                    if self
+                        .budgets
+                        .admit_origin(now, origin, header.class, payload.len())
+                        != BudgetOutcome::Admitted
+                    {
+                        return Err(MeshError::Channel(ChannelError::BudgetDenied {
+                            scope: ChannelBudgetScope::Origin,
+                        }));
+                    }
+                    if self.budgets.admit_channel(
+                        now,
+                        channel_budget_origin(envelope.channel_id),
+                        header.class,
+                        payload.len(),
+                    ) != BudgetOutcome::Admitted
+                    {
+                        // The channel refused a packet the origin would
+                        // otherwise have paid for; restore its tokens.
+                        self.budgets
+                            .refund_origin(now, origin, header.class, payload.len());
+                        return Err(MeshError::Channel(ChannelError::BudgetDenied {
+                            scope: ChannelBudgetScope::Channel,
+                        }));
+                    }
+                }
                 let signature =
                     sign_packet(identity, &mut header, payload).map_err(MeshError::Signing)?;
                 // The origin has already put this message on the air:
@@ -1181,6 +1347,16 @@ impl<R: RngCore> MeshEngine<R> {
                         payload: bytes,
                     },
                 }])
+            }
+            MeshInput::ChannelSubscribe { name } => {
+                self.channels.subscribe(name).map_err(MeshError::Channel)?;
+                Ok(Vec::new())
+            }
+            MeshInput::ChannelUnsubscribe { name } => {
+                self.channels
+                    .unsubscribe(name)
+                    .map_err(MeshError::Channel)?;
+                Ok(Vec::new())
             }
         }
     }
@@ -1758,4 +1934,19 @@ impl<R: RngCore> MeshEngine<R> {
             Vec::new()
         }
     }
+}
+
+/// Recognises a channel envelope only in an ordinary Broadcast payload.
+///
+/// `Ok(None)` covers every other class and legacy opaque Broadcast bytes
+/// whose first byte is not the reserved channel magic. A magic byte that
+/// does not decode as v1 is an error attributable to the sender.
+fn parse_channel_envelope(
+    class: PacketClass,
+    payload: &[u8],
+) -> Result<Option<ChannelEnvelope<'_>>, ChannelError> {
+    if class != PacketClass::Broadcast || payload.first() != Some(&CHANNEL_MAGIC) {
+        return Ok(None);
+    }
+    ChannelEnvelope::decode(payload).map(Some)
 }

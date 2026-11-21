@@ -26,7 +26,10 @@
 //! from typed presence observations, whose coalesced changes are UI events
 //! and never wire bytes. MSH-21 derives bounded reverse-path hints from
 //! those directory observations and uses a fresh one to steer a Direct spray
-//! copy.
+//! copy. MSH-23 carries public channels as a bounded envelope inside signed
+//! Broadcast payloads: subscriptions stay local, relays keep no subscription
+//! state, and the channel key reuses MSH-10's bucket table and MSH-11's
+//! suppression.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -34,6 +37,7 @@
 #[cfg(feature = "adapter")]
 pub mod adapter;
 pub mod budget;
+pub mod channel;
 mod deliver;
 pub mod directory;
 pub mod engine;
@@ -58,6 +62,11 @@ pub mod telemetry;
 #[cfg(feature = "adapter")]
 pub use adapter::{AdapterEvent, NetworkAdapter};
 pub use budget::{BudgetConfig, BudgetOutcome, BudgetTracker, ClassRate};
+pub use channel::{
+    CHANNEL_HEADER_LEN, CHANNEL_ID_LEN, CHANNEL_MAGIC, CHANNEL_VERSION, ChannelBudgetScope,
+    ChannelConfig, ChannelEnvelope, ChannelError, ChannelId, ChannelRules, MAX_CHANNEL_NAME_LEN,
+    MAX_CHANNEL_SUBSCRIPTIONS, derive_channel_id,
+};
 pub use directory::{
     DirectoryChange, DirectoryConfig, DirectoryEntry, DirectoryError, DirectoryStats,
     NodeDirectory, NodeObservation,
@@ -78,6 +87,7 @@ pub use routehint::{RouteHint, RouteHintConfig, RouteHintMode, RouteHintTable};
 pub use seen::{Offer, SeenCache, SeenConfig};
 pub use sign::{
     RelayOutcome, VerifyError, derive_msg_id, sign_packet, verify_for_relay, verify_origin,
+    verify_origin_with_signing_pk,
 };
 pub use spray::{MAX_COPIES, SPRAY_MAGIC, SPRAY_VERSION, SprayConfig, SprayError, SprayTracker};
 pub use suppress::SuppressionConfig;

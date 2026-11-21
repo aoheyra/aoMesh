@@ -27,6 +27,18 @@ pub enum AdapterEvent {
         /// The opened application payload.
         payload: Vec<u8>,
     },
+    /// A signed public-channel Broadcast accepted for a local subscriber
+    /// (MSH-23). The engine verified the origin signature with the key from
+    /// the sender's signed hello and accepted the id in its replay guard;
+    /// the payload is the opaque envelope body, unmodified.
+    ChannelDeliver {
+        /// The channel the message was addressed to.
+        channel_id: crate::ChannelId,
+        /// Packet header, as received.
+        header: crate::Header,
+        /// Opaque application bytes from the envelope.
+        payload: Vec<u8>,
+    },
     /// Network admission failed; SendError retains the original payload.
     SendFailed {
         /// The refusing link.
@@ -239,6 +251,15 @@ impl<R: RngCore, T: Transport> NetworkAdapter<R, T> {
                 MeshOutput::Deliver { header, payload } => {
                     events.push(AdapterEvent::Deliver { header, payload })
                 }
+                MeshOutput::ChannelDeliver {
+                    channel_id,
+                    header,
+                    payload,
+                } => events.push(AdapterEvent::ChannelDeliver {
+                    channel_id,
+                    header,
+                    payload,
+                }),
                 MeshOutput::Purge { id } => events.push(AdapterEvent::Purge { id }),
                 MeshOutput::Delivered { id, origin, by } => {
                     events.push(AdapterEvent::Delivered { id, origin, by })

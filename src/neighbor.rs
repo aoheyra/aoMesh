@@ -6,6 +6,7 @@ use ao_network::{Hello, LinkId};
 use std::collections::BTreeMap;
 
 use crate::budget::BudgetConfig;
+use crate::channel::ChannelConfig;
 use crate::directory::DirectoryConfig;
 use crate::presence::PresenceConfig;
 use crate::receipt::ReceiptConfig;
@@ -45,6 +46,8 @@ pub struct MeshConfig {
     pub route_hint: RouteHintConfig,
     /// Telemetry freshness, hop limit, coalescing and throttle (MSH-22).
     pub telemetry: TelemetryConfig,
+    /// Bounds for local public-channel subscriptions (MSH-23).
+    pub channels: ChannelConfig,
 }
 
 impl Default for MeshConfig {
@@ -76,6 +79,7 @@ impl Default for MeshConfig {
             directory: DirectoryConfig::default(),
             route_hint: RouteHintConfig::default(),
             telemetry: TelemetryConfig::default(),
+            channels: ChannelConfig::default(),
         }
     }
 }
@@ -92,6 +96,12 @@ pub struct Neighbor {
     /// not decode, verify or negotiate: the link still counts traffic,
     /// but nothing may forward, deliver or budget on its behalf.
     pub node_id: Option<NodeId>,
+    /// Signing key proved by the same verified introduction (MSH-07).
+    ///
+    /// Retained so a recipient can authenticate a signed Broadcast, such
+    /// as a public-channel message, without a directory lookup. `None` on
+    /// a failed introduction, which may not forward or deliver.
+    pub signing_pk: Option<[u8; 32]>,
     /// Caller-supplied connection time in milliseconds.
     pub connected_at_ms: u64,
     /// Caller-supplied time of the latest received packet, if any.
@@ -152,7 +162,14 @@ impl NeighborTable {
     /// Records a transport-ready neighbour with the identity the engine
     /// verified, `None` for a rejected introduction. The caller has
     /// already checked [`Self::contains`] and [`Self::has_room`].
-    pub(crate) fn insert(&mut self, now: u64, link: LinkId, hello: Hello, node_id: Option<NodeId>) {
+    pub(crate) fn insert(
+        &mut self,
+        now: u64,
+        link: LinkId,
+        hello: Hello,
+        node_id: Option<NodeId>,
+        signing_pk: Option<[u8; 32]>,
+    ) {
         debug_assert!(self.has_room(), "insert past the neighbour bound");
         debug_assert!(!self.contains(link), "insert over a live link");
         self.entries.insert(
@@ -161,6 +178,7 @@ impl NeighborTable {
                 link,
                 remote_hello: hello,
                 node_id,
+                signing_pk,
                 connected_at_ms: now,
                 last_rx_ms: None,
                 received_bytes: 0,

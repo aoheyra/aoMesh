@@ -57,6 +57,7 @@ packet, hello or sync wire field changes. On the paired random-20 case
 unchanged at 230 and overhead at 23.0000, while additive uses 231
 transmissions and 23.1000. The line-20 control (seed `1297303584`) is identical
 in all modes.
+
 MSH-22 adds bounded latest-wins Telemetry. `SubmitTelemetry` frames an opaque
 payload with an application-owned kind and a monotonic sequence under the
 existing Telemetry class; the frame prefix is version, kind, `u64` sequence,
@@ -70,6 +71,29 @@ fixed slow-line seed `1297304023` shows eight bursts reduced to one in-flight
 frame plus one pending replacement at each receiver (six receptions, at most
 two sequences per node, sequence 8, 12 transmissions); the chatty seed
 `1297304029` accepts one of twelve attempts and emits no telemetry frame.
+
+MSH-23 adds bounded public channels over signed Broadcast packets. A channel is
+an 18-byte envelope (magic `0xC4`, version `1`, a 16-byte BLAKE3-128 id derived
+from a local name, then opaque app bytes) inside the existing payload; no
+header, class or signature domain changes. Subscriptions are local-only
+`MeshInput::ChannelSubscribe`/`ChannelUnsubscribe` state, so relays keep no
+subscription table. Channel traffic reuses MSH-10's bounded origin-bucket table
+through a domain-separated synthetic key and MSH-11's Broadcast suppression.
+A direct copy is authenticated with the key from the sender's signed hello and
+emitted as `MeshOutput::ChannelDeliver` / `AdapterEvent::ChannelDeliver` after
+the replay guard accepts it; relayed copies forward without local delivery.
+The fixed line-20 case with seed `1297304023` delivers one message to both
+in-range subscribers in twelve transmissions (3,048 bytes) inside the
+43,690-byte Broadcast burst. The row was remeasured after rebasing onto MSH-22:
+MSH-19's two-link suppression floor makes each line relay forward once,
+replacing the old two-transmission expectation from the pre-MSH-19 tree. No
+published MSH-27 threshold was lowered. Bounds, typed errors and the exact
+simulator row are in the README, ADR-0001 and `docs/protocol.md`.
+
+Breaking unreleased API additions: `MeshConfig` gained `channels`, `Neighbor`
+gained `signing_pk`, `NeighborTable::insert` takes that key, and the input,
+output, adapter-event and error enums gained channel variants. Exhaustive
+matches in `tests/forwarding.rs` and `tests/sim_budgets.rs` were updated.
 
 MSH-17 adds signed delivery receipts and bounded store immunity. An
 authenticated delivery emits a cap-gated receipt envelope carrying a signed
