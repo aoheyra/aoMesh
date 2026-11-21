@@ -514,3 +514,26 @@ frame and the newest pending replacement: six total receptions, at most two
 sequences at any node, maximum sequence 8, 12 transmissions. The chatty row
 (seed `1297304029`) accepts one of twelve attempts, emits no telemetry frame,
 and records no store copy. `tests/sim_telemetry.rs` locks both exact CSV rows.
+
+## MSH-23 public-channel parameters
+
+Channel messages remain in the Broadcast class; its existing byte budget and TTL
+are unchanged. The versioned body is negotiated by MeshHello bit 5. Names are
+hashed from exact UTF-8 bytes; subscriptions are local and never advertised.
+
+| Parameter | Default | Reason and evidence |
+| --- | --- | --- |
+| Local subscriptions | 64 | Explicit bounded UI membership |
+| Active origin/channel windows | 512 each | Bounded anti-spam state; full tables refuse new keys |
+| Recent channel ids | 4096 | Bounds local-delivery dedupe, including pending suppression |
+| Admission window | 60000 ms | Local relative time, independent of remote clock |
+| Messages/channel/window | 30 | Additional shared-channel spam ceiling |
+| Messages/origin/window | 10 | Shared across channels so channel rotation cannot bypass it |
+| Channel suppression threshold floor | 2 ingress links | Preserves the only onward path on a line |
+
+Fixed seeds 1297303587 and 1297303593 delivered to 2/2 and 9/9 subscribers,
+respectively. On the 20-node graph, suppression reduced sends from 32 to 25 at
+600 to 1700 ms maximum latency; the 5-node line used four sends in both modes.
+These light-load scenarios establish basic delivery under the limits, not optimal
+spam parameters. Tests exercise exhaustion and all memory caps. See
+[ADR-0006](0006-public-channels.md) for the versioned payload and complete metrics.

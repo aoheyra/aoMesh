@@ -211,6 +211,9 @@ fn assert_delivered_once(events: &[(usize, AdapterEvent)], dst: usize) {
             AdapterEvent::DirectoryChanged { .. } => {
                 panic!("unexpected directory event in a forwarding test: {event:?}")
             }
+            AdapterEvent::ChannelMessage { .. } => {
+                panic!("unexpected channel message in a Direct forwarding test: {event:?}")
+            }
             AdapterEvent::TelemetryAccepted { .. } => {
                 panic!("unexpected telemetry event in a forwarding test: {event:?}")
             }

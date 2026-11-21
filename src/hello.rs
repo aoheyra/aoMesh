@@ -62,7 +62,11 @@ pub const CAP_RECEIPT_V1: u32 = 1 << 3;
 /// Capability bit for MSH-19 signed presence announcements.
 pub const CAP_PRESENCE_V1: u32 = 1 << 4;
 /// Feature bits this build sets (ADR-0001).
-pub const CAPS: u32 = CAP_SYNC_V1 | CAP_SYNC_V2 | CAP_SPRAY_V1 | CAP_RECEIPT_V1 | CAP_PRESENCE_V1;
+/// Capability for versioned, authenticated public-channel Broadcast bodies.
+pub const CAP_CHANNEL_V1: u32 = 1 << 5;
+/// Feature bits advertised by this build.
+pub const CAPS: u32 =
+    CAP_CHANNEL_V1 | CAP_SYNC_V1 | CAP_SYNC_V2 | CAP_SPRAY_V1 | CAP_RECEIPT_V1 | CAP_PRESENCE_V1;
 
 /// Encoded length of a v1 hello: fixed, so a wrong length is rejected
 /// before anything is read (ADR-0004).

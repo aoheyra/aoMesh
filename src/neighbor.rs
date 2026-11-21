@@ -45,6 +45,8 @@ pub struct MeshConfig {
     pub route_hint: RouteHintConfig,
     /// Telemetry freshness, hop limit, coalescing and throttle (MSH-22).
     pub telemetry: TelemetryConfig,
+    /// Public-channel subscriptions and admission bounds (MSH-23).
+    pub channels: crate::channel::ChannelConfig,
 }
 
 impl Default for MeshConfig {
@@ -76,6 +78,7 @@ impl Default for MeshConfig {
             directory: DirectoryConfig::default(),
             route_hint: RouteHintConfig::default(),
             telemetry: TelemetryConfig::default(),
+            channels: crate::channel::ChannelConfig::default(),
         }
     }
 }

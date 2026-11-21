@@ -829,3 +829,12 @@ previous encounters plus local monotonic elapsed time determines expiry;
 remote timestamps are ignored. `expiry::age_at` carries consumed age between
 encounters with different local epochs. See [the expiry decision](docs/adr/lifetime-expiry.md)
 for the caller contract and restart/sync boundaries.
+
+### Public channels (MSH-23)
+
+Use `MeshInput::SubmitChannel` with a `ChannelId::from_name` and opaque plaintext.
+Subscribe locally through `engine.channels_mut().subscribe(id)`; the engine and
+adapter emit `ChannelMessage` only after end-to-end authentication. Relays do not
+need subscriptions. Messages are public and unencrypted. Capability bit 5 gates
+the versioned body, and per-channel/per-origin admission complements the existing
+Broadcast relay budget. See [the channel protocol, bounds and measured scenarios](docs/adr/0006-public-channels.md).
