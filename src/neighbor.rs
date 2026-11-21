@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use crate::budget::BudgetConfig;
 use crate::suppress::SuppressionConfig;
-use crate::sync::SummaryConfig;
+use crate::sync::{SummaryConfig, SyncConfig};
 
 /// Limits for engine-owned state. These do not enforce radio topology policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +24,8 @@ pub struct MeshConfig {
     pub suppression: SuppressionConfig,
     /// Store-summary debounce and discovery hint (MSH-13).
     pub summary: SummaryConfig,
+    /// Anti-entropy contact bounds and timeout (MSH-14).
+    pub sync: SyncConfig,
 }
 
 impl Default for MeshConfig {
@@ -47,6 +49,7 @@ impl Default for MeshConfig {
             budgets: BudgetConfig::default(),
             suppression: SuppressionConfig::default(),
             summary: SummaryConfig::default(),
+            sync: SyncConfig::default(),
         }
     }
 }

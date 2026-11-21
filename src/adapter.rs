@@ -33,6 +33,21 @@ pub enum AdapterEvent {
         /// Typed cause and original payload.
         error: SendError,
     },
+    /// The store owner must resolve these short ids to encoded packets and
+    /// feed them back with `MeshInput::SyncItems`.
+    SyncNeed {
+        /// The contact's link.
+        link: LinkId,
+        /// Prefixes the peer is missing.
+        prefixes: Vec<[u8; crate::sync::SHORT_ID_BYTES]>,
+    },
+    /// A peer's item is ready for the store owner to validate and insert.
+    SyncItem {
+        /// Full content address parsed from the packet.
+        id: crate::MessageId,
+        /// Complete encoded mesh packet.
+        wire: Vec<u8>,
+    },
 }
 
 /// Engine and facade owned together by one caller task.
@@ -114,6 +129,15 @@ impl<R: RngCore, T: Transport> NetworkAdapter<R, T> {
                     digest,
                     flags,
                 } => self.network.set_beacon(hint, digest, flags),
+                MeshOutput::ReleaseOpportunistic { link } => {
+                    self.network.release(network_now, link)
+                }
+                MeshOutput::SyncNeed { link, prefixes } => {
+                    events.push(AdapterEvent::SyncNeed { link, prefixes })
+                }
+                MeshOutput::SyncItem { id, wire } => {
+                    events.push(AdapterEvent::SyncItem { id, wire })
+                }
                 MeshOutput::Deliver { header, payload } => {
                     events.push(AdapterEvent::Deliver { header, payload })
                 }
