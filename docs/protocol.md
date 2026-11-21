@@ -40,8 +40,8 @@ Telemetry; the recipient always verifies a Direct packet addressed to it
 (`sign::verify_for_relay`, `sign::verify_origin`). MSH-04 ships the calls;
 MSH-09 runs the recipient's check for local delivery, and MSH-11 checks the
 content id of every flooded packet before adding it to suppression state.
-The remaining relay-side verification paths belong to the class-specific
-issues (MSH-19, MSH-22, MSH-23).
+MSH-19 verifies every Presence announcement at every hop; MSH-22 and MSH-23
+own the remaining class-specific paths.
 
 `msg_id` is a content address, in two domain-separated steps under
 `aoheyra/mesh/v1/msg-id`:
@@ -138,6 +138,12 @@ MeshHello rejections report `hello::HelloError`: `Truncated`,
 aoIdents reports it), `NodeIdMismatch`, `IncompatibleProto`. Each has a
 test that triggers it.
 
+Presence announcement work reports `presence::PresenceError`: `BadLength`,
+`BadMagic`, `BadVersion`, `BadClass`, `MsgIdMismatch`, `BadBinding`,
+`OriginMismatch`, `TooManyKnownCards`, `Signing` and `Packet`. Packet-driven
+failures are dropped and attributed to the sending link, not returned as a
+`MeshError`; only host-supplied state or local signing reaches the caller.
+
 ## Engine integration (MSH-06, MSH-08)
 
 The wire layout is unchanged. Submit validates the payload/header agreement,
@@ -230,21 +236,119 @@ deadline. The node counts **distinct sending links**, so retransmissions from
 one neighbour are only one copy.
 
 A seeded assessment delay shrinks as the verified neighbour degree grows.
-Before the deadline the node sends nothing. If the seeded copy threshold is
-reached from different links, the pending entry is cancelled and the
-seen-cache records the id: the mesh has already given this node enough
-chances to hear the content, and this node adds no duplicate. If the timer
+Before the deadline the node sends nothing. The effective threshold is the
+seeded degree-scaled value floored at two distinct links: one copy proves only
+that this node heard the packet, and cancelling on it extinguished floods on
+degree-one paths. If the effective threshold is reached from different links,
+the pending entry is cancelled and the seen-cache records the id: the mesh has
+already given this node enough chances to hear the content, and this node adds
+no duplicate. If the timer
 wins, the node re-encodes the packet with `ttl` capped at the class value,
 decrements `ttl` once, increments `hops`, records the id and sends one copy
 to every verified neighbour except the links already counted. The configured
 threshold is fractional for most degrees; the seeded rounding draw keeps its
 expected value exact without making the engine non-deterministic.
 
-`Direct` keeps the MSH-08 path unchanged, `Telemetry` is dropped as before,
-and locally submitted packets are clamped to their ADR-0001 class TTL before
-signing. `SuppressionConfig::enabled` is a simulator ablation switch only.
-The pending table never holds payload bytes borrowed from a neighbour: the
-relay bytes are encoded once when the first copy arrives.
+`Direct` keeps the MSH-08 path unchanged, and locally submitted packets are
+clamped to their ADR-0001 class TTL before signing. Telemetry has its own
+latest-wins path below and never enters the suppression table.
+`SuppressionConfig::enabled` is a simulator ablation switch only. The pending
+table never holds payload bytes borrowed from a neighbour: the relay bytes are
+encoded once when the first copy arrives.
+
+## Telemetry latest-wins (MSH-22)
+
+Telemetry reuses class 4 and the `aoheyra/mesh/v1/packet` signature domain; no
+header field, class id or capability bit changes. Older nodes already dropped
+this class, and a node that understands the frame accepts it without a new
+negotiation. The payload begins with a fixed ten-byte prefix:
+
+| Offset | Bytes | Field | Meaning |
+|---|---|---|---|
+| 0 | 1 | `version` | `1`; another value is an attributable malformed frame |
+| 1 | 1 | `kind` | Opaque application stream tag; aoMesh does not interpret it |
+| 2..10 | 8 | `seq` | Sender-monotonic big-endian sequence |
+| 10.. | remainder | payload | Opaque bytes, unchanged by the mesh |
+
+`MeshInput::SubmitTelemetry` frames and signs this payload and returns
+`TelemetrySend` or `TelemetryBroadcast` with a typed `TelemetryAdvisory`. The
+advisory's coalescing key is BLAKE3 over
+`aoheyra/mesh/v1/telemetry/coalesce || origin(16) || kind(1)`, truncated to
+16 bytes; `seq` is excluded so a newer value replaces an older waiting frame.
+`NetworkAdapter` maps the advisory to aoNetwork's `SendOpts { coalesce_key,
+expires_at }` using `Network::send_opts`. It never queues in the core and never
+invents a network API.
+
+Relays first check the content address and frame prefix. A malformed frame or
+content mismatch is charged to the sending neighbour as invalid traffic.
+Freshness and rate policy run before the relay budget: a sender declaring
+zero lifetime, a sequence not newer than the last accepted one, an origin
+inside its 10 s cap, or a packet with no relay hop left is a silent drop with
+no budget debit, no penalty and no dedupe record. Remote `created_ms` is
+ignored; only local monotonic `now` drives expiry, eviction and throttling, so
+skewed device clocks cannot buy freshness. The effective window is
+`min(sender lifetime, 30 s)`.
+
+Telemetry is ambient state, not a message: it is never offered to `SyncItem`,
+the store, or the receipt tracker. Per-`(origin, kind)` freshness and
+per-origin rate state are bounded by `TelemetryConfig::max_entries` (default
+512); full state evicts by earliest local expiry, then key order. The relay
+caps `ttl` at the Telemetry class limit, decrements it and increments `hops`
+outside the signed prefix, exactly like other classes, and refuses a packet
+that has already spent the configured radius.
+
+## Presence announcements (MSH-19)
+
+No packet class, header field or signature domain changes. A presence
+announcement is an ordinary signed `PacketClass::Presence` packet with no
+`dst`, TTL clamped by `SuppressionConfig::presence_ttl` (3), and a fixed
+150-byte payload:
+
+| Offset | Size | Field | Notes |
+|---|---:|---|---|
+| 0 | 1 | Magic | `0x56` |
+| 1 | 1 | Version | `1` |
+| 2 | 8 | `card_hash` | Opaque eight-byte identity-card announcement hash |
+| 10 | 4 | `caps` | Capability bits, big endian |
+| 14 | 8 | `seq` | Monotonic per origin, big endian |
+| 22 | 32 | `signing_pk` | Origin Ed25519 verification key |
+| 54 | 32 | `agreement_pk` | Origin X25519 agreement key |
+| 86 | 64 | `binding` | aoIdents agreement-key binding signature |
+
+The decoder checks the exact length, magic and version before reading any
+field. The two keys and binding are the origin's `PublicIdentity`, already
+defined by aoIdents; the mesh carries them so every relay can authenticate the
+body without a directory or key store. Verification re-derives `msg_id`, calls
+`PublicIdentity::verify_binding`, derives `origin` with `compute_node_id`, and
+checks the packet signature under the existing `aoheyra/mesh/v1/packet`
+domain. A changed `ttl` or `hops` keeps the signature valid; a changed
+immutable field, card hash, capability bit or sequence does not. A body that
+fails any check is attributable invalid traffic and increments the sending
+link's penalty.
+
+`MeshHello` advertises `CAP_PRESENCE_V1` (`1 << 4`) in its existing `caps`
+field. An announcement is emitted and accepted only on links whose negotiated
+capabilities include the bit. A capability peer without it never receives
+announcement bytes and follows the pre-MSH-19 Presence relay path; the new
+body is an additive wire change, not a version bump.
+
+The host supplies the borrowed `Identity` and an eight-byte card hash on each
+`MeshInput::Tick`, and declares hashes it can resolve through
+`MeshInput::KnownCards`. The engine keeps only a sequence number, a typed
+trickle deadline and bounded learned entries; the host receives
+`MeshOutput::CardFetch { node_id, card_hash }` once per unknown hash until it
+declares that hash. Learned entries are latest-wins: a higher `seq` replaces
+an older one, and equal sequences use the full carried body as a
+deterministic tie-break. Entries expire after `PresenceConfig::lifetime_s`
+using local monotonic time, never a remote clock. The tracker holds at most
+`max_entries` learned nodes and `max_known_cards` declared hashes.
+
+A change sets a quick deadline carrying the facts it was scheduled for, so
+repeated ticks while it is pending cannot postpone the first announcement.
+After emission, quiet refreshes double from `base_interval_ms` to
+`steady_interval_ms`. Duplicate announcements are stopped by the MSH-05
+seen-cache; fresh ones use MSH-11's suppression with Presence TTL 3 and are
+sent only to capability links.
 
 ## Store summary and beacon digest (MSH-13)
 
@@ -352,6 +456,176 @@ carry the same count in `SprayItem`, so a stored copy received through
 MSH-14/15 can continue spraying on a later contact. The host persists the count
 as `StoreMetadata::copies_left`; the engine keeps at most 4096 live tickets.
 
+## Reverse-path route hints (MSH-21)
+
+No packet, hello or sync wire field changes. A hint is local routing advice:
+"the freshest observation for destination D arrived from verified neighbour N,
+H hops away". It is not signed, is never sent to a peer and never authenticates
+a packet. It is derived exclusively from MSH-20 directory observations:
+verified MSH-19 announcements feed them, and host facts use
+`MeshInput::ObserveNode`. A fact is retained as a hint only while its via-node
+names a verified neighbour. The source accepts no peer-supplied timestamp:
+expiry uses only local `now`, and a backwards local clock is clamped to the
+table's clock floor so neither skew nor replay can extend freshness. The
+simulator injects BFS-derived directory facts every five seconds, including in
+the hint-off control rows.
+
+Observations from links that are down or lack a verified identity are ignored,
+as are zero-hop or over-ceiling hop counts. Hints rank by `(hops ascending,
+seq descending, LinkId ascending)`; an equal-rank observation never refreshes
+the winner's expiry. The table holds at most `RouteHintConfig::max_entries`
+destinations, evicting the earliest expiry then the lowest `NodeId`. `Tick`
+expires hints and `LinkDown` removes every hint that link supplied, so a stale
+or vanished path cannot survive.
+
+With `RouteHintMode::SubstituteCopy` (the measured default) a fresh hint takes
+the place of one ordinary spray recipient: the engine sends one one-ticket
+copy along the hint and omits one other recipient, so neither the transmission
+count nor the remaining-ticket accounting grows. `AdditiveUnicast` sent one
+extra send and was rejected by the paired report. `Off` records nothing and
+leaves every forwarding decision unchanged. Config defaults are 1024 entries,
+300,000 ms lifetime, an eight-hop ceiling and `SubstituteCopy`; the measured
+rows and seeds are in the MSH-21 section of the README.
+
+## Signed delivery receipts (MSH-17)
+
+`MeshHello` adds `CAP_RECEIPT_V1` (`1 << 3`). The packet header, signature
+coverage and class set do not change. A successful authenticated delivery emits
+a control envelope on the Message channel with this fixed header:
+
+| Bytes | Field |
+|---|---|
+| 1 | Magic `0x55` |
+| 1 | Version `1` |
+| 1 | Tag `1` (Ack) |
+| 1 | Flags, currently zero |
+| 2 | Little-endian encoded original-header length |
+| 2 | Little-endian encoded acknowledgement-packet length |
+| 32 | Destination signing public key |
+| 32 | Destination agreement public key |
+| 64 | Agreement-key binding signature |
+
+The variable part is the original encoded header (including hop-mutable
+`ttl`/`hops`), a 32-byte payload hash in the same domain as `msg_id`, and the
+complete encoded acknowledgement packet. The acknowledgement is an ordinary
+Direct packet addressed to the original origin whose payload is the original
+`MessageId`, signed under the registered `aoheyra/mesh/v1/packet` domain. The
+decoder reads both lengths before allocating, rejects unknown versions, tags,
+non-zero flags, bad lengths and trailing bytes, and parses the original header
+before any signature work.
+
+Verification is self-contained: `verify_binding` and `compute_node_id` prove the
+attached public identity owns the original destination; re-deriving the id from
+the original header and payload hash proves the acknowledged id belongs to that
+destination; `verify_origin` checks the acknowledgement under the existing
+packet domain. No key directory and no new crypto domain are required. A stray
+receipt on a link without the capability, or one that fails verification, is
+attributable invalid traffic and feeds the neighbour penalty.
+
+An accepted receipt produces `MeshOutput::Purge { id }` for the host store and
+`MeshOutput::Delivered { id, origin, by }` at the origin. It also inserts a
+bounded immunity entry (512 ids, 300 seconds, 16 frames per contact burst).
+Immune ids are never relayed, re-stored or served from sync. This is distinct
+from aoIdents' recipient-side replay guard and from the engine's forwarding
+dedupe cache.
+
+## NodeDirectory (MSH-20)
+
+There is no new wire format. MSH-19's presence announcements will be verified
+elsewhere and handed to the engine as a typed `NodeObservation`: node id,
+card hash, caps, per-origin `seq`, estimated hop distance, via-node,
+observation time and opaque bounded location bytes. The directory does not
+fetch cards or interpret location. It is an ephemeral local view, not a
+persisted store, and it emits no packets.
+
+Each entry keeps the last observation time, local receipt time, expiry
+instant, hop distance, via-node, caps, `seq`, card hash and optional location.
+The default bounds are 256 entries, 30 minutes of relative freshness, 64
+opaque location bytes and 64 pending UI events (ADR-0001). A full directory
+evicts the least-recently-seen entry; expiry starts at local receipt time, and
+a high-water-mark clock makes a backwards `now` inert. A peer-supplied
+observation time is clamped to that clock for ordering only and cannot change
+the expiry instant.
+
+An observation with a lower `seq` than the stored entry is ignored. A repeat
+at the same or a newer `seq` refreshes local freshness and LRU position, but
+emits an `Updated` event only when a visible field changes. Queries by id,
+hop-distance range and recency are deterministic, bounded and read-only.
+Changes reach the host as `MeshOutput::DirectoryChanged` /
+`AdapterEvent::DirectoryChanged` with at most one coalesced event per node;
+the UI queries the directory for details instead of receiving payloads.
+
+## Public channels (MSH-23)
+
+A public channel is an envelope inside the opaque payload of a normal signed
+`Broadcast` packet. The packet header, signature coverage, class set and
+`msg_id` derivation are unchanged, and legacy peers can relay the bytes without
+understanding them.
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 1 | Magic `0xC4` |
+| 1 | 1 | Version `1` |
+| 2 | 16 | Channel id |
+| 18 | .. | Opaque application bytes |
+
+The 18-byte header is parsed before any application bytes are read. The total
+envelope must fit the existing 2048-byte packet payload cap. Magic `0xC4` is
+reserved: a Broadcast payload that starts with it but cannot decode as a v1
+envelope is attributable invalid traffic and feeds the neighbour penalty.
+Payloads with any other first byte remain ordinary Broadcast data.
+
+The channel id is derived locally from a bounded name:
+
+```
+id = BLAKE3("aoheyra/mesh/v1/channel-id" || len(name) || 0x01 || name)[..16]
+```
+
+The one-byte length and form tag avoid ambiguity between names and other
+domain-separated hashes. The name is never encoded on the wire. A 128-bit digest
+can collide in principle, so the local registry binds each id to the name that
+claimed it and returns `ChannelError::IdCollision` if a different name claims
+the same id. This is a local host-state check, not a wire field.
+
+For the existing MSH-10 bucket table, the synthetic budget key is:
+
+```
+key = BLAKE3("aoheyra/mesh/v1/channel-budget" || 16 || id)[..16]
+```
+
+It is a bucket index, never a node identity. The extra domain prevents a real
+`NodeId` and a channel id from being interchangeable. A submission or relay
+debited for the Broadcast class pays both the claimed origin and this channel
+key, in addition to the normal per-link bucket on receive. This reuses the same
+bounded table and class rates; it is not a second limiter.
+
+Verification is unchanged: the origin signature covers the immutable header,
+and `msg_id` binds the envelope bytes, under `aoheyra/mesh/v1/packet` and
+`aoheyra/mesh/v1/msg-id` respectively. A subscriber verifies a direct copy with
+the `signing_pk` proved by the sending link's signed `MeshHello`, then runs the
+recipient replay guard before `MeshOutput::ChannelDeliver` is emitted with the
+opaque bytes after byte 18. A relayed copy is forwarded but not delivered
+locally: the directory's typed observations do not carry a signing key proved
+under the packet domain, so no signature check is relaxed. No new hello
+capability bit is required because old peers already treat the payload as
+opaque Broadcast bytes.
+## Restart snapshot bytes (MSH-29)
+
+MSH-29 defines a local host-owned snapshot, not a radio or peer protocol wire
+format. `MeshEngine::snapshot()` writes magic `AMSH`, a one-byte version
+(`SNAPSHOT_VERSION = 1`), four little-endian section counts, then
+BTreeMap-ordered sections for seen entries, seen eviction order, receipt
+immunity and spray tickets. Every integer is little-endian; receipt wires are
+stored verbatim and revalidated with the frame decoder on restore.
+
+The host stores the bytes, rebuilds the engine with the same config and RNG
+seed, calls `restore`, and re-announces live links with `MeshInput::LinkUp`.
+Link capabilities, config, clock and stored packets are deliberately not in the
+snapshot. `MAX_SNAPSHOT_LEN` is 4 MiB; bad magic, wrong version, oversized or
+truncated input, trailing bytes, count/bound mismatches, duplicate entries and
+invalid receipt wires produce a typed `SnapshotError` before any state changes.
+No packet header or sync frame changes, so this needs no hello capability bit.
+
 ## Simulation evidence (MSH-27)
 
 No wire format changes. Feature `sim` drives the codec and engine over aoNetwork's
@@ -370,3 +644,63 @@ MSH-12 stores encoded packets unchanged. Local copies_left, priority,
 first_seen, received_at, consumed age, size and ingress node are not wire
 fields. Expiry compares relative age against lifetime, never remote wall time.
 See [MessageStore](adr/message-store.md) for quotas and deterministic eviction.
+
+## Lifetime ceilings and relative age
+
+MSH-18 computes effective lifetime as the smaller of the sender's lifetime_s
+and the configured class ceiling. Local age at receipt and elapsed monotonic
+time decide expiry; created_ms is never compared with a local clock. Store
+policy does not modify encoded bytes or add a wire age field. Sync callers
+must carry consumed age separately and account for known transfer delay.
+See [lifetime policy](adr/lifetime-expiry.md).
+
+## Resource bounds and typed rejections (MSH-28)
+
+No wire field changes. Every decoder reads a fixed header or declared length
+before allocating, and every host-supplied slice is bounded before it can grow
+engine state:
+
+| Input | Bound | Rejection before work |
+|---|---:|---|
+| Packet header | 10-byte canonical varints, `payload_len <= 2048` | `PacketError` while parsing the header; no payload is read |
+| Store summary ids | 1024 entries | `StoreSummary::from_ids` reads only the cap; duplicates and order do not matter |
+| Sync frame body | 8198 bytes (`6 + 1024 * 8`) | `SyncError::FrameTooLarge(usize)` / `SyncV2Error::FrameTooLarge(usize)` before a slice is copied |
+| Sync summary count | 1024 entries | `TooManyEntries` before constructing the id vector; body length must match the count exactly |
+| Sync offers per input | 1024 | `SyncTracker::on_offers` iterates only the cap |
+
+v1 summaries keep their historical `TooManyEntries` rejection even when the
+declared length exceeds the general body cap, so earlier behaviour and tests
+are preserved. Every other v1 tag and every v2 tag rejects an oversized body
+before copying it into an `Item`, `SprayItem`, range list or id list. The public
+`SyncFrame::decode` and `SyncFrameV2::decode` return typed `SyncError` and
+`SyncV2Error` values, both implementing `Display` and `std::error::Error`.
+
+A delivery-path `debug_assert_eq!` that hostile input could reach in debug
+builds was replaced by a checked outcome; a rejection is still recorded, but a
+malformed packet cannot panic the process. `tests/resource_bounds.rs` pins
+allocation and CPU-proxy ceilings for decoders, summary streams, hostile engine
+Data streams and store quotas. The `fuzz/` crate adds `libFuzzer` targets for
+packet decoding, engine input streams and sync frames; nightly CI runs each for
+one hour with a 16 KiB maximum input, a 2048 MiB RSS limit and a 10-second
+per-input timeout. No one-hour campaign is part of local verification.
+## Diagnostics snapshot (MSH-30)
+
+`MeshSnapshot` is host-local plain data, not a wire message. Its `version`
+field selects the field layout; version 1 carries saturating `u64` counters for
+duplicate forwarding verdicts, cancelled flood relays, encoded sync bytes sent
+and received, and positive neighbour penalty applications. It also carries
+`u32` gauges for live store ids, current penalty totals/maxima and counts,
+seen-cache records and pending suppression windows. Store occupancy is the
+count from the latest `MeshInput::StoreSummary`: the engine owns no store and
+never invents a byte count.
+
+The counters live in the module that makes the decision, so a snapshot cannot
+disagree with routing state. Malformed or unverified frames are penalties, not
+sync bytes; zero-amount decay probes are not penalty events. All values are
+deterministic for a fixed input stream and hostile traffic can only saturate a
+counter, never grow a map. No field contains packet content, message ids, keys,
+identities or personal data. `MeshEngine::observability_snapshot` and
+`NetworkAdapter::snapshot` expose the same value without I/O or allocation, so
+aoheyra can map it directly into its APP-15 diagnostics bundle. Adding or
+changing a field is a snapshot schema change and bumps `MESH_SNAPSHOT_VERSION`;
+it does not change packet, sync or beacon bytes.

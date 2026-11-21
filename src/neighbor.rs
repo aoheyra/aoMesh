@@ -6,15 +6,26 @@ use ao_network::{Hello, LinkId};
 use std::collections::BTreeMap;
 
 use crate::budget::BudgetConfig;
+use crate::channel::ChannelConfig;
+use crate::directory::DirectoryConfig;
+use crate::presence::PresenceConfig;
+use crate::receipt::ReceiptConfig;
+use crate::routehint::RouteHintConfig;
+use crate::seen::SeenConfig;
 use crate::spray::SprayConfig;
 use crate::suppress::SuppressionConfig;
 use crate::sync::{SummaryConfig, SyncConfig};
+use crate::telemetry::TelemetryConfig;
 
 /// Limits for engine-owned state. These do not enforce radio topology policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MeshConfig {
     /// Maximum neighbour entries; zero refuses every new link.
     pub max_neighbors: usize,
+    /// Bounds and class windows for forwarding dedupe (MSH-05, ADR-0003).
+    /// The engine creates its one [`crate::SeenCache`] from these limits, so
+    /// the snapshot's `seen_records` gauge has a tested, configurable bound.
+    pub seen: SeenConfig,
     /// Replay acceptance at delivery (MSH-09): the per-sender
     /// message-id window, the timestamp tolerance and the sender cap
     /// for [`ao_idents::ReplayGuard`].
@@ -29,10 +40,24 @@ pub struct MeshConfig {
     pub sync: SyncConfig,
     /// Binary spray-and-wait policy for Direct traffic (MSH-16).
     pub spray: SprayConfig,
+    /// Signed receipts and bounded immunity policy (MSH-17).
+    pub receipt: ReceiptConfig,
+    /// Bounded presence announcements and trickle timing (MSH-19).
+    pub presence: PresenceConfig,
+    /// Bounded mesh-wide directory capacity, staleness and event limits
+    /// (MSH-20).
+    pub directory: DirectoryConfig,
+    /// Reverse-path hint table and Direct forwarding mode (MSH-21).
+    pub route_hint: RouteHintConfig,
+    /// Telemetry freshness, hop limit, coalescing and throttle (MSH-22).
+    pub telemetry: TelemetryConfig,
+    /// Bounds for local public-channel subscriptions (MSH-23).
+    pub channels: ChannelConfig,
 }
 
 impl Default for MeshConfig {
-    /// The documented bounds: 32 neighbours; 1024 message ids per
+    /// The documented bounds: 32 neighbours, 4096 seen-cache recordings
+    /// (ADR-0003); 1024 message ids per
     /// sender for 24 h across 64 senders. The tolerance is ADR-0001's
     /// Direct lifetime, so a message carried for a full day still
     /// opens at its recipient instead of reading stale; the window
@@ -43,10 +68,12 @@ impl Default for MeshConfig {
     /// keep far out of reach in normal use). The budget defaults are
     /// ADR-0001's class rates (MSH-10), suppression defaults are its
     /// per-class TTLs plus the measured 50-node sweep (MSH-11), and the
-    /// store beacon waits 200 ms after a change (MSH-13).
+    /// store beacon waits 200 ms after a change (MSH-13), and the directory
+    /// holds 256 nodes for 30 minutes with a 64-event UI queue (MSH-20).
     fn default() -> Self {
         Self {
             max_neighbors: 32,
+            seen: SeenConfig::default(),
             replay: ReplayConfig::new(1_024, 86_400_000, 64)
                 .expect("the documented defaults are within aoIdents' bounds"),
             budgets: BudgetConfig::default(),
@@ -54,6 +81,12 @@ impl Default for MeshConfig {
             summary: SummaryConfig::default(),
             sync: SyncConfig::default(),
             spray: SprayConfig::default(),
+            receipt: ReceiptConfig::default(),
+            presence: PresenceConfig::default(),
+            directory: DirectoryConfig::default(),
+            route_hint: RouteHintConfig::default(),
+            telemetry: TelemetryConfig::default(),
+            channels: ChannelConfig::default(),
         }
     }
 }
@@ -70,6 +103,12 @@ pub struct Neighbor {
     /// not decode, verify or negotiate: the link still counts traffic,
     /// but nothing may forward, deliver or budget on its behalf.
     pub node_id: Option<NodeId>,
+    /// Signing key proved by the same verified introduction (MSH-07).
+    ///
+    /// Retained so a recipient can authenticate a signed Broadcast, such
+    /// as a public-channel message, without a directory lookup. `None` on
+    /// a failed introduction, which may not forward or deliver.
+    pub signing_pk: Option<[u8; 32]>,
     /// Caller-supplied connection time in milliseconds.
     pub connected_at_ms: u64,
     /// Caller-supplied time of the latest received packet, if any.
@@ -130,7 +169,14 @@ impl NeighborTable {
     /// Records a transport-ready neighbour with the identity the engine
     /// verified, `None` for a rejected introduction. The caller has
     /// already checked [`Self::contains`] and [`Self::has_room`].
-    pub(crate) fn insert(&mut self, now: u64, link: LinkId, hello: Hello, node_id: Option<NodeId>) {
+    pub(crate) fn insert(
+        &mut self,
+        now: u64,
+        link: LinkId,
+        hello: Hello,
+        node_id: Option<NodeId>,
+        signing_pk: Option<[u8; 32]>,
+    ) {
         debug_assert!(self.has_room(), "insert past the neighbour bound");
         debug_assert!(!self.contains(link), "insert over a live link");
         self.entries.insert(
@@ -139,6 +185,7 @@ impl NeighborTable {
                 link,
                 remote_hello: hello,
                 node_id,
+                signing_pk,
                 connected_at_ms: now,
                 last_rx_ms: None,
                 received_bytes: 0,

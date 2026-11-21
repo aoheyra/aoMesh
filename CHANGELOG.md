@@ -7,6 +7,136 @@ change without notice until v0.1.0, and consumers pin by git tag
 
 ## Unreleased
 
+MSH-19 adds bounded presence announcements. An ordinary signed `Presence`
+packet carries a fixed 150-byte body with the origin's card hash, capabilities,
+sequence and existing public identity, so every relay can verify the binding
+and signature without storing keys or consulting a directory. `MeshHello`
+advertises `CAP_PRESENCE_V1` (`1 << 4`); legacy peers keep the previous Presence
+relay path. Trickle timing, latest-wins ordering, bounded learned entries and
+one-shot `CardFetch` host events are implemented in the new `presence` module.
+The fixed 50-node report on seed `1297304021` learns 49 of 49 peers in 50 ms,
+emits no card fetches, and uses 15,480 B/h per source at steady state against
+the 64 KiB/h budget. The one-copy cancellation in MSH-11 suppression is also
+fixed at the algorithm level: the effective threshold is floored at two
+distinct sending links for every flooded class, with a unit regression. The
+MSH-17 enabled 200-node report consequently sends 27,926 instead of 27,958
+packets on seed `1297303752`; delivery, receipts, purges and purge latency are
+unchanged.
+
+Breaking unreleased API change: `MeshInput::Tick` now takes a borrowed
+`Identity` and an eight-byte card hash. New host seams are
+`MeshInput::KnownCards` and `MeshOutput::CardFetch` (surfaced by the adapter as
+`AdapterEvent::CardFetch`); `poll_event` and `next_event` signatures are
+unchanged. `MeshConfig` gains a `presence: PresenceConfig` field and
+`MeshEngine::presence()` exposes read-only learned state.
+MSH-20 adds a bounded, ephemeral `NodeDirectory` fed by a typed presence
+observation seam. Entries carry the last seen time, local expiry, hop
+distance, via-node, caps, sequence, card hash and opaque bounded location
+bytes. Capacity evicts least-recently-seen nodes, relative-time expiry ignores
+backwards and skewed clocks, and queries by id, vicinity and recency are
+bounded and deterministic. UI changes arrive as coalesced
+`DirectoryChanged` events with one pending entry per node. The engine remains
+sans-IO and no wire format changes. Verified MSH-19 announcements now feed the
+directory with their origin, card hash, caps, sequence, hop count and
+ingress neighbour. The fixed seed `1297304021` scenario peaks at
+the four-entry cap, expires all 24 timed-out entries and ends with zero live
+entries.
+
+MSH-21 adds bounded reverse-path route hints for Direct traffic, derived from
+MSH-20 directory observations: verified presence announcements feed them
+automatically and host facts use `MeshInput::ObserveNode`. No peer time is
+accepted, a backwards local clock is clamped to the table's floor, and
+observations whose via-node has no verified link are ignored. The bounded table
+ranks by hops, presence sequence and link id, expires on `Tick` and drops
+entries on `LinkDown`. The measured default `SubstituteCopy` makes a fresh hint
+one of the existing spray copies instead of adding a send; `AdditiveUnicast` is
+retained as a rejected option and `Off` keeps every published row unchanged. No
+packet, hello or sync wire field changes. On the paired random-20 case
+(seed `1297303632`) substitution cuts fresh-path mean latency from 356 ms to
+337 ms and overall mean latency from 360 ms to 345 ms with transmissions
+unchanged at 230 and overhead at 23.0000, while additive uses 231
+transmissions and 23.1000. The line-20 control (seed `1297303584`) is identical
+in all modes.
+
+MSH-22 adds bounded latest-wins Telemetry. `SubmitTelemetry` frames an opaque
+payload with an application-owned kind and a monotonic sequence under the
+existing Telemetry class; the frame prefix is version, kind, `u64` sequence,
+then opaque bytes. `TelemetrySend`/`TelemetryBroadcast` carry a typed advisory
+whose stable `(origin, kind)` coalescing key and local deadline the adapter
+passes to aoNetwork's `SendOpts` and `Network::send_opts`. Relays check the
+frame and apply 30 s freshness, a one-per-origin/10 s cap and a three-hop limit
+before spending a relay budget; malformed frames alone are penalised. Telemetry
+is never stored or synced, and its bounded tracker uses local time only. The
+fixed slow-line seed `1297304023` shows eight bursts reduced to one in-flight
+frame plus one pending replacement at each receiver (six receptions, at most
+two sequences per node, sequence 8, 12 transmissions); the chatty seed
+`1297304029` accepts one of twelve attempts and emits no telemetry frame.
+
+MSH-23 adds bounded public channels over signed Broadcast packets. A channel is
+an 18-byte envelope (magic `0xC4`, version `1`, a 16-byte BLAKE3-128 id derived
+from a local name, then opaque app bytes) inside the existing payload; no
+header, class or signature domain changes. Subscriptions are local-only
+`MeshInput::ChannelSubscribe`/`ChannelUnsubscribe` state, so relays keep no
+subscription table. Channel traffic reuses MSH-10's bounded origin-bucket table
+through a domain-separated synthetic key and MSH-11's Broadcast suppression.
+A direct copy is authenticated with the key from the sender's signed hello and
+emitted as `MeshOutput::ChannelDeliver` / `AdapterEvent::ChannelDeliver` after
+the replay guard accepts it; relayed copies forward without local delivery.
+The fixed line-20 case with seed `1297304023` delivers one message to both
+in-range subscribers in twelve transmissions (3,048 bytes) inside the
+43,690-byte Broadcast burst. The row was remeasured after rebasing onto MSH-22:
+MSH-19's two-link suppression floor makes each line relay forward once,
+replacing the old two-transmission expectation from the pre-MSH-19 tree. No
+published MSH-27 threshold was lowered. Bounds, typed errors and the exact
+simulator row are in the README, ADR-0001 and `docs/protocol.md`.
+
+Breaking unreleased API additions: `MeshConfig` gained `channels`, `Neighbor`
+gained `signing_pk`, `NeighborTable::insert` takes that key, and the input,
+output, adapter-event and error enums gained channel variants. Exhaustive
+matches in `tests/forwarding.rs` and `tests/sim_budgets.rs` were updated.
+MSH-28 adds deterministic resource bounds and fuzz targets for hostile input.
+Packet decoding remains allocation-free; sync frame bodies are capped at 8198
+bytes before copying, summary construction and `SyncItems` handling read at
+most 1024 entries, and a reachable delivery-path debug assertion was removed.
+`SyncFrame::decode`, `SyncFrameV2::decode`, `SyncError` and `SyncV2Error` are
+public with typed `FrameTooLarge(usize)` rejections. New `fuzz/` targets cover
+packet decoding, engine input streams and sync frames; nightly CI runs each for
+one hour with a 16 KiB input cap, 2048 MiB RSS limit and 10-second timeout.
+`tests/resource_bounds.rs` pins allocation and CPU-proxy ceilings with a
+counting allocator. The separate fuzz crate uses dev-only `libfuzzer-sys` and
+`rand`; core dependencies and the sans-IO boundary are unchanged.
+MSH-29 adds versioned restart snapshots through the `Snapshot` trait on
+`MeshEngine`. A host stores the bytes and restores them into a fresh engine with
+the same config and RNG seed; seen-cache entries and eviction order, receipt
+immunity and spray copy counters survive, while store content, clock, config and
+link capabilities stay host-owned. The format is bounded at 4 MiB, typed errors
+reject malformed or version-mismatched bytes atomically, and the fixed-seed
+line-20 report shows 14 post-restart re-relays without restore against zero with
+restore, with delivery unchanged at 20/20.
+MSH-30 adds bounded observability. `MeshSnapshot` exposes saturating counters
+for duplicate packets, suppressed relays, encoded sync bytes and neighbour
+penalty events, plus gauges derived from existing bounded state for store ids,
+current penalties, seen records and pending suppression windows. The snapshot
+is versioned plain integer data with no packet content, ids, keys or personal
+data, and `MeshEngine::observability_snapshot` / `NetworkAdapter::snapshot` read it without
+allocation, I/O or a second source of truth. `MeshConfig` gains a `seen` field
+so the seen-record gauge has the same documented 4096-entry bound as the cache.
+The fixed mixed 20-node scenario with seed `1297304021` reports 323 duplicates,
+120 suppressed relays, 88 store ids, 820 sync bytes in each direction and four
+penalty events from injected malformed frames. These values were remeasured on
+the accumulated MSH-19 stack after the two-distinct-link suppression floor
+changed which relays cancel a flood; no wire format or MSH-27 threshold
+changed. The host maps this snapshot into aoheyra's APP-15 bundle.
+
+MSH-17 adds signed delivery receipts and bounded store immunity. An
+authenticated delivery emits a cap-gated receipt envelope carrying a signed
+Direct acknowledgement, the destination's public identity and the original
+header/hash, so any relay can prove the acker without a directory. Accepted
+receipts purge host-store copies, stop spray and sync of the id, and report
+`Delivered` to the origin. The fixed-seed report purges all 206 line-20 copies
+in 1,550 ms and all 1,341 scripted-200 copies in 1,750 ms, with the ablations
+retaining their copies.
+
 MSH-16 adds binary spray-and-wait for Direct traffic. Packets keep their signed
 header; a six-byte capability-negotiated envelope carries a remaining-copy
 ticket on the Message channel. Peers without `CAP_SPRAY_V1` receive the raw

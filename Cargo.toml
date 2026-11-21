@@ -54,9 +54,41 @@ name = "sim_report"
 required-features = ["sim"]
 
 [[example]]
+name = "presence_report"
+required-features = ["sim"]
+
+[[example]]
 name = "sync_v2_report"
 required-features = ["sim"]
 
 [[example]]
 name = "spray_report"
+required-features = ["sim"]
+
+[[example]]
+name = "receipt_report"
+required-features = ["sim"]
+
+[[example]]
+name = "directory_report"
+required-features = ["sim"]
+
+[[example]]
+name = "routehint_report"
+required-features = ["sim"]
+
+[[example]]
+name = "telemetry_report"
+required-features = ["sim"]
+
+[[example]]
+name = "channel_report"
+required-features = ["sim"]
+
+[[example]]
+name = "restart_report"
+required-features = ["sim"]
+
+[[example]]
+name = "observability_report"
 required-features = ["sim"]

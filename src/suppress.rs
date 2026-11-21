@@ -16,6 +16,7 @@ use ao_network::LinkId;
 use rand_core::RngCore;
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::observability::Counter;
 use crate::packet::{MessageId, Packet, PacketClass};
 use crate::sign::derive_msg_id;
 
@@ -39,7 +40,11 @@ pub struct SuppressionConfig {
     pub degree_ref: usize,
     /// Copy threshold at `degree_ref`.
     pub k_at_degree_ref: usize,
-    /// Lower bound for the degree-scaled copy threshold.
+    /// Configured lower bound for the degree-scaled copy threshold.
+    ///
+    /// The suppression table always requires at least two distinct sending
+    /// links, because one copy cannot prove the flood reached this node's
+    /// neighbours.
     pub min_k: usize,
     /// Upper bound for the degree-scaled copy threshold.
     pub max_k: usize,
@@ -209,6 +214,9 @@ pub(crate) struct Sighting {
 #[derive(Debug)]
 pub(crate) struct SuppressionTable {
     config: SuppressionConfig,
+    /// Cancelled relays (MSH-30). The table owns this count because it owns
+    /// the suppression decision.
+    suppressed: Counter,
     entries: BTreeMap<MessageId, Pending>,
 }
 
@@ -216,13 +224,19 @@ impl SuppressionTable {
     pub(crate) fn new(config: SuppressionConfig) -> Self {
         Self {
             config,
+            suppressed: Counter::new(),
             entries: BTreeMap::new(),
         }
     }
 
-    #[cfg(test)]
-    fn len(&self) -> usize {
+    /// Pending assessment windows, for the bounded-gauge part of the snapshot.
+    pub(crate) fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Saturating count of cancelled relays (MSH-30).
+    pub(crate) fn suppressed_relays(&self) -> u64 {
+        self.suppressed.get()
     }
 
     /// Removes every window that ended at or before `now`.
@@ -275,6 +289,7 @@ impl SuppressionTable {
             pending.senders.insert(sender);
             if pending.senders.len() >= pending.threshold {
                 self.entries.remove(&msg_id);
+                self.suppressed.add(1);
                 return Observe::Suppressed;
             }
             return Observe::Pending;
@@ -289,13 +304,16 @@ impl SuppressionTable {
                 self.entries.remove(&victim);
             }
         }
-        let threshold = threshold.max(1);
+        // One copy proves only that this node heard the packet. Cancelling on
+        // it would let suppression extinguish a flood at the first hop,
+        // especially on a line or a small-degree graph. Every degree-scaled
+        // threshold is therefore floored at two distinct sending links; if no
+        // second copy arrives, `take_due` relays when the timer fires.
+        let threshold = threshold.max(2);
         let mut senders = BTreeSet::new();
         senders.insert(sender);
         if senders.len() >= threshold {
-            // A threshold of one means a single sighting is enough to
-            // cancel; the seen-cache still records it so later copies
-            // cannot restart this decision.
+            self.suppressed.add(1);
             return Observe::Suppressed;
         }
         self.entries.insert(
@@ -443,6 +461,20 @@ mod tests {
     }
 
     #[test]
+    fn a_single_copy_is_never_enough_to_cancel_a_flood() {
+        let mut table = SuppressionTable::new(config());
+        assert_eq!(
+            table.observe(sight(0, ID, LINK_A, 1, 100, vec![1])),
+            Observe::Pending,
+            "a degree-one neighbour must not extinguish the flood"
+        );
+        assert_eq!(
+            table.observe(sight(1, ID, LINK_B, 1, 100, vec![1])),
+            Observe::Suppressed
+        );
+    }
+
+    #[test]
     fn deadline_produces_one_due_relay() {
         let mut table = SuppressionTable::new(config());
         assert_eq!(
@@ -497,6 +529,66 @@ mod tests {
             Observe::RelayNow(_)
         ));
         assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn only_cancelled_relays_increment_the_suppression_counter() {
+        let mut table = SuppressionTable::new(config());
+        assert_eq!(table.suppressed_relays(), 0);
+        assert_eq!(
+            table.observe(sight(0, ID, LINK_A, 3, 100, vec![1])),
+            Observe::Pending
+        );
+        assert_eq!(table.suppressed_relays(), 0);
+        assert_eq!(
+            table.observe(sight(1, ID, LINK_A, 3, 100, vec![1])),
+            Observe::Pending
+        );
+        assert_eq!(
+            table.observe(sight(2, ID, LINK_B, 3, 100, vec![1])),
+            Observe::Pending
+        );
+        assert_eq!(table.suppressed_relays(), 0);
+        assert_eq!(
+            table.observe(sight(3, ID, LINK_C, 3, 100, vec![1])),
+            Observe::Suppressed
+        );
+        assert_eq!(table.suppressed_relays(), 1);
+        // A timer win is a relay, not a suppression.
+        let timer = MessageId::from_bytes([6; 16]);
+        assert_eq!(
+            table.observe(sight(0, timer, LINK_A, 3, 10, vec![2])),
+            Observe::Pending
+        );
+        assert_eq!(table.take_due(10).len(), 1);
+        assert_eq!(table.suppressed_relays(), 1);
+        // The MSH-19 floor requires a second distinct link even when the
+        // requested threshold is one; the genuine cancellation still counts.
+        let floored = MessageId::from_bytes([5; 16]);
+        assert_eq!(
+            table.observe(sight(0, floored, LINK_A, 1, 100, vec![3])),
+            Observe::Pending
+        );
+        assert_eq!(table.suppressed_relays(), 1);
+        assert_eq!(
+            table.observe(sight(1, floored, LINK_B, 1, 100, vec![3])),
+            Observe::Suppressed
+        );
+        assert_eq!(table.suppressed_relays(), 2);
+    }
+
+    #[test]
+    fn suppression_counter_saturates() {
+        let mut table = SuppressionTable::new(config());
+        table.suppressed.set(u64::MAX - 1);
+        let first = MessageId::from_bytes([4; 16]);
+        let _ = table.observe(sight(0, first, LINK_A, 1, 100, vec![3]));
+        let _ = table.observe(sight(1, first, LINK_B, 1, 100, vec![3]));
+        assert_eq!(table.suppressed_relays(), u64::MAX);
+        let second = MessageId::from_bytes([3; 16]);
+        let _ = table.observe(sight(0, second, LINK_A, 1, 100, vec![3]));
+        let _ = table.observe(sight(1, second, LINK_B, 1, 100, vec![3]));
+        assert_eq!(table.suppressed_relays(), u64::MAX);
     }
 
     #[test]

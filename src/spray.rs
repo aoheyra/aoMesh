@@ -142,11 +142,18 @@ impl Default for SprayConfig {
 }
 
 #[derive(Debug, Clone)]
-struct Entry {
-    copies_left: u8,
-    destination: [u8; 16],
-    expires_at_ms: u64,
-    handed_to: BTreeSet<LinkId>,
+pub(crate) struct SprayEntry {
+    pub(crate) copies_left: u8,
+    pub(crate) destination: [u8; 16],
+    pub(crate) expires_at_ms: u64,
+    pub(crate) handed_to: BTreeSet<LinkId>,
+}
+
+/// The bounded state an MSH-29 snapshot carries. Link capabilities are not
+/// included: the host re-announces live links after a restart.
+#[derive(Debug, Clone)]
+pub(crate) struct SprayState {
+    pub(crate) entries: BTreeMap<MessageId, SprayEntry>,
 }
 
 /// Deterministic, bounded spray state owned by the sans-IO engine.
@@ -158,7 +165,7 @@ struct Entry {
 pub struct SprayTracker {
     config: SprayConfig,
     caps: BTreeMap<LinkId, u32>,
-    entries: BTreeMap<MessageId, Entry>,
+    entries: BTreeMap<MessageId, SprayEntry>,
 }
 
 impl SprayTracker {
@@ -170,6 +177,18 @@ impl SprayTracker {
             caps: BTreeMap::new(),
             entries: BTreeMap::new(),
         }
+    }
+
+    /// Copies the bounded ticket set into an MSH-29 snapshot payload.
+    pub(crate) fn export_state(&self) -> SprayState {
+        SprayState {
+            entries: self.entries.clone(),
+        }
+    }
+
+    /// Installs a validated snapshot, leaving link capabilities untouched.
+    pub(crate) fn import_state(&mut self, state: SprayState) {
+        self.entries = state.entries;
     }
 
     /// Records the capability set a link advertised in its signed hello.
@@ -227,7 +246,7 @@ impl SprayTracker {
         }
         self.entries.insert(
             id,
-            Entry {
+            SprayEntry {
                 copies_left: copies,
                 destination,
                 expires_at_ms,
@@ -245,6 +264,11 @@ impl SprayTracker {
     #[must_use]
     pub(crate) fn copies_left(&self, id: MessageId) -> u8 {
         self.entries.get(&id).map_or(1, |entry| entry.copies_left)
+    }
+
+    /// Stops spraying an id once a delivery receipt has purged it.
+    pub(crate) fn forget(&mut self, id: MessageId) {
+        self.entries.remove(&id);
     }
 
     /// Whether a contact may carry this id to `peer`. The destination always
@@ -270,6 +294,25 @@ impl SprayTracker {
         sender: Option<LinkId>,
         candidates: impl IntoIterator<Item = (LinkId, [u8; 16])>,
     ) -> Vec<(LinkId, u8)> {
+        self.plan_with_hint(now, id, sender, candidates, None)
+    }
+
+    /// Same as [`Self::plan`], with an optional MSH-21 reverse-path hint.
+    ///
+    /// A hint only changes the plan when it names a candidate that the binary
+    /// split would not have chosen. In the spray phase it replaces the last
+    /// (highest link id) recipient with a one-ticket copy; the number of
+    /// transmissions and the ticket consumption stay exactly as planned, so
+    /// using a hint cannot add traffic. In the wait phase, where there is no
+    /// other recipient, the retained copy is sent once along the fresh path.
+    pub(crate) fn plan_with_hint(
+        &mut self,
+        now: u64,
+        id: MessageId,
+        sender: Option<LinkId>,
+        candidates: impl IntoIterator<Item = (LinkId, [u8; 16])>,
+        hint: Option<LinkId>,
+    ) -> Vec<(LinkId, u8)> {
         self.expire(now);
         let Some(entry) = self.entries.get_mut(&id) else {
             return Vec::new();
@@ -288,19 +331,51 @@ impl SprayTracker {
         }
 
         let mut plan = Vec::new();
-        for (link, _node) in candidates {
-            if Some(link) == sender || entry.handed_to.contains(&link) {
+        for (link, _node) in &candidates {
+            if Some(*link) == sender || entry.handed_to.contains(link) {
                 continue;
             }
             if entry.copies_left <= 1 {
                 break;
             }
             let give = entry.copies_left / 2;
-            entry.handed_to.insert(link);
+            entry.handed_to.insert(*link);
             entry.copies_left -= give;
-            plan.push((link, give));
+            plan.push((*link, give));
             if entry.copies_left <= 1 {
                 break;
+            }
+        }
+        if let Some(hint) = hint {
+            let wanted = Some(hint) != sender
+                && !plan.iter().any(|(link, _)| *link == hint)
+                && candidates.iter().any(|(link, _)| *link == hint);
+            if wanted {
+                if let Some(last) = plan.last_mut() {
+                    let replaced = last.0;
+                    // The destination shortcut is already the best copy.
+                    if candidates
+                        .iter()
+                        .any(|(link, node)| *link == replaced && *node == entry.destination)
+                    {
+                        return plan;
+                    }
+                    // Ticket accounting stays at `give` consumed: the wire
+                    // copy carries one ticket, but the replaced recipient's
+                    // share is not returned to the spray pool. That keeps
+                    // the number of transmissions, and the later fan-out,
+                    // identical to the unhinted plan.
+                    entry.handed_to.remove(&replaced);
+                    entry.handed_to.insert(hint);
+                    last.0 = hint;
+                    last.1 = 1;
+                } else if entry.copies_left > 0 {
+                    // Wait phase: there is no other recipient, so the
+                    // retained copy goes once along the fresh path.
+                    entry.handed_to.insert(hint);
+                    entry.copies_left = 0;
+                    plan.push((hint, 1));
+                }
             }
         }
         plan
@@ -392,6 +467,48 @@ mod tests {
         tracker.observe(0, id(1), PacketClass::Direct, [9; 16], 60, 1);
         assert_eq!(
             tracker.plan(0, id(1), None, [(LINK_A, [4; 16]), (LINK_B, [9; 16])]),
+            vec![(LINK_B, 1)]
+        );
+        assert_eq!(tracker.copies_left(id(1)), 0);
+    }
+
+    #[test]
+    fn hint_replaces_a_recipient_without_adding_a_transmission() {
+        // Four tickets stop the binary split after two contacts, leaving C as
+        // a candidate the hint can actually substitute. With eight tickets the
+        // split would already select C, so the hint would be a no-op.
+        let candidates = [(LINK_A, [3; 16]), (LINK_B, [4; 16]), (LINK_C, [5; 16])];
+        let mut baseline = tracker(4, 8);
+        baseline.observe(0, id(1), PacketClass::Direct, [9; 16], 60, 4);
+        let base = baseline.plan(0, id(1), None, candidates);
+        assert_eq!(base, vec![(LINK_A, 2), (LINK_B, 1)]);
+        let base_left = baseline.copies_left(id(1));
+
+        let mut hinted = tracker(4, 8);
+        hinted.observe(0, id(1), PacketClass::Direct, [9; 16], 60, 4);
+        let plan = hinted.plan_with_hint(0, id(1), None, candidates, Some(LINK_C));
+        assert_eq!(plan, vec![(LINK_A, 2), (LINK_C, 1)]);
+        assert_eq!(plan.len(), base.len());
+        assert_eq!(hinted.copies_left(id(1)), base_left);
+    }
+
+    #[test]
+    fn wait_phase_sends_its_only_copy_along_a_fresh_hint() {
+        let mut tracker = tracker(8, 8);
+        tracker.observe(0, id(1), PacketClass::Direct, [9; 16], 60, 1);
+        assert!(
+            tracker
+                .plan(0, id(1), None, [(LINK_A, [3; 16]), (LINK_B, [4; 16])])
+                .is_empty()
+        );
+        assert_eq!(
+            tracker.plan_with_hint(
+                0,
+                id(1),
+                None,
+                [(LINK_A, [3; 16]), (LINK_B, [4; 16])],
+                Some(LINK_B),
+            ),
             vec![(LINK_B, 1)]
         );
         assert_eq!(tracker.copies_left(id(1)), 0);

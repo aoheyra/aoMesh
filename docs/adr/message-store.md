@@ -45,6 +45,12 @@ the caller can explicitly evict and insert an updated entry, retaining original
 first_seen, received_at and age. Such multi-call changes are caller-owned and
 are not an atomic metadata update API.
 
+MSH-17 uses the existing `evict` method as the purge seam. A `MeshOutput::Purge`
+tells the host which content address is immune; the host calls `evict` and
+refreshes its summary so anti-entropy does not re-offer the id. No new store
+method or conformance case is needed because purging is ordinary bounded
+removal; the routing policy that decides when to purge remains in the engine.
+
 ## Time and compatibility
 
 All clocks passed to one store must share a monotonic local epoch. Expiry is

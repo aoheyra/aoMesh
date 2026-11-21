@@ -2,7 +2,7 @@
 
 **The routing and store-and-forward engine of the aoheyra mesh.** A sans-IO Rust crate that decides what happens to a packet: forward it, hold it, suppress it, deliver it, or drop it, across a phone-to-phone mesh where links come and go.
 
-> **Status: pre-alpha, through MSH-16.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest, bounded anti-entropy sync, range-based reconciliation on meeting links and binary spray-and-wait for Direct traffic are implemented.
+> **Status: pre-alpha, through MSH-30.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest, bounded anti-entropy sync, range-based reconciliation on meeting links, binary spray-and-wait for Direct traffic, signed delivery receipts with bounded store purging, relative-age lifetime ceilings, bounded presence announcements with trickle timing, a bounded ephemeral NodeDirectory with coalesced UI events, bounded reverse-path route hints derived from directory observations, bounded latest-wins telemetry with typed advisory coalescing, local public-channel subscriptions over signed Broadcast envelopes, resource-bounded decoders with nightly fuzz targets, versioned restart snapshots for seen-cache, immunity and spray state, and a versioned content-free diagnostics snapshot are implemented.
 
 Cargo package name: `ao_mesh`.
 
@@ -32,7 +32,9 @@ aoMesh consumes **aoNetwork** (links and frames) and **aoIdents** (signatures, s
 - **Stores and forwards**: `MessageStore` trait with quotas and eviction, store summary and beacon digest, anti-entropy sync when two nodes meet.
 - **Controls abuse mesh-wide**: per-origin and per-class relay budgets, neighbour penalty scores.
 - Handles **delivery receipts and immunity** so copies are purged after delivery.
-- Maintains **presence**, a mesh-wide **NodeDirectory**, reverse-path route hints and public channels.
+- Maintains bounded **presence** announcements and a mesh-wide **NodeDirectory** from typed observations, with LRU eviction, relative-time expiry and coalesced UI changes; derives bounded **reverse-path route hints** from those facts.
+- Publishes **Telemetry** as latest-wins ambient state with NET-21 coalescing, and carries **public channels** as bounded envelopes inside signed Broadcast packets with local-only subscriptions.
+- Exposes **bounded diagnostics counters** as a versioned, content-free snapshot for the host.
 - Ships a **simulator harness** with mobility models and metrics, so every routing parameter can be swept and every claim measured.
 
 ## What it deliberately does not do
@@ -47,9 +49,9 @@ aoMesh consumes **aoNetwork** (links and frames) and **aoIdents** (signatures, s
 
 | Class | Strategy | Storage | Notes |
 |---|---|---|---|
-| **Direct** (1:1) | Spray-and-wait (binary spray, default `L = 8` copies) plus reverse-path hints | Stored; default lifetime ~48 h | Highest relay priority; receipt and immunity purge copies |
+| **Direct** (1:1) | Spray-and-wait (binary spray, default `L = 255` copies) plus reverse-path hints | Stored; default lifetime ~48 h | Highest relay priority; signed receipt and immunity purge copies |
 | **Broadcast / channels** | Counter-based suppression, random assessment delay, per-class TTL | Short | Main flood-prevention mechanism |
-| **Presence** | Trickle-timed gossip, short TTL, latest-wins by `seq` | Not stored long (~10 min) | Interval backs off when nothing changes |
+| **Presence** | Trickle-timed gossip of signed 150-byte announcements, short TTL, latest-wins by `seq` | Not stored long (~30 min) | Cap-gated; interval backs off when nothing changes |
 | **Telemetry** (location) | Latest-wins, hop limit ~3, per-origin rate cap | **Never stored**; ~30 s | Coalesced in aoNetwork via `coalesce_key` |
 
 Lifetimes, TTLs, copy counts and budgets are **defaults with documented reasons** and are all configurable. Expiry uses relative age (`received_at` plus age at receipt), so a wrong phone clock can neither extend nor kill messages.
@@ -71,6 +73,7 @@ Lifetimes, TTLs, copy counts and budgets are **defaults with documented reasons*
  │  ├─ store: MessageStore trait · quotas · expiry     │
  │  ├─ sync: summary · digest · anti-entropy v1 (v2)   │
  │  ├─ receipts and immunity                           │
+ │  ├─ observability: bounded counters · snapshot      │
  │  └─ presence · NodeDirectory · route hints · channels│
  └─────────────────────────────────────────────────────┘
        ▲  thin async adapter (feature `adapter`)
@@ -78,15 +81,15 @@ Lifetimes, TTLs, copy counts and budgets are **defaults with documented reasons*
    aoNetwork  (NetworkEvent in, actions out)      aoIdents (sign, open, replay)
 ```
 
-**Engine inputs:** `LinkUp`, `LinkDown`, `Data`, `Tick`, `Submit`, `StoreSummary`, `SyncItems`. **Outputs:** `Send`, `Broadcast`, `Release`, `Deliver`, `SetHello`, `SetBeacon`, `SyncNeed`, `SyncItem`, `ReleaseOpportunistic`.
+**Engine inputs:** `LinkUp`, `LinkDown`, `Data`, `Tick`, `Submit`, `SubmitTelemetry`, `KnownCards`, `ObserveNode`, `StoreSummary`, `SyncItems`, `ChannelSubscribe`, `ChannelUnsubscribe`. **Outputs:** `Send`, `Broadcast`, `TelemetrySend`, `TelemetryBroadcast`, `Release`, `Deliver`, `ChannelDeliver`, `SetHello`, `SetBeacon`, `SyncNeed`, `SyncItem`, `ReleaseOpportunistic`, `Purge`, `Delivered`, `CardFetch`, `DirectoryChanged`.
 
 ### Engine and adapter (MSH-06)
 
-`MeshEngine::new(rng)` uses `MeshConfig::default()`: 32 neighbour entries, the
-MSH-09 replay guard (1024 ids per sender, 24 h tolerance, 64 senders), the
-budget fields below, the MSH-11 suppression fields, the MSH-13 summary
-fields and the MSH-14/15 sync fields below. `with_config`
-accepts explicit bounds; zero neighbours
+`MeshEngine::new(rng)` uses `MeshConfig::default()`: 32 neighbour entries,
+4096 MSH-05 seen-cache recordings, the MSH-09 replay guard (1024 ids per
+sender, 24 h tolerance, 64 senders), the budget fields below, the MSH-11
+suppression fields, the MSH-13 summary fields, the MSH-14/15 sync fields and
+the MSH-23 channel bounds below. `with_config` accepts explicit bounds; zero neighbours
 refuses all new links. Excess links emit `Release`, duplicate link-up events
 preserve counters, and link-down removes the entry. These are bookkeeping
 limits, not radio topology policy.
@@ -96,8 +99,13 @@ Link-up verifies the peer's signed MeshHello, so each entry carries a verified
 `Submit` borrows an `Identity`, header and opaque payload. The engine retains
 no keys, validates lengths before signing, and emits `Send` to a selected
 admitted link or `Broadcast` to all up links. Telemetry uses the Telemetry
-channel; other packet classes use Message. Packet and signing failures return
-typed `MeshError`s while the caller retains its payload. Incoming Data also
+channel; other packet classes use Message. A Broadcast payload carrying the
+reserved channel magic is validated as a channel envelope and charged to both
+the origin's Broadcast bucket and the channel's own bucket before signing.
+`ChannelSubscribe` and `ChannelUnsubscribe` change only that node's bounded
+local registry; relays never send either input. Packet, channel and signing
+failures return typed `MeshError`s while the caller retains its payload.
+Incoming Data also
 borrows the local `Identity`; the engine keeps no keys. It is parsed without
 copying and counted: a fresh Direct packet whose `dst` is that identity's
 node id becomes a delivery candidate, any other fresh Direct packet relays
@@ -110,18 +118,26 @@ guard accepts. Refusals and forged content addresses are counted against the
 sending neighbour.
 
 With feature `adapter`, `NetworkAdapter` owns the facade and engine in one
-caller task. All nine output variants map to network commands or host events;
+caller task. Every output variant maps to a network command or host event;
+`ChannelDeliver` reports a signed channel message to a local subscriber,
 `SyncNeed` asks the host to resolve store ids, `SyncItem` hands an incoming
-packet to the host store, and `ReleaseOpportunistic` calls aoNetwork's
-`Network::release`, which closes only opportunistic links. `SendFailed`
+packet to the host store, `ReleaseOpportunistic` calls aoNetwork's
+`Network::release`, which closes only opportunistic links, and `CardFetch`
+asks the host to resolve an unknown identity-card hash. `SendFailed`
 returns the link and original payload through `SendError`.
 `poll_event` and its `next_event` future need no runtime dependency and work
 in a Tokio-owned task. Each pump takes the local `Identity` by borrow so
 MSH-09 can open deliveries; the engine retains no key. The host supplies
 separate monotonic network durations and mesh milliseconds, arranges wakeups
 by `next_deadline()`, and recreates
-`next_event` with fresh times after a timer wakeup. Tick is explicit; no mesh
-timers are scheduled yet.
+`next_event` with fresh times after a timer wakeup. `MeshInput::Tick` also
+borrows the identity and an eight-byte card hash so MSH-19 can sign and emit a
+due announcement; its state is only a sequence number and a deadline. Tick is
+explicit; no mesh timers are scheduled yet.
+
+`MeshEngine::observability_snapshot()` and `NetworkAdapter::snapshot()` return the same
+versioned, content-free diagnostics view (MSH-30). The adapter adds no I/O,
+clock read or second counter; see [Observability](#observability-msh-30).
 
 ```bash
 cargo run --features adapter --example mesh_adapter
@@ -130,6 +146,35 @@ cargo run --features adapter --example mesh_adapter
 This seeded three-node example checks structural reception through the full
 adapter and transport path. It does not demonstrate multihop forwarding,
 end-to-end encryption or application delivery. See the [I/O decision](docs/adr/engine-io-and-adapter.md).
+
+### Telemetry (MSH-22)
+
+`SubmitTelemetry` frames an opaque payload with a one-byte application-owned
+`kind` and a sender-monotonic `u64` sequence, signs it under the existing
+Telemetry class, and emits `TelemetrySend` or `TelemetryBroadcast`. The mesh
+never reads the payload as a location or any other app schema. The coalescing
+key is BLAKE3 over a dedicated domain, the origin id and the kind byte; the
+sequence is deliberately excluded so a newer update replaces an older one
+waiting in aoNetwork's NET-21 queue. `NetworkAdapter` passes that key and a
+local-deadline-derived `SendOpts.expires_at` to `Network::send_opts`; it does
+not build a second radio queue.
+
+Relays decode the frame after the header and content-address checks, then
+apply freshness and throttling **before** relaying or spending a per-origin
+budget token. Stale, expired, rate-limited and hop-limited updates are silent
+policy drops; only malformed frames or a bad content address count against the
+sender. Expiry and the one-per-origin/10 s cap use only the caller's monotonic
+`now`, so a skewed `created_ms` cannot change them. Telemetry is never handed
+to `SyncItem`, the store, or the receipt tracker. Engine state is bounded by
+`TelemetryConfig::max_entries`, evicting by earliest local expiry then key.
+
+The fixed-seed report is reproducible with:
+
+```bash
+cargo run --release --features sim --example telemetry_report
+```
+
+The regression gate in `tests/sim_telemetry.rs` locks both seeds and rows.
 
 ### Packet format (MSH-03, MSH-04)
 
@@ -148,6 +193,32 @@ A bounded dedupe cache for forwarding: `check_and_insert(now, class, msg_id)` an
 - Bounded in **size and time**: at most 4096 recordings (oldest evicted first), each expiring at its class's window from ADR-0001 (Direct 24 h, Broadcast 6 h, Presence 30 min, Telemetry 5 min). A duplicate does not extend the window.
 - No input can grow it past the bound: one million insertions peak at 263,560 bytes, asserted against the documented 512 KiB ceiling by `tests/seen_memory.rs`. Decision record ADR-0003.
 - Capacity and windows are configurable through `SeenConfig`; capacity 0 records nothing, a zero window never deduplicates.
+- MSH-29 snapshots preserve both the entry map and the eviction order, so an eviction after restart happens at the same point as without a restart.
+
+### Restart persistence (MSH-29)
+
+The host owns the bytes: `MeshEngine` implements `Snapshot`, whose `snapshot()`
+returns `Result<Vec<u8>, SnapshotError>` and whose `restore(&[u8])` is atomic.
+The format is local host state, not a radio wire format: magic `AMSH`, version
+byte, four little-endian counts, then BTreeMap-ordered seen entries, seen order,
+receipt-immunity entries and spray tickets. All integers are little-endian.
+`SNAPSHOT_VERSION` is 1 and `MAX_SNAPSHOT_LEN` is 4 MiB, above the roughly
+1.85 MiB worst case of the default bounds.
+
+Malformed, truncated, trailing, oversized or version-mismatched bytes are
+rejected with a typed `SnapshotError` before any engine state is changed.
+Restore checks counts against the receiving engine's config bounds, revalidates
+immunity receipt wires and rejects duplicate ids or links. Store content, RNG
+seed, config, wall clock and live link capabilities stay host-owned: the host
+rebuilds the engine with the same seed and config, calls `restore`, and
+re-announces links with `MeshInput::LinkUp`.
+
+`tests/restart.rs` covers no re-relay after restart, immunity and copy-counter
+survival, store isolation and atomic rejection. `tests/sim_restart.rs` locks the
+fixed-seed paired report from `examples/restart_report`: with seed
+`1_297_303_584` on line-20, the lost-state row re-relays 14 post-restart sends
+(723 transmissions) while the restored row re-relays none (566 transmissions);
+both deliver 20/20 and snapshot 5,374 bytes.
 
 ### MeshHello (MSH-07)
 
@@ -175,8 +246,9 @@ hop limit: a submission with `ttl` N reaches N hops, and the destination
 delivers even on a worn `ttl`) and `hops` incremented, saturating at 255.
 Submissions are recorded too, so a node never re-relays its own message.
 `Telemetry`, unverified senders and duplicates are counted and dropped.
-Broadcast and Presence follow MSH-11's suppression path; MSH-19 and MSH-22
-own their remaining pipelines (ADR-0004 forbids acting on an unverified link). The line, ring and seeded random-graph cases in
+Broadcast and Presence follow MSH-11's suppression path; MSH-19 adds signed
+announcements over the existing Presence class and MSH-22 owns telemetry
+(ADR-0004 forbids acting on an unverified link). The line, ring and seeded random-graph cases in
 `tests/forwarding.rs` pin delivery and the absence of loops with sealed
 payloads, so the destination's MSH-09 pipeline emits the delivery.
 
@@ -245,7 +317,9 @@ Broadcast and Presence do not relay on sight. A fresh content id waits a
 seeded assessment window while distinct sending links are counted; if the
 degree-scaled copy threshold is reached, the relay is cancelled and the id is
 recorded. Otherwise one relay is sent when the timer fires, with `ttl` capped
-at the ADR-0001 class value. State is bounded by
+at the ADR-0001 class value. The effective threshold is always at least two
+distinct sending links: a single copy proves only that this node heard the
+packet, and cancelling on it extinguished floods on degree-one paths. State is bounded by
 `SuppressionConfig::max_entries` (default 1024) and evicted by earliest
 deadline. `Direct` and `Telemetry` keep their existing paths and no wire field
 changes.
@@ -253,10 +327,13 @@ changes.
 | Setting | Default | Why |
 |---|---|---|
 | Reference degree / copies | 4 / 3 | 50-node sweep: cancels 45% of transmissions without moving Direct delivery |
-| Copy bounds | 1 to 6 | Keeps sparse graphs forwarding and dense graphs from over-relaying |
+| Copy bounds | 1 to 6 configured, 2 effective | Keeps sparse graphs forwarding; one copy cannot prove neighbours heard a flood |
 | Base delay | 60-140 ms, seeded | Long enough for neighbour copies, short enough for a contact |
 | Final delay | 20-600 ms, shrinking with degree | Dense groups decide sooner |
 | Class TTL | Direct 8, Broadcast 6, Presence 3, Telemetry 3 | ADR-0001 table, clamped on submission too |
+| Telemetry freshness | 30 s | Long enough for a moving contact, short enough that stale ambient state is dropped |
+| Telemetry rate cap | One accepted update per origin per 10 s | A chatty origin cannot fill a slow link; measured with seed `1297304029` |
+| Telemetry state bound | 512 `(origin, kind)` entries | Bounded relay memory; earliest expiry, then key order, is evicted |
 
 The fixed mixed case in `tests/sim_suppression.rs` submits 100 messages on a
 seeded 50-node random graph (seed `1297304013`), every tenth one a sealed
@@ -267,7 +344,78 @@ stays at 0.2000 (2/10) in both runs. Unique Broadcast receptions fall from
 shorten a flood's reach, and that cost is not counted as a delivery-ratio
 improvement. MSH-10 admission gates suppression, so a denied packet starts no
 timer. The four published MSH-27 baselines are unchanged because they carry no
-flooded classes.
+flooded classes. The two-copy floor applies to every flooded class and is
+covered by a unit regression; CI rechecks the suppression scenario without
+lowering its thresholds.
+
+### Presence announcements (MSH-19)
+
+Presence uses the existing signed `PacketClass::Presence` packet; no new class,
+header field, crypto domain or key storage is added. The opaque payload is a
+fixed 150-byte announcement:
+
+| Offset | Size | Field | Notes |
+|---|---:|---|---|
+| 0 | 1 | magic | `0x56` |
+| 1 | 1 | version | `1` |
+| 2 | 8 | `card_hash` | Opaque aoIdents announcement hash |
+| 10 | 4 | `caps` | Big endian capability bits |
+| 14 | 8 | `seq` | Big endian, monotonic per origin |
+| 22 | 32 | `signing_pk` | Origin Ed25519 key |
+| 54 | 32 | `agreement_pk` | Origin X25519 key |
+| 86 | 64 | `binding` | aoIdents agreement-key binding signature |
+
+The two keys and their binding are the origin's existing `PublicIdentity`.
+Every relay derives `origin` from those keys, verifies the binding and the
+packet signature, and rejects a forged origin at every hop. The keys are
+carried in the opaque payload only; the engine retains no key and never
+interprets the card hash. Changing `card_hash` or `caps` raises `seq`, and a
+higher sequence replaces an older entry; ties use the full carried facts as a
+deterministic tie-break.
+
+`MeshHello` advertises `CAP_PRESENCE_V1` (`1 << 4`). Announcements are sent and
+accepted only on links that negotiated the bit; a legacy peer keeps the
+pre-MSH-19 Presence relay path and learns no entries from announcement bodies.
+The host borrows its `Identity` and card hash on each `MeshInput::Tick`,
+declares known hashes through `MeshInput::KnownCards`, and receives
+`MeshOutput::CardFetch { node_id, card_hash }` once per unknown hash until it
+answers. The adapter exposes the last one as `AdapterEvent::CardFetch`;
+`poll_event` and `next_event` keep their signatures.
+
+| Setting | Default | Why |
+|---|---|---|
+| Enabled | `true` | Cap gating still restricts which links see announcements |
+| Maximum learned nodes | 1024 | Bounds the entry map independently of the directory |
+| Maximum known cards | 1024 | Bounds host-supplied hashes per input |
+| Quick delay | 1000 ms | Fast first announcement after a change or capable link appears |
+| Base quiet interval | 60 s | Doubles after each quiet refresh |
+| Steady interval | 900 s | Fits the 30 min entry lifetime and 64 KiB/h class budget |
+| Entry lifetime | 1800 s | ADR-0001's Presence lifetime, using relative local time |
+
+Trickle state is one typed deadline with the facts it was scheduled for, so
+ticks while a quick deadline is pending cannot push the first announcement
+forever. Duplicate cards are suppressed by the seen-cache and fresh ones are
+relayed through MSH-11 with Presence TTL 3, only to capability peers.
+
+The fixed 50-node case is a static diameter-three circulant (steps 1, 8 and
+12, seed `1297304021`) with no application traffic. Its one-second quick delay
+and 60-second steady interval make convergence and overhead visible inside a
+two-minute run. All card hashes are declared up front, so any `CardFetch`
+would be a regression.
+
+```bash
+cargo run --release --features sim --example presence_report
+cargo test --release --all-features --test sim_presence
+```
+
+| Scenario | Seed | Converged | Convergence | Fewest learned | Card fetches | Steady sends / bytes (last 60 s) |
+|---|---:|---|---:|---:|---:|---:|
+| `presence-smallworld-50` | 1297304021 | true | 50 ms | 49/49 | 0 | 6036 / 1,557,288 |
+
+The average wire size is 258 bytes, so one source's 60-second refresh is
+15,480 bytes per hour, well under ADR-0001's 64 KiB/h Presence budget. Relays
+are separately capped by the MSH-10 buckets. `tests/sim_presence.rs` locks the
+exact CSV header and row as well as the directional bounds.
 
 ### Simulator harness and baseline (MSH-27)
 
@@ -294,7 +442,11 @@ queue occupancy pass. `tests/sim_baseline.rs` records the exact gate values.
 CSV columns: `scenario,seed,nodes,submitted,delivered,duplicate_deliveries,
 transmissions,receptions,send_failures,radio_bytes,mean_latency_ms,
 max_latency_ms,delivery_ratio,overhead,duplicate_ratio,peak_queued_bytes,
-links_after_settle`. Ratios are fractions and print with four decimal places.
+links_after_settle,presence_converged,convergence_ms,learned_nodes_min,
+card_fetches,announcement_sends,announcement_bytes,steady_announcement_sends,
+steady_announcement_bytes`. Ratios are fractions and print with four decimal
+places. The last eight columns are MSH-19 diagnostics; baseline rows with
+presence disabled report `false`, zero and zero learned nodes.
 
 Published baseline (Rust stable, release profile, fixed seeds):
 
@@ -327,7 +479,9 @@ release runs produced identical metrics. No aoMesh routing code changed.
 Performance claims are measured in the simulator harness (MSH-27), never asserted:
 
 - Counter-based suppression: 45.20% fewer transmissions than naive flooding on the seeded 50-node graph, Direct delivery ratio unchanged at 0.2000 (see above).
+- Presence: all 49 peers learned within 50 ms on the seeded 50-node circulant, with a 15,480 B/h per-source steady refresh against a 64 KiB/h budget (see above).
 - Spray-and-wait: delivery close to epidemic routing at a fraction of the transmissions under mobility.
+- Reverse-path hints: fresh-path mean latency drops from 356 ms to 337 ms on the seeded random-20 case with transmissions unchanged at 230; the additive alternative used 231 (see above).
 - Sync v2: bytes per contact drop measurably against v1 for stores of 1000+ messages.
 
 Metrics: delivery ratio, latency, overhead (transmissions per delivery), duplicate ratio, buffer occupancy. Reports are CSV (see the [MSH-27 baseline](#simulator-harness-and-baseline-msh-27)); nightly CI enforces thresholds and fails on regression.
@@ -354,6 +508,16 @@ cargo doc --no-deps --all-features
 # Simulator scenarios and metrics
 cargo run --release --features sim --example sim_report
 cargo test --release --all-features --test sim_baseline
+
+# MSH-19 presence convergence and announcement overhead
+cargo run --release --features sim --example presence_report
+cargo test --release --all-features --test sim_presence
+
+# Fuzzing (nightly; separate crate, no runtime dependencies)
+cd fuzz
+cargo +nightly fuzz run packet_decode -- -max_total_time=3600 -rss_limit_mb=2048 -timeout=10 -max_len=16384
+cargo +nightly fuzz run engine_input -- -max_total_time=3600 -rss_limit_mb=2048 -timeout=10 -max_len=16384
+cargo +nightly fuzz run sync_frames -- -max_total_time=3600 -rss_limit_mb=2048 -timeout=10 -max_len=16384
 ```
 
 MSH-16 adds a separate paired report; the four published rows above stay the
@@ -364,7 +528,17 @@ cargo run --release --all-features --example spray_report
 cargo test --release --all-features --test sim_spray
 ```
 
-Tests are `cargo test` only: no Miri or callgrind locally. CI runs fmt, clippy, tests on three operating systems, `cargo doc`, cargo-deny, an MSRV build and miri on every pull request.
+MSH-21 adds another paired report; the published rows keep `RouteHintMode::Off`:
+
+```bash
+cargo run --release --features sim --example routehint_report
+cargo test --release --all-features --test sim_routehint
+```
+
+Tests are `cargo test` only: no Miri, callgrind or one-hour fuzz campaigns
+locally. CI runs fmt, clippy, tests on three operating systems, `cargo doc`,
+cargo-deny, an MSRV build and miri on every pull request; the one-hour fuzz
+campaign is a separate nightly workflow (below).
 
 ### Sibling crates
 
@@ -535,3 +709,339 @@ The scripted-200 case keeps 99 percent delivery while using 48 percent fewer
 transmissions. `tests/spray.rs` covers envelope bounds, the binary split, the
 destination shortcut, wait-phase delivery, tracker eviction and capability
 fallback; `tests/sim_spray.rs` locks the fixed-seed numbers.
+
+## Reverse-path route hints (MSH-21)
+
+Direct traffic can use a bounded, local table of reverse-path hints derived
+from MSH-20 directory observations: "destination D was last seen through
+verified neighbour N, H hops away". Verified MSH-19 presence announcements feed
+the directory automatically; host-supplied facts use `MeshInput::ObserveNode`.
+A hint is never signed, never encoded on the wire and never used to authenticate
+a packet. The hint source accepts no peer time: only local `now` sets expiry,
+and a backwards local clock is clamped to the table's clock floor so clock skew
+cannot keep a hint fresh. A fact whose via-node is not currently a verified
+neighbour cannot steer traffic.
+
+Hints rank by lowest hops, then highest `seq`, then lowest `LinkId`; an exact
+tie never refreshes the winner. `Tick` expires entries and `LinkDown` removes
+every hint supplied by that link. In the default `SubstituteCopy` mode a fresh
+hint replaces one ordinary spray recipient with a one-ticket copy along the
+hint, so the transmission count and `copies_left` accounting stay unchanged;
+a node holding its last ticket waits and hands that copy to the destination.
+`Off` records nothing and changes no decision. `AdditiveUnicast` was measured
+as a rejected option because it lowers latency only by adding a transmission.
+
+| Setting | Default | Why |
+|---|---|---|
+| Mode | `SubstituteCopy` | Lower fresh-path latency at unchanged transmissions per delivery |
+| Maximum entries | 1024 | One per destination, bounded to the documented directory scale |
+| Lifetime | 300,000 ms | Shorter than the 10-15 min presence refresh, so stale paths age out |
+| Fresh hop ceiling | 8 | Matches Direct's TTL; longer paths are not trusted |
+
+The paired report keeps topology, mobility, traffic, budgets, spray and
+receipts identical and changes only the hint mode. The last three columns are
+the fresh-path diagnostic: every row receives the same seeded observations,
+so the `Off` row is the honest latency baseline.
+
+| Scenario | Seed | Delivered / submitted | Transmissions | Mean latency (ms) | Fresh-path deliveries | Fresh-path latency (ms) | Overhead |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `hint-spray-line-20` | 1297303584 | 20 / 20 | 186 | 727 | 20 / 20 | 727 | 9.3000 |
+| `hint-additive-line-20` | 1297303584 | 20 / 20 | 186 | 727 | 20 / 20 | 727 | 9.3000 |
+| `hint-substitute-line-20` | 1297303584 | 20 / 20 | 186 | 727 | 20 / 20 | 727 | 9.3000 |
+| `hint-spray-random-20` | 1297303632 | 10 / 20 | 230 | 360 | 8 / 8 | 356 | 23.0000 |
+| `hint-additive-random-20` | 1297303632 | 10 / 20 | 231 | 345 | 8 / 8 | 337 | 23.1000 |
+| `hint-substitute-random-20` | 1297303632 | 10 / 20 | 230 | 345 | 8 / 8 | 337 | 23.0000 |
+
+On the random-20 case, substitution cuts fresh-path mean latency from 356 ms
+to 337 ms and overall mean latency from 360 ms to 345 ms while transmissions
+stay at 230 and overhead at 23.0000. Additive reaches the same 337 ms but uses
+231 transmissions (23.1000), so it was rejected. The line-20 rows are an
+unchanged-behaviour control: the hint already lies on the spray path. Unit and
+integration tests cover freshest selection, tie-breaking, capacity eviction,
+expiry fallback, backwards clocks, unknown or unverified links, `Off` mode and
+a Direct packet delivered through a substituted hint; the fixed-seed gate
+locks every row above.
+
+```bash
+cargo run --release --features sim --example routehint_report
+cargo test --release --all-features --test sim_routehint
+```
+
+## Signed delivery receipts and immunity (MSH-17)
+
+A successful authenticated delivery emits a signed receipt on the Message
+channel. The receipt is a cap-gated control envelope, not a fifth packet class:
+magic `0x55`, version `1`, tag `1`, flags `0`, two little-endian lengths, the
+destination's 128-byte public identity, the original encoded header, the
+original payload hash and a normal signed Direct packet whose payload is the
+acknowledged `MessageId`. The ack uses the already registered
+`aoheyra/mesh/v1/packet` domain, so no sibling crypto domain or key directory is
+needed. Peers advertise `CAP_RECEIPT_V1` (`1 << 3`); a link without it receives
+no receipt and never parses the envelope.
+
+The engine verifies the binding signature, derives the signer's `NodeId`,
+re-derives the acknowledged id from the original header and payload hash,
+checks that the signer is the packet's destination and verifies the ack
+signature. Accepted receipts enter a bounded immunity list (512 ids, five
+minutes), suppress further spray or sync of that id, and produce a `Purge`
+output for the host store. The sender receives one `Delivered` output, which is
+the origin's sender-status transition. The host owns the bytes; the engine never
+holds keys, payloads or a store handle.
+
+A late spray copy is dropped rather than re-stored once its id is immune. This
+was the root cause of residual copies in the first scripted-200 run: four nodes
+had purged, then re-stored a copy from an older spray ticket.
+
+| Setting | Default | Why |
+|---|---|---|
+| Immunity entries | 512 | Bounds receipt bytes and per-link sent sets |
+| Immunity lifetime | 300 s | Outlives a contact and its later re-sync |
+| Gossip per contact | 16 frames | Bounds a link-up burst; further entries follow later contacts |
+
+The paired report uses spray in both rows so the stores are populated, and only
+the receipt bit differs:
+
+| Scenario | Seed | Delivered | Receipts at origin | Purges | Copies left | Slowest purge |
+|---|---:|---:|---:|---:|---:|---:|
+| `receipt-relay-line-20` | 1297303584 | 20 / 20 | 0 | 0 | 206 | n/a |
+| `receipt-enabled-line-20` | 1297303584 | 20 / 20 | 20 | 206 | 0 | 1,550 ms |
+| `receipt-relay-scripted-200` | 1297303752 | 100 / 100 | 0 | 0 | 1,436 | n/a |
+| `receipt-enabled-scripted-200` | 1297303752 | 100 / 100 | 100 | 1,341 | 0 | 1,750 ms |
+
+```bash
+cargo run --release --all-features --example receipt_report
+cargo test --release --all-features --test sim_receipts
+```
+
+`tests/receipts.rs` covers the two-node pipeline; `tests/sim_receipts.rs` locks
+the fixed-seed numbers and requires zero delivered copies at every node.
+## NodeDirectory (MSH-20)
+
+`directory::NodeDirectory` is a bounded, ephemeral, mesh-wide view of known
+nodes. A typed `NodeObservation` carries an opaque `NodeId`, a card hash,
+capability bits, an announcement sequence, an estimated hop distance, the
+via-neighbour, an observation time and opaque bounded location bytes. The mesh
+never fetches a card, opens a payload or interprets an app schema; location is
+stored as bytes until the telemetry work defines its meaning. Verified MSH-19
+announcements feed the directory automatically with the origin, card hash,
+capabilities, sequence, hop count and ingress neighbour from the signed packet.
+`MeshInput::ObserveNode` remains available for host-supplied facts; no packet or
+hello wire format changes here.
+
+| Setting | Default | Why |
+|---|---|---|
+| Directory entries | 256 | Covers the mesh visible over several contacts in about 80 KiB |
+| Stale after | 30 min | ADR-0001's Presence lifetime: a missed trickle refresh cannot make a node linger |
+| Location bytes | 64 | Bounds hostile location claims while leaving telemetry schema open |
+| UI events | 64 | Bounds the coalesced change stream handed to the app |
+
+Capacity evicts the least-recently-seen node, with sequence and `NodeId` as
+deterministic tie-breaks. Expiry is relative to the local receipt time: a
+high-water-mark clock means a backwards `now` neither extends nor shortens a
+lifetime, and a peer's observation time is clamped for display ordering only.
+`Tick` reclaims stale entries and emits their removals on schedule; queries
+also treat a stale entry as absent without mutating state. `get`, `nearby`
+(hop-distance range, nearest first) and `recent` are deterministic and bounded
+by an explicit result limit.
+
+UI updates arrive as `MeshOutput::DirectoryChanged` /
+`AdapterEvent::DirectoryChanged`, each holding only node ids and kinds. One
+pending event per node is coalesced (`Added` plus `Removed` disappears;
+`Removed` plus `Added` becomes `Updated`), so an announcement flood cannot
+grow the event stream past the configured bound. Oversized locations return
+the typed `DirectoryError::LocationTooLong` through `MeshError::Directory`.
+
+The fixed simulator scenario injects bounded observations with alternating
+future and past observation-time skew. It isolates the ceiling and expiry
+schedule without adding announcement traffic or changing any routing metric:
+
+| Scenario | Seed | Capacity | Peak entries | Expirations | Evictions | Last removal | Live at end |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `directory-line-6` | 1297304021 | 4 | 4 | 24 | 24 | 4,000 ms | 0 |
+
+```bash
+cargo run --all-features --example directory_report
+cargo test --all-features --test sim_directory
+```
+
+`tests/directory.rs` covers the engine seam and typed errors;
+`tests/sim_directory.rs` locks the fixed-seed numbers.
+
+## Lifetime and expiry (MSH-18)
+
+`expiry::LifetimePolicy` provides per-class ceilings using the ADR-0001 defaults.
+`MemoryStore::with_lifetime_policy` applies a custom policy consistently to
+admission, lookup, summaries and cleanup. The effective lifetime never exceeds
+the sender's lifetime and signed wire bytes are unchanged. Age carried from
+previous encounters plus local monotonic elapsed time determines expiry;
+remote timestamps are ignored. `expiry::age_at` carries consumed age between
+encounters with different local epochs. See [the expiry decision](docs/adr/lifetime-expiry.md)
+for the caller contract and restart/sync boundaries.
+
+## Public channels (MSH-23)
+
+A public channel is a fixed envelope inside the opaque payload of an ordinary
+signed `Broadcast` packet:
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 1 | Magic `0xC4` |
+| 1 | 1 | Version `1` |
+| 2 | 16 | Channel id |
+| 18 | .. | Opaque application bytes |
+
+There is no new packet class, header field or signature domain. The channel id
+is BLAKE3-128 over `aoheyra/mesh/v1/channel-id`, a one-byte name length, tag
+`0x01` and the name; the name itself is never sent. A separate
+`aoheyra/mesh/v1/channel-budget` hash turns the id into a synthetic key for the
+existing MSH-10 origin-bucket table. A hot channel is therefore limited without
+a second budget table and without eating the origin's general Broadcast
+allowance.
+
+| Setting | Default | Hard cap | Why |
+|---|---:|---:|---|
+| Local subscriptions | 32 | 256 | Bounds local name state; relays keep zero |
+| Channel name bytes | 64 | 64 | Fits one length byte and bounds hash input |
+| Envelope header | 18 | - | Magic, version and a 16-byte id |
+| Channel id bytes | 16 | - | 128-bit collision resistance with typed collision detection |
+
+`MeshInput::ChannelSubscribe` and `ChannelUnsubscribe` mutate only the node's
+bounded `ChannelRules` registry. Relays never receive them, so an uninvolved
+relay keeps an empty registry and forwards channel packets like any other
+Broadcast. A Broadcast payload starting with the reserved magic must be a
+complete envelope; a truncated or wrong-version one is rejected and counted
+against the sending link. Ordinary Broadcast payloads keep the MSH-11 path.
+
+For a copy arriving directly from the origin, a subscriber verifies the origin
+signature with the key proved by the sender's signed `MeshHello`, accepts the
+content id in the replay guard, and receives `MeshOutput::ChannelDeliver` with
+the envelope's opaque inner bytes. Relayed copies still forward under MSH-10
+and MSH-11 but are not delivered locally: the MSH-20 directory carries typed
+presence observations and no signed packet key, so a remote origin cannot be
+authenticated for local delivery. Verification is not relaxed to make a
+delivery happen. Extending the directory with a key proved under the packet
+domain can extend delivery beyond direct neighbours without changing the
+envelope.
+
+Locally submitted envelopes are validated before signing, then debited from the
+origin's Broadcast bucket and the channel bucket; the origin is refunded if the
+channel bucket refuses. Relays pay the normal origin and link buckets plus the
+channel bucket before suppression starts. All rejections are typed
+`ChannelError` values exposed as `MeshError::Channel`; no packet-driven path
+panics, and no payload is interpreted as text or an app schema.
+
+The fixed 20-node line case puts subscribers 9 and 11 in origin 10's radio
+range and leaves the other 17 nodes subscription-free. One signed message is
+submitted with seed `1297304023`:
+
+```bash
+cargo run --release --all-features --example channel_report
+cargo test --release --all-features --test sim_channels
+```
+
+The report CSV columns are `scenario,seed,nodes,submitted,subscribers,
+channel_deliveries,channel_transmissions,channel_bytes,broadcast_burst_bytes,
+within_broadcast_budget`. Its exact row is:
+
+| Scenario | Seed | Nodes | Submitted | Subscribers | Deliveries | Transmissions | Envelope bytes | Burst bytes | Within budget |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `channel-line-20` | 1297304023 | 20 | 1 | 2 | 2 | 12 | 3048 | 43690 | yes |
+
+Both in-range subscribers receive the message; no other node does. Twelve
+one-link transmissions carry 3,048 bytes against the 43,690-byte Broadcast
+burst allowance from ADR-0001. This row was remeasured after rebasing onto
+MSH-22: MSH-19's two-link suppression floor makes each line relay forward once,
+replacing the old two-transmission expectation from the pre-MSH-19 tree.
+Reachability and the budget gate are unchanged, and no published MSH-27
+threshold was lowered. The four published MSH-27 baselines are unchanged.
+## Fuzzing and resource bounds (MSH-28)
+
+Every neighbour byte stream and host-supplied slice has a hard bound before it
+can grow engine state. The packet decoder stays allocation-free; sync decoders
+reject a hostile body before copying it; summary construction and sync-offer
+handling read at most the store's entry cap. A reachable `debug_assert` in the
+delivery path was removed so hostile input cannot panic in debug builds.
+
+| Bound | Limit | Why |
+|---|---:|---|
+| Packet payload | 2048 bytes | Existing `MAX_PAYLOAD`, checked in the header (MSH-03) |
+| Varint field | 10 bytes | Canonical unsigned LEB128, checked before value use |
+| Summary entries | 1024 | Matches the default store cap; longer host slices are ignored |
+| Sync frame body | 8198 bytes | `6 + 1024 * 8`, the largest legitimate v1 summary |
+| Offers per engine input | 1024 | Matches the summary cap; `SyncItems` cannot mint extra work |
+| Fuzz input | 16 KiB | Larger than every decoder cap, small enough for fast campaigns |
+| Fuzz RSS / timeout | 2048 MiB / 10 s | Detects runaway allocation or a per-input loop |
+
+`SyncFrame::decode` and `SyncFrameV2::decode` are public and return typed
+`SyncError` / `SyncV2Error` values, including `FrameTooLarge(usize)`. This keeps
+fuzz diagnostics and host integration string-free without changing the wire
+format. `tests/resource_bounds.rs` uses a counting allocator to pin allocation
+and CPU-proxy ceilings for hostile packets, sync frames, summary streams,
+engine Data streams and store quotas. It is a single-test binary so no other
+test can pollute the counters.
+
+The `fuzz/` crate has three `libFuzzer` targets: `packet_decode`,
+`engine_input` and `sync_frames`. They use injected time and RNG, construct a
+verified neighbour without `unwrap`/`expect`, and treat malicious bytes as the
+input rather than setup failure. `.github/workflows/fuzz.yml` runs each target
+for one hour nightly and uploads crash artifacts on failure; no one-hour
+campaign is claimed locally. `libfuzzer-sys` (MIT/Apache-2.0, Rust-Fuzz, small
+binding crate) and `rand` 0.9 (MIT/Apache-2.0, already a dev-dependency) are
+dev-only; the core dependency set is unchanged.
+## Restart state (MSH-29)
+
+A restart snapshot is local, versioned host state rather than a protocol
+wire format: no capability negotiation or packet layout is involved. It
+covers the forwarding seen-cache, receipt immunity and spray tickets;
+stored packets, RNG state, config and radio sessions remain with the host.
+See the engine `Snapshot` trait and the paired restart report described in
+the seen-cache section above.
+## Observability (MSH-30)
+
+`MeshSnapshot` is a plain, versioned bundle of saturating counters and gauges.
+The host can map it directly into aoheyra's APP-15 diagnostics bundle; this
+crate performs no logging, file I/O or network export. `version` selects the
+field layout, so a host must switch on `MESH_SNAPSHOT_VERSION` before reading
+fields it does not recognise. Reading a snapshot is side-effect free: gauges
+are derived from state the engine already holds for routing policy.
+
+| Field | Meaning | Bound / owner |
+|---|---|---|
+| `duplicate_packets` | Duplicate verdicts from forwarding dedupe | Saturating `u64`; `SeenCache` |
+| `suppressed_relays` | Flood relays cancelled by MSH-11 | Saturating `u64`; `SuppressionTable` |
+| `store_entries` | Live ids from the last `MeshInput::StoreSummary` | `u32`; host-owned store |
+| `sync_bytes_sent` | Encoded sync frame bytes emitted on Bulk | Saturating `u64`; `SyncTracker` |
+| `sync_bytes_received` | Decoded sync frame bytes from verified neighbours | Saturating `u64`; `SyncTracker` |
+| `neighbour_penalty_events` | Positive penalty applications, including decayed ones | Saturating `u64`; `BudgetTracker` |
+| `neighbour_penalty_total`, `neighbour_penalty_max`, `penalised_neighbours` | Current decayable penalty scores | Existing neighbour table |
+| `seen_records`, `suppression_pending` | Live bounded table entries | `SeenConfig::capacity`, `SuppressionConfig::max_entries` |
+
+Counters are owned by the module that makes the decision, so there is no
+second source of truth. Cumulative counters saturate instead of wrapping under
+hostile traffic. Malformed or unverified frames add a neighbour penalty but are
+not counted as sync bytes. No field carries packet content, `MessageId`, keys,
+identities or personal data. The wire format and MSH-27 CSV schema are
+unchanged.
+
+```bash
+cargo run --release --all-features --example observability_report
+cargo test --release --all-features --test sim_observability
+cargo test --release --all-features --test observability
+```
+
+The fixed 20-node mixed scenario has seed `1297304021`; four malformed frames
+are injected from node 0 after traffic starts. The measured report row is:
+
+| Scenario | Seed | Submitted / delivered | Duplicates | Suppressed | Store ids | Sync bytes sent / received | Penalty events | Seen / pending |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `observability-mixed-20` | 1297304021 | 40 / 6 | 323 | 120 | 88 | 820 / 820 | 4 | 552 / 0 |
+
+The row was remeasured on the accumulated MSH-19 stack: the two-distinct-link
+suppression floor changed which relays cancel a flood, so it is not comparable
+to the original 367/193/89/512/7 measurement. No MSH-27 threshold was lowered.
+Current penalties are zero at the end because scores decay after the four
+events; `neighbour_penalty_events` is the durable evidence that the hostile
+neighbour was accounted for. `tests/sim_observability.rs` locks every value,
+and `tests/observability.rs` covers adapter mapping, stability, bounds and
+absence of content leakage. The actual APP-15 bundle wiring belongs to
+aoheyra and consumes this plain snapshot.

@@ -21,20 +21,24 @@
 //! and `tests/sim_baseline.rs` enforces the published numbers. Per-origin
 //! delivery counts are kept off the CSV for the MSH-10 flood test.
 
+use crate::directory::{DirectoryConfig, NodeObservation};
+use crate::presence::{ANNOUNCE_LEN, ANNOUNCE_MAGIC};
 use crate::store::{MemoryStore, MessageStore, StoreLimits, StoreMetadata, StoredMessage};
 use crate::{
-    CAP_SYNC_V1, CAPS, Header, MeshConfig, MeshEngine, MeshHello, MeshInput, MeshOutput, MessageId,
-    NetworkAdapter, Packet, PacketClass, SHORT_ID_BYTES, SYNC_MAGIC, SYNC_V2_VERSION, StoreSummary,
-    SuppressionConfig, SyncOffer, derive_msg_id, sign_packet,
+    CAP_PRESENCE_V1, CAP_RECEIPT_V1, CAP_SYNC_V1, CAPS, CHANNEL_MAGIC, ChannelEnvelope,
+    DirectoryChange, Header, MeshConfig, MeshEngine, MeshHello, MeshInput, MeshOutput, MessageId,
+    NetworkAdapter, Packet, PacketClass, PresenceConfig, RouteHintMode, SHORT_ID_BYTES, SYNC_MAGIC,
+    SYNC_V2_VERSION, Snapshot, StoreSummary, SuppressionConfig, SyncOffer, TelemetryConfig,
+    TelemetryFrame, TelemetryKind, derive_channel_id, derive_msg_id, sign_packet,
 };
-use ao_idents::{Identity, SealedMessage};
+use ao_idents::{Identity, NodeId, SealedMessage};
 use ao_network::{
     AppHello, BeaconFlags, Channel, Hello, LinkId, LinkInfo, LocalTag, Network, NetworkConfig,
     NetworkEvent, SimConfig as WorldConfig, SimNode, SimTransport, SimWorld,
 };
 use rand::{SeedableRng as SeedableRng09, rngs::StdRng as EngineRng};
 use rand08::{SeedableRng as SeedableRng08, rngs::StdRng as SealRng};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -45,6 +49,13 @@ const TICK: Duration = Duration::from_millis(50);
 const MAX_STORE_SERVICE_ROUNDS: usize = 64;
 /// Radio range in the position units used by random and community layouts.
 const RADIUS: i64 = 100;
+/// How often the harness supplies MSH-20 directory observations for the
+/// MSH-21 paired report. These are host facts, not mesh packets; verified
+/// presence announcements feed the same seam automatically in other scenarios.
+const HINT_REFRESH: Duration = Duration::from_secs(5);
+
+type TelemetryStream = ([u8; 16], TelemetryKind);
+type TelemetrySeqs = BTreeMap<TelemetryStream, BTreeSet<u64>>;
 
 /// Where nodes start and which pairs are in radio range.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,6 +66,16 @@ pub enum Topology {
     Line,
     /// A cycle of `n` nodes, each in range of its two neighbours.
     Ring,
+    /// A fixed circulant: each node reaches `i +/- step` for every step.
+    ///
+    /// MSH-19 uses coprime steps 1, 8 and 12 on 50 nodes. The six-degree
+    /// graph has diameter three, exactly ADR-0001's Presence TTL, so the
+    /// convergence case does not need a longer relay hop limit. The scenario
+    /// raises aoNetwork's link cap to six; production still uses five.
+    Circulant {
+        /// Positive index offsets, all smaller than `n / 2`.
+        steps: Vec<usize>,
+    },
     /// `groups` clusters with seeded centres, for community mobility.
     Communities {
         /// Number of equally sized communities.
@@ -129,6 +150,70 @@ pub enum Traffic {
         /// Submit one Direct canary every `direct_every` messages.
         direct_every: usize,
     },
+    /// No application traffic: only MSH-19 announcements are gossiped.
+    ///
+    /// This isolates presence convergence and overhead from message delivery.
+    Presence,
+    /// Submit latest-wins Telemetry updates through the typed MSH-22 path.
+    Telemetry {
+        /// Node index of the origin.
+        origin: usize,
+        /// Opaque stream tag, passed through unchanged.
+        kind: u8,
+        /// Submit every update at once instead of staggering it.
+        ///
+        /// The burst is what makes a send queue the bottleneck: NET-21's
+        /// coalescing key must leave one pending update for the stream.
+        burst: bool,
+    },
+    /// Submit signed public-channel Broadcasts (MSH-23).
+    ///
+    /// Only the listed nodes subscribe locally; every other node is a relay
+    /// with no channel state. The message must reach every subscriber in
+    /// direct radio range of `origin`, while all channel traffic stays inside
+    /// the Broadcast relay budget.
+    Channel {
+        /// Node index of the channel's origin.
+        origin: usize,
+        /// Channel name, hashed locally by subscribers and the origin.
+        name: &'static str,
+        /// Nodes with a local subscription.
+        subscribers: &'static [usize],
+    },
+}
+
+/// Host-side directory observation schedule for one scenario (MSH-20).
+///
+/// The harness injects the same bounded facts that verified MSH-19
+/// announcements produce, with presence traffic off, so the test isolates
+/// directory capacity and expiry. It never changes routing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryPlan {
+    /// Directory bounds and staleness under test.
+    pub config: DirectoryConfig,
+    /// Local milliseconds between announcement rounds.
+    pub every_ms: u64,
+    /// Number of rounds; each node announces one other node per round.
+    pub announcements: usize,
+    /// Magnitude of the alternating observation-time skew. Even-index nodes
+    /// report this far in the future, odd-index nodes that far in the past.
+    pub observed_skew_ms: u64,
+}
+
+/// A mid-run engine restart (MSH-29).
+///
+/// The host snapshots every engine, drops it and constructs a new one with
+/// the same RNG seed and config. With `restore` set the snapshot is applied;
+/// the ablation discards it. Live links are re-announced with `MeshInput::LinkUp`
+/// because link capabilities are per-session and are not persisted. One
+/// previously relayed packet is replayed on each node immediately afterwards:
+/// that delayed copy is exactly what a lost seen-cache would re-relay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Restart {
+    /// Run-relative time of the restart.
+    pub at: Duration,
+    /// Whether the new engine receives the old engine's snapshot.
+    pub restore: bool,
 }
 
 /// One reproducible experiment.
@@ -167,8 +252,28 @@ pub struct Scenario {
     /// The published MSH-27 baselines keep this false so they remain the
     /// relay-only MSH-08 reference; spray gets its own paired report.
     pub spray: bool,
+    /// Whether signed receipts and store purges are enabled (MSH-17).
+    ///
+    /// Ablation runs keep this false so the effect of receipts can be
+    /// measured without changing any other engine behaviour.
+    pub receipts: bool,
+    /// MSH-21 route-hint mode. `Off` keeps every published row unchanged.
+    pub route_hint: RouteHintMode,
     /// Suppression bounds and timer parameters under test.
     pub suppression: SuppressionConfig,
+    /// Whether links advertise and consume MSH-19 announcements.
+    ///
+    /// Existing baselines leave this false so their published numbers and
+    /// pre-MSH-19 fallback behaviour stay unchanged.
+    pub presence: bool,
+    /// Presence trickle parameters under test.
+    pub presence_config: PresenceConfig,
+    /// Optional directory observation schedule (MSH-20).
+    pub directory: Option<DirectoryPlan>,
+    /// Telemetry freshness, throttle and state bounds under test (MSH-22).
+    pub telemetry: TelemetryConfig,
+    /// Mid-run engine restart, if this scenario exercises MSH-29.
+    pub restart: Option<Restart>,
 }
 
 /// Everything one run measured. Ratios are fractions, not percentages.
@@ -226,17 +331,196 @@ pub struct Metrics {
     ///
     /// Not part of the CSV report.
     pub unique_receptions: u64,
+    /// Typed Telemetry submissions attempted in this scenario (MSH-22).
+    pub telemetry_attempts: u64,
+    /// Telemetry submissions the origin's throttle accepted.
+    pub telemetry_accepted: u64,
+    /// Telemetry submissions refused by the typed policy.
+    pub telemetry_rejected: u64,
+    /// Structurally valid Telemetry packets received at mesh nodes.
+    pub telemetry_receptions: u64,
+    /// Distinct sequences observed per `(origin, kind)`, summed over nodes.
+    pub telemetry_distinct_seqs: u64,
+    /// Most sequences any one node observed for one stream.
+    ///
+    /// With an in-flight first frame, a value of two proves at most one
+    /// further update stayed pending per coalescing key.
+    pub telemetry_max_seqs_per_node: u64,
+    /// Highest Telemetry sequence observed anywhere in the scenario.
+    pub telemetry_max_seq: u64,
+    /// Store evictions caused by authenticated delivery receipts.
+    ///
+    /// Not part of the CSV report; MSH-17 uses it with `remaining_copies`.
+    pub purges: u64,
+    /// Authenticated receipts that reached their origin.
+    ///
+    /// Not part of the CSV report; this is the sender's Delivered status.
+    pub delivery_receipts: u64,
+    /// Stored copies still present when the scenario ends.
+    ///
+    /// Not part of the CSV report; includes messages that were never
+    /// delivered, for which no receipt can exist.
+    pub remaining_copies: usize,
+    /// Stored copies of delivered messages still present at the end.
+    ///
+    /// Not part of the CSV report; zero is the MSH-17 purge requirement.
+    pub remaining_delivered_copies: usize,
+    /// Of the remaining delivered copies, how many sit at nodes that already
+    /// hold the receipt. Non-zero means the host did not honour its purge.
+    ///
+    /// Not part of the CSV report; a diagnosis field for MSH-17.
+    pub remaining_delivered_copies_immune: usize,
+    /// Slowest interval from first delivery to an empty store set.
+    ///
+    /// Not part of the CSV report; bounded by the MSH-02 immunity lifetime.
+    pub max_purge_latency_ms: u64,
+    /// Whether every node learned every other node's announcement.
+    ///
+    /// Not part of the CSV report; MSH-19 convergence evidence.
+    pub presence_converged: bool,
+    /// Run-relative time when the last node reached full knowledge.
+    ///
+    /// Not part of the CSV report; zero when convergence did not happen.
+    pub convergence_ms: u64,
+    /// Fewest announcements learned by any node at the end of the run.
+    ///
+    /// Not part of the CSV report; the denominator is `nodes - 1`.
+    pub learned_nodes_min: usize,
+    /// Unknown-card host events emitted during the run.
+    ///
+    /// Not part of the CSV report; the fixed scenario declares all hashes.
+    pub card_fetches: u64,
+    /// Announcement sends and wire bytes during the run.
+    ///
+    /// Not part of the CSV report; these isolate MSH-19 from other traffic.
+    pub announcement_sends: u64,
+    /// Announcement wire bytes during the run.
+    pub announcement_bytes: u64,
+    /// Announcement sends in the last 60 seconds of the run.
+    pub steady_announcement_sends: u64,
+    /// Announcement wire bytes in the last 60 seconds of the run.
+    pub steady_announcement_bytes: u64,
+    /// Peak entries held by any node's directory (MSH-20).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub directory_peak_entries: usize,
+    /// Relative-time expirations summed over all nodes (MSH-20).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub directory_expirations: u64,
+    /// Capacity evictions summed over all nodes (MSH-20).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub directory_evictions: u64,
+    /// Last local millisecond at which any directory entry was removed
+    /// (MSH-20). Not part of the MSH-27 CSV report.
+    pub directory_last_removal_ms: u64,
+    /// Entries still live at the end of the run (MSH-20). The scenario's
+    /// staleness must have reclaimed every entry by then.
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub directory_live_entries: usize,
+    /// MSH-21 submissions that had a fresh hint for their destination.
+    ///
+    /// Not part of the CSV report; the denominator of the fresh-path
+    /// latency comparison.
+    pub fresh_hint_submissions: u64,
+    /// Deliveries of messages that had a fresh hint at submission.
+    ///
+    /// Not part of the CSV report.
+    pub fresh_hint_deliveries: u64,
+    /// Mean latency of fresh-hint deliveries in milliseconds.
+    ///
+    /// Not part of the CSV report; the MSH-21 acceptance measure.
+    pub fresh_hint_mean_latency_ms: u64,
+    /// Nodes with a local channel subscription (MSH-23).
+    ///
+    /// Not part of the published MSH-27 CSV; `channel_csv_row` reports it.
+    pub channel_subscribers: usize,
+    /// Signed channel envelopes accepted by local subscribers (MSH-23).
+    ///
+    /// Not part of the published MSH-27 CSV; `channel_csv_row` reports it.
+    pub channel_deliveries: u64,
+    /// Unique channel messages accepted at each local subscriber.
+    ///
+    /// Not part of the published MSH-27 CSV.
+    pub channel_delivered_ids: Vec<BTreeSet<MessageId>>,
+    /// Mesh sends whose payload was a channel envelope.
+    ///
+    /// Not part of the published MSH-27 CSV; this is the numerator of the
+    /// Broadcast-budget gate.
+    pub channel_transmissions: u64,
+    /// Radio bytes in channel-envelope sends.
+    ///
+    /// Not part of the published MSH-27 CSV.
+    pub channel_bytes: u64,
+    /// Bytes in the largest MSH-29 snapshot taken at the restart.
+    ///
+    /// Not part of the CSV report.
+    pub restart_snapshot_bytes: usize,
+    /// Message sends after the restart whose id this node had already sent.
+    ///
+    /// Not part of the CSV report; the MSH-29 replay signal must be zero.
+    pub restart_replays: u64,
+    /// All message sends after the restart, for context on `restart_replays`.
+    ///
+    /// Not part of the CSV report.
+    pub restart_sends_after: u64,
+    /// Sum of per-node duplicate counters (MSH-30).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub duplicate_packets: u64,
+    /// Sum of per-node cancelled relays (MSH-30).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub suppressed_relays: u64,
+    /// Sum of live store ids in the last store summary at each node (MSH-30).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub store_entries: u64,
+    /// Sum of encoded sync bytes sent by every node (MSH-30).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub sync_bytes_sent: u64,
+    /// Sum of valid sync bytes received by every node (MSH-30).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub sync_bytes_received: u64,
+    /// Sum of neighbour penalty applications (MSH-30).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub neighbour_penalty_events: u64,
+    /// Sum of current neighbour penalty scores at the end (MSH-30).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub neighbour_penalty_total: u64,
+    /// Largest current penalty score at any node (MSH-30).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub neighbour_penalty_max: u32,
+    /// Number of neighbours with a non-zero penalty at the end (MSH-30).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub penalised_neighbours: u64,
+    /// Sum of seen-cache recordings at the end (MSH-30).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub seen_records: u64,
+    /// Sum of pending suppression windows at the end (MSH-30).
+    ///
+    /// Not part of the MSH-27 CSV report.
+    pub suppression_pending: u64,
 }
 
 impl Metrics {
     /// CSV column names, in the same order as [`Self::csv_row`].
     pub fn csv_header() -> &'static str {
-        "scenario,seed,nodes,submitted,delivered,duplicate_deliveries,transmissions,receptions,send_failures,radio_bytes,mean_latency_ms,max_latency_ms,delivery_ratio,overhead,duplicate_ratio,peak_queued_bytes,links_after_settle"
+        "scenario,seed,nodes,submitted,delivered,duplicate_deliveries,transmissions,receptions,send_failures,radio_bytes,mean_latency_ms,max_latency_ms,delivery_ratio,overhead,duplicate_ratio,peak_queued_bytes,links_after_settle,presence_converged,convergence_ms,learned_nodes_min,card_fetches,announcement_sends,announcement_bytes,steady_announcement_sends,steady_announcement_bytes"
     }
     /// One CSV line with four decimal places on every ratio.
     pub fn csv_row(&self) -> String {
         format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{},{},{},{},{},{},{},{},{},{}",
             self.scenario,
             self.seed,
             self.nodes,
@@ -254,6 +538,67 @@ impl Metrics {
             self.duplicate_ratio,
             self.peak_queued_bytes,
             self.links_after_settle,
+            self.presence_converged,
+            self.convergence_ms,
+            self.learned_nodes_min,
+            self.card_fetches,
+            self.announcement_sends,
+            self.announcement_bytes,
+            self.steady_announcement_sends,
+            self.steady_announcement_bytes,
+        )
+    }
+    /// Telemetry-specific columns, outside the published MSH-27 schema.
+    pub fn telemetry_csv_header() -> &'static str {
+        "scenario,seed,nodes,telemetry_attempts,telemetry_accepted,telemetry_rejected,telemetry_receptions,telemetry_distinct_seqs,telemetry_max_seqs_per_node,telemetry_max_seq,transmissions,radio_bytes"
+    }
+    /// One MSH-22 row. Receptions and distinct sequences are the observable
+    /// proof that only one pending update survived a slow send queue.
+    pub fn telemetry_csv_row(&self) -> String {
+        format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{}",
+            self.scenario,
+            self.seed,
+            self.nodes,
+            self.telemetry_attempts,
+            self.telemetry_accepted,
+            self.telemetry_rejected,
+            self.telemetry_receptions,
+            self.telemetry_distinct_seqs,
+            self.telemetry_max_seqs_per_node,
+            self.telemetry_max_seq,
+            self.transmissions,
+            self.radio_bytes,
+        )
+    }
+
+    /// MSH-23 columns, outside the published MSH-27 radio schema.
+    ///
+    /// `broadcast_burst_bytes` is the full MSH-10 Broadcast allowance for
+    /// `burst_seconds`. `within_broadcast_budget` is true when every channel
+    /// transmission this run could fit in that one bucket, which is the
+    /// channel issue's "without exceeding the Broadcast budget" gate.
+    pub fn channel_csv_header() -> &'static str {
+        "scenario,seed,nodes,submitted,subscribers,channel_deliveries,channel_transmissions,channel_bytes,broadcast_burst_bytes,within_broadcast_budget"
+    }
+
+    /// One MSH-23 CSV line.
+    pub fn channel_csv_row(&self) -> String {
+        let burst = crate::BudgetConfig::default().rates
+            [crate::PacketClass::Broadcast as usize - 1]
+            .burst_bytes();
+        format!(
+            "{},{},{},{},{},{},{},{},{},{}",
+            self.scenario,
+            self.seed,
+            self.nodes,
+            self.submitted,
+            self.channel_subscribers,
+            self.channel_deliveries,
+            self.channel_transmissions,
+            self.channel_bytes,
+            burst,
+            self.channel_bytes <= burst,
         )
     }
 }
@@ -276,7 +621,14 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             enforce_budgets: true,
             enforce_suppression: true,
             spray: false,
+            receipts: false,
+            route_hint: RouteHintMode::Off,
             suppression: SuppressionConfig::default(),
+            presence: false,
+            presence_config: PresenceConfig::default(),
+            directory: None,
+            telemetry: TelemetryConfig::default(),
+            restart: None,
         },
         Scenario {
             name: "waypoint-50",
@@ -294,7 +646,14 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             enforce_budgets: true,
             enforce_suppression: true,
             spray: false,
+            receipts: false,
+            route_hint: RouteHintMode::Off,
             suppression: SuppressionConfig::default(),
+            presence: false,
+            presence_config: PresenceConfig::default(),
+            directory: None,
+            telemetry: TelemetryConfig::default(),
+            restart: None,
         },
         Scenario {
             name: "community-100",
@@ -312,7 +671,14 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             enforce_budgets: true,
             enforce_suppression: true,
             spray: false,
+            receipts: false,
+            route_hint: RouteHintMode::Off,
             suppression: SuppressionConfig::default(),
+            presence: false,
+            presence_config: PresenceConfig::default(),
+            directory: None,
+            telemetry: TelemetryConfig::default(),
+            restart: None,
         },
         Scenario {
             name: "scripted-200",
@@ -328,7 +694,14 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             enforce_budgets: true,
             enforce_suppression: true,
             spray: false,
+            receipts: false,
+            route_hint: RouteHintMode::Off,
             suppression: SuppressionConfig::default(),
+            presence: false,
+            presence_config: PresenceConfig::default(),
+            directory: None,
+            telemetry: TelemetryConfig::default(),
+            restart: None,
         },
     ]
 }
@@ -359,7 +732,14 @@ pub fn flood_scenarios() -> Vec<Scenario> {
         enforce_budgets: true,
         enforce_suppression: true,
         spray: false,
+        receipts: false,
+        route_hint: RouteHintMode::Off,
         suppression: SuppressionConfig::default(),
+        presence: false,
+        presence_config: PresenceConfig::default(),
+        directory: None,
+        telemetry: TelemetryConfig::default(),
+        restart: None,
     }]
 }
 
@@ -389,7 +769,51 @@ pub fn suppression_scenarios() -> Vec<Scenario> {
         enforce_budgets: true,
         enforce_suppression: true,
         spray: false,
+        receipts: false,
+        route_hint: RouteHintMode::Off,
         suppression: SuppressionConfig::default(),
+        presence: false,
+        presence_config: PresenceConfig::default(),
+        directory: None,
+        telemetry: TelemetryConfig::default(),
+        restart: None,
+    }]
+}
+
+/// MSH-23's fixed public-channel case.
+///
+/// A line gives an exact, topology-independent expectation: nodes 9 and 11
+/// are the only subscribers in node 10's radio range. Only those two nodes
+/// receive a `ChannelSubscribe`; every other node stays a subscription-free
+/// relay. One signed envelope is enough to check reachability and the
+/// Broadcast-budget ceiling without a long run.
+pub fn channel_scenarios() -> Vec<Scenario> {
+    vec![Scenario {
+        name: "channel-line-20",
+        seed: 1_297_304_023,
+        nodes: 20,
+        topology: Topology::Line,
+        mobility: Mobility::Static,
+        settle: Duration::from_secs(30),
+        run: Duration::from_secs(30),
+        messages: 1,
+        payload_len: 128,
+        traffic: Traffic::Channel {
+            origin: 10,
+            name: "town-square",
+            subscribers: &[9, 11],
+        },
+        enforce_budgets: true,
+        enforce_suppression: true,
+        spray: false,
+        receipts: false,
+        route_hint: RouteHintMode::Off,
+        suppression: SuppressionConfig::default(),
+        presence: false,
+        presence_config: PresenceConfig::default(),
+        directory: None,
+        telemetry: TelemetryConfig::default(),
+        restart: None,
     }]
 }
 
@@ -413,7 +837,14 @@ pub fn spray_scenarios() -> Vec<Scenario> {
         enforce_budgets: true,
         enforce_suppression: true,
         spray: false,
+        receipts: false,
+        route_hint: RouteHintMode::Off,
         suppression: SuppressionConfig::default(),
+        presence: false,
+        presence_config: PresenceConfig::default(),
+        directory: None,
+        telemetry: TelemetryConfig::default(),
+        restart: None,
     };
     let scripted = Scenario {
         name: "spray-relay-scripted-200",
@@ -429,20 +860,446 @@ pub fn spray_scenarios() -> Vec<Scenario> {
         enforce_budgets: true,
         enforce_suppression: true,
         spray: false,
+        receipts: false,
+        route_hint: RouteHintMode::Off,
         suppression: SuppressionConfig::default(),
+        presence: false,
+        presence_config: PresenceConfig::default(),
+        directory: None,
+        telemetry: TelemetryConfig::default(),
+        restart: None,
     };
     vec![
         line.clone(),
         Scenario {
             name: "spray-enabled-line-20",
             spray: true,
+            receipts: false,
             ..line
         },
         scripted.clone(),
         Scenario {
             name: "spray-enabled-scripted-200",
             spray: true,
+            receipts: false,
             ..scripted
+        },
+    ]
+}
+
+/// Simulator-only hostile-neighbour injection (MSH-30).
+///
+/// This is never available to a real radio: the harness writes malformed
+/// bytes straight into aoNetwork's facade from one node, so the receiving
+/// engine exercises its penalty path without changing the sender's engine.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Injection {
+    /// Node index whose facade emits malformed frames.
+    pub from: usize,
+    /// Number of one-byte frames to emit, at most one per pump step.
+    pub invalid_frames: usize,
+}
+
+/// One MSH-30 scenario and the hostile neighbour traffic layered on it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservabilityScenario {
+    /// The ordinary seeded scenario.
+    pub scenario: Scenario,
+    /// Malformed frames injected after traffic has started.
+    pub injection: Injection,
+}
+
+/// The fixed MSH-30 counter scenario.
+///
+/// Mixed Broadcast/Direct traffic fills the suppression and dedupe counters,
+/// spray populates host stores and starts anti-entropy contacts for sync
+/// bytes, and a scripted malformed-frame neighbour exercises penalties. The
+/// seed and injection schedule are fixed; `tests/sim_observability.rs` locks
+/// the resulting numbers.
+pub fn observability_scenarios() -> Vec<ObservabilityScenario> {
+    vec![ObservabilityScenario {
+        scenario: Scenario {
+            name: "observability-mixed-20",
+            seed: 1_297_304_021,
+            nodes: 20,
+            topology: Topology::Random,
+            mobility: Mobility::Static,
+            settle: Duration::from_secs(30),
+            run: Duration::from_secs(60),
+            messages: 40,
+            payload_len: 128,
+            traffic: Traffic::MixedBroadcast {
+                origin: 0,
+                direct_every: 5,
+            },
+            enforce_budgets: true,
+            enforce_suppression: true,
+            spray: true,
+            receipts: false,
+            route_hint: RouteHintMode::Off,
+            suppression: SuppressionConfig::default(),
+            presence: false,
+            presence_config: PresenceConfig::default(),
+            directory: None,
+            telemetry: TelemetryConfig::default(),
+            restart: None,
+        },
+        injection: Injection {
+            from: 0,
+            invalid_frames: 4,
+        },
+    }]
+}
+
+/// Runs one MSH-30 scenario with its injection attached.
+pub fn run_observability(experiment: ObservabilityScenario) -> Metrics {
+    let mut simulation = Simulation::new(experiment.scenario);
+    simulation.injection = experiment.injection;
+    simulation.run()
+}
+
+/// The fixed MSH-17 receipt and purge comparison scenarios.
+pub fn receipt_scenarios() -> Vec<Scenario> {
+    let line = Scenario {
+        name: "receipt-relay-line-20",
+        seed: 1_297_303_584,
+        nodes: 20,
+        topology: Topology::Line,
+        mobility: Mobility::Static,
+        settle: Duration::from_secs(30),
+        run: Duration::from_secs(30),
+        messages: 20,
+        payload_len: 128,
+        traffic: Traffic::Balanced,
+        enforce_budgets: true,
+        enforce_suppression: true,
+        spray: true,
+        receipts: false,
+        route_hint: RouteHintMode::Off,
+        suppression: SuppressionConfig::default(),
+        presence: false,
+        presence_config: PresenceConfig::default(),
+        directory: None,
+        telemetry: TelemetryConfig::default(),
+        restart: None,
+    };
+    let scripted = Scenario {
+        name: "receipt-relay-scripted-200",
+        seed: 1_297_303_752,
+        nodes: 200,
+        topology: Topology::Scripted(scripted_contacts(200)),
+        mobility: Mobility::Scripted,
+        settle: Duration::from_secs(60),
+        run: Duration::from_secs(90),
+        messages: 100,
+        payload_len: 128,
+        traffic: Traffic::Balanced,
+        enforce_budgets: true,
+        enforce_suppression: true,
+        spray: true,
+        receipts: false,
+        route_hint: RouteHintMode::Off,
+        suppression: SuppressionConfig::default(),
+        presence: false,
+        presence_config: PresenceConfig::default(),
+        directory: None,
+        telemetry: TelemetryConfig::default(),
+        restart: None,
+    };
+    vec![
+        line.clone(),
+        Scenario {
+            name: "receipt-enabled-line-20",
+            receipts: true,
+            route_hint: RouteHintMode::Off,
+            ..line
+        },
+        scripted.clone(),
+        Scenario {
+            name: "receipt-enabled-scripted-200",
+            receipts: true,
+            route_hint: RouteHintMode::Off,
+            ..scripted
+        },
+    ]
+}
+
+/// MSH-19's fixed 50-node presence case.
+///
+/// The topology is a seeded four-degree circulant with diameter two, so
+/// ADR-0001's three-hop Presence TTL can reach the whole mesh. No application
+/// messages are submitted: every byte on the wire is an announcement or an
+/// ordinary link-control frame. The one-second quick delay proves bounded
+/// convergence, and a 60-second steady interval is deliberately more frequent
+/// than the 15-minute default so a short run still measures a conservative
+/// per-node hourly overhead. All nodes declare each other's card hashes, so
+/// zero `CardFetch` events is part of the expected steady state.
+pub fn presence_scenarios() -> Vec<Scenario> {
+    vec![Scenario {
+        name: "presence-smallworld-50",
+        seed: 1_297_304_021,
+        nodes: 50,
+        topology: Topology::Circulant {
+            steps: vec![1, 8, 12],
+        },
+        mobility: Mobility::Static,
+        settle: Duration::from_secs(30),
+        run: Duration::from_secs(120),
+        messages: 0,
+        payload_len: 0,
+        traffic: Traffic::Presence,
+        enforce_budgets: true,
+        enforce_suppression: true,
+        spray: false,
+        receipts: false,
+        route_hint: RouteHintMode::Off,
+        suppression: SuppressionConfig::default(),
+        presence: true,
+        presence_config: PresenceConfig {
+            quick_ms: 1_000,
+            base_interval_ms: 60_000,
+            steady_interval_ms: 60_000,
+            ..PresenceConfig::default()
+        },
+        directory: None,
+        telemetry: TelemetryConfig::default(),
+        restart: None,
+    }]
+}
+
+/// MSH-22's paired Telemetry cases.
+///
+/// The slow-line row bursts eight updates from one origin before the radio
+/// gets a tick. NET-21 must coalesce them to one pending frame per key, so
+/// every receiver observes only the newest sequence. The chatty row uses the
+/// default per-origin interval; eleven of its twelve attempts must be
+/// rejected locally before they ever reach a queue.
+pub fn telemetry_scenarios() -> Vec<Scenario> {
+    let slow = Scenario {
+        name: "telemetry-slow-line-5",
+        seed: 1_297_304_023,
+        nodes: 5,
+        topology: Topology::Line,
+        mobility: Mobility::Static,
+        settle: Duration::from_secs(30),
+        run: Duration::from_secs(5),
+        messages: 8,
+        payload_len: 64,
+        traffic: Traffic::Telemetry {
+            origin: 0,
+            kind: 7,
+            burst: true,
+        },
+        enforce_budgets: true,
+        enforce_suppression: true,
+        spray: false,
+        receipts: false,
+        route_hint: RouteHintMode::Off,
+        suppression: SuppressionConfig::default(),
+        presence: false,
+        presence_config: PresenceConfig::default(),
+        directory: None,
+        telemetry: TelemetryConfig {
+            rate_limit_ms: 0,
+            ..TelemetryConfig::default()
+        },
+        restart: None,
+    };
+    let chatty = Scenario {
+        name: "telemetry-chatty-random-20",
+        seed: 1_297_304_029,
+        nodes: 20,
+        topology: Topology::Random,
+        mobility: Mobility::Static,
+        settle: Duration::from_secs(30),
+        run: Duration::from_secs(8),
+        messages: 12,
+        payload_len: 64,
+        traffic: Traffic::Telemetry {
+            origin: 0,
+            kind: 7,
+            burst: false,
+        },
+        enforce_budgets: true,
+        enforce_suppression: true,
+        spray: false,
+        receipts: false,
+        route_hint: RouteHintMode::Off,
+        suppression: SuppressionConfig::default(),
+        presence: false,
+        presence_config: PresenceConfig::default(),
+        directory: None,
+        telemetry: TelemetryConfig::default(),
+        restart: None,
+    };
+    vec![slow, chatty]
+}
+
+/// MSH-20's fixed directory case: a small static line whose nodes announce
+/// each other on a seeded schedule with alternating observation-time skew.
+///
+/// The four-entry ceiling and two-second relative lifetime are far smaller
+/// than the defaults so the run exercises both capacity eviction and
+/// scheduled expiry. Presence traffic stays off; the host injects the typed
+/// observations that verified MSH-19 announcements produce at runtime.
+pub fn directory_scenarios() -> Vec<Scenario> {
+    vec![Scenario {
+        name: "directory-line-6",
+        seed: 1_297_304_021,
+        nodes: 6,
+        topology: Topology::Line,
+        mobility: Mobility::Static,
+        settle: Duration::from_millis(100),
+        run: Duration::from_secs(6),
+        messages: 1,
+        payload_len: 32,
+        traffic: Traffic::Balanced,
+        enforce_budgets: true,
+        enforce_suppression: true,
+        spray: false,
+        receipts: false,
+        route_hint: RouteHintMode::Off,
+        suppression: SuppressionConfig::default(),
+        presence: false,
+        presence_config: PresenceConfig::default(),
+        directory: Some(DirectoryPlan {
+            config: DirectoryConfig {
+                capacity: 4,
+                stale_after_ms: 2_000,
+                max_location_bytes: 8,
+                max_change_events: 8,
+            },
+            every_ms: 250,
+            announcements: 8,
+            observed_skew_ms: 5_000,
+        }),
+        telemetry: TelemetryConfig::default(),
+        restart: None,
+    }]
+}
+
+/// MSH-21's paired route-hint case.
+///
+/// All three rows share the MSH-16 spray seed, topology, traffic, budgets and
+/// receipt setting; only the hint mode differs. The harness supplies the same
+/// seeded facts through `MeshInput::ObserveNode` in every row, so the engine's
+/// MSH-20 directory derives identical hints and latency changes are attributable
+/// to how a fresh hint is used. `Off` is the unhinted spray baseline.
+pub fn route_hint_scenarios() -> Vec<Scenario> {
+    let line = Scenario {
+        name: "hint-spray-line-20",
+        seed: 1_297_303_584,
+        nodes: 20,
+        topology: Topology::Line,
+        mobility: Mobility::Static,
+        settle: Duration::from_secs(30),
+        run: Duration::from_secs(30),
+        messages: 20,
+        payload_len: 128,
+        traffic: Traffic::Balanced,
+        enforce_budgets: true,
+        enforce_suppression: true,
+        spray: true,
+        receipts: false,
+        route_hint: RouteHintMode::Off,
+        suppression: SuppressionConfig::default(),
+        presence: false,
+        presence_config: PresenceConfig::default(),
+        directory: None,
+        telemetry: TelemetryConfig::default(),
+        restart: None,
+    };
+    let random = Scenario {
+        name: "hint-spray-random-20",
+        seed: 1_297_303_632,
+        nodes: 20,
+        topology: Topology::Random,
+        mobility: Mobility::Static,
+        settle: Duration::from_secs(30),
+        run: Duration::from_secs(30),
+        messages: 20,
+        payload_len: 128,
+        traffic: Traffic::Balanced,
+        enforce_budgets: true,
+        enforce_suppression: true,
+        spray: true,
+        receipts: false,
+        route_hint: RouteHintMode::Off,
+        suppression: SuppressionConfig::default(),
+        presence: false,
+        presence_config: PresenceConfig::default(),
+        directory: None,
+        telemetry: TelemetryConfig::default(),
+        restart: None,
+    };
+    vec![
+        line.clone(),
+        Scenario {
+            name: "hint-additive-line-20",
+            route_hint: RouteHintMode::AdditiveUnicast,
+            ..line.clone()
+        },
+        Scenario {
+            name: "hint-substitute-line-20",
+            route_hint: RouteHintMode::SubstituteCopy,
+            ..line
+        },
+        random.clone(),
+        Scenario {
+            name: "hint-additive-random-20",
+            route_hint: RouteHintMode::AdditiveUnicast,
+            ..random.clone()
+        },
+        Scenario {
+            name: "hint-substitute-random-20",
+            route_hint: RouteHintMode::SubstituteCopy,
+            ..random
+        },
+    ]
+}
+
+/// MSH-29's paired restart case.
+///
+/// Both rows use the fixed line-20 seed, spray and receipts so all three
+/// snapshot sections are populated. Engines restart halfway through the run;
+/// only the `restore` bit differs, so the replay count is attributable to
+/// the snapshot rather than to topology, traffic or the RNG stream.
+pub fn restart_scenarios() -> Vec<Scenario> {
+    let base = Scenario {
+        name: "restart-lost-line-20",
+        seed: 1_297_303_584,
+        nodes: 20,
+        topology: Topology::Line,
+        mobility: Mobility::Static,
+        settle: Duration::from_secs(30),
+        run: Duration::from_secs(30),
+        messages: 20,
+        payload_len: 128,
+        traffic: Traffic::Balanced,
+        enforce_budgets: true,
+        enforce_suppression: true,
+        spray: true,
+        receipts: true,
+        route_hint: RouteHintMode::Off,
+        suppression: SuppressionConfig::default(),
+        presence: false,
+        presence_config: PresenceConfig::default(),
+        directory: None,
+        telemetry: TelemetryConfig::default(),
+        restart: Some(Restart {
+            at: Duration::from_secs(16),
+            restore: false,
+        }),
+    };
+    vec![
+        base.clone(),
+        Scenario {
+            name: "restart-restored-line-20",
+            restart: Some(Restart {
+                at: Duration::from_secs(16),
+                restore: true,
+            }),
+            ..base
         },
     ]
 }
@@ -478,8 +1335,30 @@ fn next(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
+fn engine_config(scenario: &Scenario) -> MeshConfig {
+    let mut config = MeshConfig::default();
+    config.budgets.enforce = scenario.enforce_budgets;
+    config.spray.enabled = scenario.spray;
+    config.receipt.enabled = scenario.receipts;
+    config.presence = PresenceConfig {
+        enabled: scenario.presence,
+        ..scenario.presence_config
+    };
+    if let Some(plan) = &scenario.directory {
+        config.directory = plan.config;
+    }
+    config.route_hint.mode = scenario.route_hint;
+    config.suppression = SuppressionConfig {
+        enabled: scenario.enforce_suppression,
+        ..scenario.suppression
+    };
+    config.telemetry = scenario.telemetry;
+    config
+}
+
 struct Node {
     adapter: NetworkAdapter<EngineRng, SimTransport>,
+    card_hash: [u8; 8],
     pos: (i64, i64),
     group: usize,
 }
@@ -514,8 +1393,50 @@ pub struct Simulation {
     delivered_ids: Vec<BTreeSet<MessageId>>,
     delivered_by_origin: Vec<u64>,
     received_ids: Vec<BTreeSet<MessageId>>,
+    telemetry_attempts: u64,
+    telemetry_accepted: u64,
+    telemetry_rejected: u64,
+    telemetry_receptions: u64,
+    telemetry_seqs: Vec<TelemetrySeqs>,
     origin_index: BTreeMap<[u8; 16], usize>,
     links_after_settle: usize,
+    receipts: u64,
+    purges: u64,
+    store_holders: BTreeMap<MessageId, BTreeSet<usize>>,
+    first_delivery_ms: BTreeMap<MessageId, u64>,
+    purge_latencies: Vec<u64>,
+    purge_recorded: BTreeSet<MessageId>,
+    presence_converged: bool,
+    convergence_ms: u64,
+    card_fetches: u64,
+    announcement_sends: u64,
+    announcement_bytes: u64,
+    steady_announcement_sends: u64,
+    steady_announcement_bytes: u64,
+    directory_last_ms: u64,
+    directory_announcements: usize,
+    directory_peak_entries: usize,
+    directory_last_removal_ms: u64,
+    hint_seq: u64,
+    injected_fresh: Vec<BTreeSet<NodeId>>,
+    fresh_hint_ids: BTreeSet<MessageId>,
+    fresh_hint_submissions: u64,
+    fresh_hint_deliveries: u64,
+    fresh_latencies: Vec<u64>,
+    channel_delivered_ids: Vec<BTreeSet<MessageId>>,
+    channel_deliveries: u64,
+    channel_transmissions: u64,
+    channel_bytes: u64,
+    channel_subscribers: usize,
+    restart_done: bool,
+    restart_snapshot_bytes: usize,
+    restart_replays: u64,
+    restart_sends_after: u64,
+    sent_ids: Vec<BTreeSet<MessageId>>,
+    probe_wires: Vec<Option<(LinkId, Channel, Vec<u8>)>>,
+    link_hellos: Vec<BTreeMap<LinkId, Hello>>,
+    injection: Injection,
+    injected_invalid: usize,
 }
 
 impl Simulation {
@@ -528,7 +1449,10 @@ impl Simulation {
     /// never packet-driven paths.
     pub fn new(scenario: Scenario) -> Self {
         assert!(scenario.nodes > 0, "a scenario needs nodes");
-        assert!(scenario.messages > 0, "a scenario needs messages");
+        assert!(
+            scenario.messages > 0 || matches!(scenario.traffic, Traffic::Presence),
+            "a scenario needs messages"
+        );
         let world = SimWorld::new(WorldConfig {
             seed: scenario.seed,
             ..WorldConfig::default()
@@ -540,6 +1464,7 @@ impl Simulation {
         let mut rng = scenario.seed;
         let mut nodes = Vec::with_capacity(n);
         let mut identities = Vec::with_capacity(n);
+        let mut card_hashes = Vec::with_capacity(n);
         for i in 0..n {
             let radio = world
                 .add_node(SimNode::default())
@@ -547,24 +1472,50 @@ impl Simulation {
             let mut seed_input = [0u8; 16];
             seed_input[..8].copy_from_slice(&scenario.seed.to_be_bytes());
             seed_input[8..].copy_from_slice(&(i as u64).to_be_bytes());
+            let digest = blake3::hash(&seed_input);
             let mut seed = [0u8; 32];
-            seed.copy_from_slice(blake3::hash(&seed_input).as_bytes());
+            seed.copy_from_slice(digest.as_bytes());
+            let mut card_hash = [0u8; 8];
+            card_hash.copy_from_slice(&digest.as_bytes()[8..16]);
             let identity = Identity::from_seed(seed);
             let engine_rng = EngineRng::seed_from_u64(scenario.seed ^ (i as u64 + 1));
-            let mut engine_config = MeshConfig::default();
-            engine_config.budgets.enforce = scenario.enforce_budgets;
-            engine_config.spray.enabled = scenario.spray;
-            engine_config.suppression = SuppressionConfig {
-                enabled: scenario.enforce_suppression,
-                ..scenario.suppression
-            };
-            let engine = MeshEngine::with_config(engine_rng, engine_config);
+            let mut engine = MeshEngine::with_config(engine_rng, engine_config(&scenario));
+            // Subscription is a local host declaration. Only configured
+            // subscribers get one; relays keep an empty channel registry and
+            // forward from the ordinary Broadcast path.
+            if let Traffic::Channel {
+                name, subscribers, ..
+            } = scenario.traffic
+            {
+                if subscribers.contains(&i) {
+                    let outputs = engine
+                        .handle(
+                            0,
+                            MeshInput::ChannelSubscribe {
+                                name: name.as_bytes(),
+                            },
+                        )
+                        .expect("fixed subscription is valid");
+                    assert!(
+                        outputs.is_empty(),
+                        "subscribing emits no host action: {outputs:?}"
+                    );
+                }
+            }
             // Baseline nodes have empty stores. The hello and beacon must
             // advertise the engine's actual digest, otherwise every link
             // looks different and MSH-14 starts a needless sync contact.
             let store_digest = engine.sync().local_digest();
-            let mut adapter =
-                NetworkAdapter::new(engine, Network::new(NetworkConfig::default(), radio));
+            let network_config = if matches!(scenario.topology, Topology::Circulant { .. }) {
+                // The circulant's full six-degree graph is part of the
+                // scenario; aoNetwork still owns and enforces the cap.
+                NetworkConfig::default()
+                    .with_max_links(6)
+                    .expect("six is a valid link cap")
+            } else {
+                NetworkConfig::default()
+            };
+            let mut adapter = NetworkAdapter::new(engine, Network::new(network_config, radio));
             let tag = {
                 let mut t = next(&mut rng).to_be_bytes().repeat(2);
                 t[0] = i as u8;
@@ -572,8 +1523,16 @@ impl Simulation {
                 out.copy_from_slice(&t[..16]);
                 LocalTag::new(out)
             };
-            let signed =
-                MeshHello::sign(&identity, [0; 8], store_digest).expect("fixed identity signs");
+            let mut caps = if scenario.receipts {
+                CAPS
+            } else {
+                CAPS & !CAP_RECEIPT_V1
+            };
+            if !scenario.presence {
+                caps &= !CAP_PRESENCE_V1;
+            }
+            let signed = MeshHello::sign_with_caps(&identity, card_hash, store_digest, caps)
+                .expect("fixed identity signs");
             let applied = adapter.apply(
                 world.now(),
                 vec![
@@ -597,7 +1556,7 @@ impl Simulation {
             );
             let pos = match scenario.topology {
                 Topology::Line => ((i as i64) * radius, 0),
-                Topology::Ring => ring_position(i, n, side),
+                Topology::Ring | Topology::Circulant { .. } => ring_position(i, n, side),
                 Topology::Random | Topology::Communities { .. } | Topology::Scripted(_) => {
                     let x = (next(&mut rng) % side as u64) as i64;
                     let y = (next(&mut rng) % side as u64) as i64;
@@ -605,8 +1564,10 @@ impl Simulation {
                 }
             };
             identities.push(identity);
+            card_hashes.push(card_hash);
             nodes.push(Node {
                 adapter,
+                card_hash,
                 pos,
                 group: match scenario.topology {
                     Topology::Communities { groups } => i % groups.max(1),
@@ -617,9 +1578,16 @@ impl Simulation {
         let mut ranges = vec![vec![false; n]; n];
         for a in 0..n {
             for b in a + 1..n {
-                let on = match scenario.topology {
+                let on = match &scenario.topology {
                     Topology::Line => b == a + 1,
                     Topology::Ring => b == a + 1 || (a == 0 && b == n - 1),
+                    Topology::Circulant { steps } => {
+                        let forward = (b + n - a) % n;
+                        steps.iter().any(|step| {
+                            *step != 0
+                                && (*step == forward || n.checked_sub(*step) == Some(forward))
+                        })
+                    }
                     Topology::Random => near(nodes[a].pos, nodes[b].pos, radius),
                     Topology::Communities { .. } => {
                         near(nodes[a].pos, nodes[b].pos, radius)
@@ -630,6 +1598,27 @@ impl Simulation {
                 };
                 ranges[a][b] = on;
                 ranges[b][a] = on;
+            }
+        }
+        // The host declares all cards up front. With a complete set the
+        // presence scenario must emit no CardFetch events, which also proves
+        // that refreshes do not repeatedly ask for the same hash.
+        if scenario.presence {
+            for node in &mut nodes {
+                let outputs = node
+                    .adapter
+                    .engine_mut()
+                    .handle(
+                        0,
+                        MeshInput::KnownCards {
+                            hashes: &card_hashes,
+                        },
+                    )
+                    .expect("bounded known-card input");
+                assert!(
+                    outputs.is_empty(),
+                    "known cards are host state, not packets: {outputs:?}"
+                );
             }
         }
         let applied = vec![vec![false; n]; n];
@@ -647,6 +1636,10 @@ impl Simulation {
             _ => Vec::new(),
         };
         contacts.sort_by_key(|contact| contact.at_ms);
+        let channel_subscribers = match scenario.traffic {
+            Traffic::Channel { subscribers, .. } => subscribers.len(),
+            _ => 0,
+        };
         let mut sim = Self {
             scenario,
             world,
@@ -676,8 +1669,50 @@ impl Simulation {
             delivered_ids,
             delivered_by_origin: vec![0; n],
             received_ids: vec![BTreeSet::new(); n],
+            telemetry_attempts: 0,
+            telemetry_accepted: 0,
+            telemetry_rejected: 0,
+            telemetry_receptions: 0,
+            telemetry_seqs: vec![BTreeMap::new(); n],
             origin_index,
             links_after_settle: 0,
+            receipts: 0,
+            purges: 0,
+            store_holders: BTreeMap::new(),
+            first_delivery_ms: BTreeMap::new(),
+            purge_latencies: Vec::new(),
+            purge_recorded: BTreeSet::new(),
+            presence_converged: false,
+            convergence_ms: 0,
+            card_fetches: 0,
+            announcement_sends: 0,
+            announcement_bytes: 0,
+            steady_announcement_sends: 0,
+            steady_announcement_bytes: 0,
+            directory_last_ms: 0,
+            directory_announcements: 0,
+            directory_peak_entries: 0,
+            directory_last_removal_ms: 0,
+            hint_seq: 0,
+            injected_fresh: vec![BTreeSet::new(); n],
+            fresh_hint_ids: BTreeSet::new(),
+            fresh_hint_submissions: 0,
+            fresh_hint_deliveries: 0,
+            fresh_latencies: Vec::new(),
+            channel_delivered_ids: vec![BTreeSet::new(); n],
+            channel_deliveries: 0,
+            channel_transmissions: 0,
+            channel_bytes: 0,
+            channel_subscribers,
+            restart_done: false,
+            restart_snapshot_bytes: 0,
+            restart_replays: 0,
+            restart_sends_after: 0,
+            sent_ids: vec![BTreeSet::new(); n],
+            probe_wires: vec![None; n],
+            link_hellos: vec![BTreeMap::new(); n],
+            injection: Injection::default(),
+            injected_invalid: 0,
         };
         sim.apply_ranges();
         sim
@@ -751,6 +1786,30 @@ impl Simulation {
         self.radio_bytes_run = 0;
     }
 
+    fn remove_store_holder(&mut self, id: MessageId, node: usize, now_ms: u64) {
+        let mut empty = false;
+        if let Some(holders) = self.store_holders.get_mut(&id) {
+            holders.remove(&node);
+            empty = holders.is_empty();
+        }
+        if empty {
+            self.store_holders.remove(&id);
+            if !self.purge_recorded.contains(&id) {
+                if let Some(first) = self.first_delivery_ms.get(&id).copied() {
+                    self.purge_latencies.push(now_ms.saturating_sub(first));
+                    self.purge_recorded.insert(id);
+                }
+            }
+        }
+    }
+
+    fn purge_stored(&mut self, node: usize, now_ms: u64, id: MessageId) {
+        if self.stores[node].evict(&id).is_some() {
+            self.purges += 1;
+        }
+        self.remove_store_holder(id, node, now_ms);
+    }
+
     fn store_item(&mut self, node: usize, now_ms: u64, wire: &[u8], copies_left: u8) {
         let metadata = StoreMetadata {
             copies_left: copies_left.max(1),
@@ -763,7 +1822,14 @@ impl Simulation {
         let Ok(message) = StoredMessage::new(wire, metadata) else {
             return;
         };
-        let _ = self.stores[node].put(now_ms, message);
+        let id = message.header().msg_id;
+        let evicted = self.stores[node].put(now_ms, message).unwrap_or_default();
+        for gone in evicted {
+            self.remove_store_holder(gone, node, now_ms);
+        }
+        if self.stores[node].get(now_ms, &id).is_some() {
+            self.store_holders.entry(id).or_default().insert(node);
+        }
     }
 
     fn refresh_store_summary(&mut self, node: usize, now: Duration, now_ms: u64) {
@@ -798,6 +1864,7 @@ impl Simulation {
         for _ in 0..MAX_STORE_SERVICE_ROUNDS {
             let mut needs = Vec::new();
             let mut items = Vec::new();
+            let mut purges = Vec::new();
             for output in &pending {
                 match output {
                     MeshOutput::SyncNeed { link, prefixes } => {
@@ -808,6 +1875,7 @@ impl Simulation {
                         wire,
                         copies_left,
                     } => items.push((*id, wire.clone(), *copies_left)),
+                    MeshOutput::Purge { id } => purges.push(*id),
                     _ => {}
                 }
             }
@@ -821,6 +1889,12 @@ impl Simulation {
                 stored = true;
             }
             if stored {
+                self.refresh_store_summary(node, now, now_ms);
+            }
+            if !purges.is_empty() {
+                for id in purges {
+                    self.purge_stored(node, now_ms, id);
+                }
                 self.refresh_store_summary(node, now, now_ms);
             }
             let mut extra = Vec::new();
@@ -885,22 +1959,30 @@ impl Simulation {
                         Poll::Pending => break,
                         Poll::Ready(event) => event,
                     };
-                    let (input, received_id) = match &event {
-                        NetworkEvent::LinkUp { link, remote_hello } => (
-                            MeshInput::LinkUp {
-                                link: *link,
-                                remote_hello: remote_hello.clone(),
-                            },
-                            None,
-                        ),
+                    let (input, received_id, telemetry, probe_source) = match &event {
+                        NetworkEvent::LinkUp { link, remote_hello } => {
+                            self.link_hellos[i].insert(*link, remote_hello.clone());
+                            (
+                                MeshInput::LinkUp {
+                                    link: *link,
+                                    remote_hello: remote_hello.clone(),
+                                },
+                                None,
+                                None,
+                                None,
+                            )
+                        }
                         NetworkEvent::LinkDown { link, reason } => {
                             self.pending[i].remove(link);
                             self.tx_last[i].remove(link);
+                            self.link_hellos[i].remove(link);
                             (
                                 MeshInput::LinkDown {
                                     link: *link,
                                     reason: *reason,
                                 },
+                                None,
+                                None,
                                 None,
                             )
                         }
@@ -909,11 +1991,24 @@ impl Simulation {
                             channel,
                             payload,
                         } => {
+                            let decoded = packet_bytes(payload)
+                                .and_then(|bytes| crate::Packet::decode(bytes).ok());
                             // Broadcast has no Deliver event yet. Count a
                             // structurally valid flooded packet as a unique
                             // reception at this node, once per content id.
-                            let received_id = crate::Packet::decode(payload)
-                                .ok()
+                            // Telemetry has no Deliver either; its framed
+                            // sequence is the only observable coalescing
+                            // result at a receiver.
+                            let telemetry = decoded
+                                .as_ref()
+                                .filter(|packet| packet.header.class == PacketClass::Telemetry)
+                                .and_then(|packet| {
+                                    TelemetryFrame::decode(packet.payload)
+                                        .ok()
+                                        .map(|frame| (packet.header.origin, frame.kind, frame.seq))
+                                });
+                            let received_id = decoded
+                                .as_ref()
                                 .filter(|packet| {
                                     matches!(
                                         packet.header.class,
@@ -921,6 +2016,11 @@ impl Simulation {
                                     )
                                 })
                                 .map(|packet| packet.header.msg_id);
+                            // The replay probe needs every class: Direct is
+                            // the traffic that actually fills a relay store.
+                            let probe_source = decoded
+                                .as_ref()
+                                .map(|packet| (*link, *channel, packet.header.msg_id));
                             (
                                 MeshInput::Data {
                                     link: *link,
@@ -929,6 +2029,8 @@ impl Simulation {
                                     identity: &self.identities[i],
                                 },
                                 received_id,
+                                telemetry,
+                                probe_source,
                             )
                         }
                         _ => continue,
@@ -936,11 +2038,19 @@ impl Simulation {
                     if let Some(id) = received_id {
                         self.received_ids[i].insert(id);
                     }
+                    if let Some((origin, kind, seq)) = telemetry {
+                        self.telemetry_receptions += 1;
+                        let streams = self.telemetry_seqs[i].entry((origin, kind)).or_default();
+                        streams.insert(seq);
+                    }
                     let outputs = self.nodes[i]
                         .adapter
                         .engine_mut()
                         .handle(now_ms, input)
                         .expect("engine inputs are well formed");
+                    if let Some((link, channel, id)) = probe_source {
+                        self.capture_probe(i, link, channel, id, &outputs);
+                    }
                     self.count_outputs(i, now_ms, &outputs);
                     self.service_stores(i, now, now_ms, outputs.clone());
                     let events = self.nodes[i].adapter.apply(now, outputs);
@@ -950,8 +2060,178 @@ impl Simulation {
                         }
                     }
                 }
+                // Presence trickle is host-driven: the borrowed identity and
+                // card hash are supplied on every tick, never retained.
+                let card_hash = self.nodes[i].card_hash;
+                let outputs = self.nodes[i]
+                    .adapter
+                    .engine_mut()
+                    .handle(
+                        now_ms,
+                        MeshInput::Tick {
+                            identity: &self.identities[i],
+                            card_hash,
+                        },
+                    )
+                    .expect("presence tick inputs are well formed");
+                self.count_outputs(i, now_ms, &outputs);
+                self.service_stores(i, now, now_ms, outputs.clone());
+                let events = self.nodes[i].adapter.apply(now, outputs);
+                for event in events {
+                    if let crate::AdapterEvent::SendFailed { .. } = event {
+                        self.send_failures += 1;
+                    }
+                }
+            }
+            if self.scenario.presence && !self.presence_converged && self.run_started {
+                let learned = self
+                    .nodes
+                    .iter()
+                    .map(|node| node.adapter.engine().presence().len())
+                    .min()
+                    .unwrap_or(0);
+                if learned >= self.nodes.len().saturating_sub(1) {
+                    self.presence_converged = true;
+                    self.convergence_ms = now_ms.saturating_sub(self.run_start_ms);
+                }
             }
             self.sample_queues();
+            self.directory_tick(now_ms);
+        }
+    }
+
+    /// Injects one seeded directory observation round when due, then ticks
+    /// every engine so relative-time expiry happens even without traffic.
+    fn directory_tick(&mut self, now_ms: u64) {
+        let Some(plan) = self.scenario.directory.clone() else {
+            return;
+        };
+        if !self.run_started {
+            return;
+        }
+        let n = self.nodes.len();
+        if self.directory_announcements < plan.announcements
+            && now_ms.saturating_sub(self.directory_last_ms) >= plan.every_ms
+        {
+            self.directory_last_ms = now_ms;
+            let round = self.directory_announcements;
+            for i in 0..n {
+                let target = (i + 1 + round) % n;
+                let card_hash = self.nodes[target].card_hash;
+                let location = [i as u8, target as u8, round as u8, (round >> 8) as u8];
+                // Half the nodes report a future timestamp and half a past
+                // one; the directory clamps both and never uses either for
+                // expiry.
+                let observed_at_ms = if i % 2 == 0 {
+                    now_ms.saturating_add(plan.observed_skew_ms)
+                } else {
+                    now_ms.saturating_sub(plan.observed_skew_ms)
+                };
+                let observation = NodeObservation {
+                    node: self.identities[target].node_id(),
+                    card_hash,
+                    caps: 1 << ((i + round) % 4),
+                    seq: round as u64 + 1,
+                    hops: ((i + round) % 4 + 1) as u8,
+                    via: self.identities[(i + 1) % n].node_id(),
+                    observed_at_ms,
+                    location: &location,
+                };
+                let outputs = self.nodes[i]
+                    .adapter
+                    .engine_mut()
+                    .handle(now_ms, MeshInput::ObserveNode { observation })
+                    .expect("host observations are bounded");
+                self.note_directory_changes(&outputs, now_ms);
+            }
+            self.directory_announcements = self.directory_announcements.saturating_add(1);
+        }
+
+        for i in 0..n {
+            let card_hash = self.nodes[i].card_hash;
+            let outputs = self.nodes[i]
+                .adapter
+                .engine_mut()
+                .handle(
+                    now_ms,
+                    MeshInput::Tick {
+                        identity: &self.identities[i],
+                        card_hash,
+                    },
+                )
+                .expect("tick is valid");
+            self.note_directory_changes(&outputs, now_ms);
+        }
+        for node in &self.nodes {
+            self.directory_peak_entries = self
+                .directory_peak_entries
+                .max(node.adapter.engine().directory().len());
+        }
+    }
+
+    fn note_directory_changes(&mut self, outputs: &[MeshOutput], now_ms: u64) {
+        for output in outputs {
+            if let MeshOutput::DirectoryChanged { changes } = output {
+                for change in changes {
+                    if matches!(change, DirectoryChange::Removed { .. }) {
+                        self.directory_last_removal_ms = self.directory_last_removal_ms.max(now_ms);
+                    }
+                }
+            }
+        }
+    }
+
+    /// True only for an MSH-19 announcement, not other Presence traffic.
+    fn is_announcement(payload: &[u8]) -> bool {
+        Packet::decode(payload).is_ok_and(|packet| {
+            packet.header.class == PacketClass::Presence
+                && packet.payload.len() == ANNOUNCE_LEN
+                && packet.payload.first() == Some(&ANNOUNCE_MAGIC)
+        })
+    }
+
+    /// Keeps one wire this node actually relayed, for the post-restart probe.
+    ///
+    /// A delayed copy of the same content is what a store-and-forward relay
+    /// sees when a peer repeats a packet after the engine comes back. The
+    /// probe is recorded only when the node put that id on the air, so the
+    /// restored and ablated rows differ solely in persisted state.
+    fn capture_probe(
+        &mut self,
+        node: usize,
+        link: LinkId,
+        channel: Channel,
+        id: MessageId,
+        outputs: &[MeshOutput],
+    ) {
+        if self.probe_wires[node].is_some() {
+            return;
+        }
+        for output in outputs {
+            let payload = match output {
+                MeshOutput::Send { payload, .. } | MeshOutput::Broadcast { payload, .. } => payload,
+                _ => continue,
+            };
+            if probe_id(payload) == Some(id) {
+                self.probe_wires[node] = Some((link, channel, payload.clone()));
+                return;
+            }
+        }
+    }
+
+    /// Tracks which ids this node has already put on the air so a restarted
+    /// engine can be checked for re-relays of the same content.
+    fn count_relay(&mut self, node: usize, payload: &[u8]) {
+        let Some(id) = probe_id(payload) else {
+            return;
+        };
+        if self.restart_done {
+            self.restart_sends_after += 1;
+            if self.sent_ids[node].contains(&id) {
+                self.restart_replays += 1;
+            }
+        } else {
+            let _ = self.sent_ids[node].insert(id);
         }
     }
 
@@ -961,8 +2241,37 @@ impl Simulation {
                 MeshOutput::Send { link, payload, .. } => {
                     self.transmissions += 1;
                     *self.pending[node].entry(*link).or_insert(0) += payload.len() as u64;
+                    if self.run_started && Self::is_announcement(payload) {
+                        self.announcement_sends += 1;
+                        self.announcement_bytes += payload.len() as u64;
+                        if now_ms >= self.run_start_ms + 60_000 {
+                            self.steady_announcement_sends += 1;
+                            self.steady_announcement_bytes += payload.len() as u64;
+                        }
+                    }
+                    if is_channel_payload(payload) {
+                        self.channel_transmissions += 1;
+                        self.channel_bytes += payload.len() as u64;
+                    }
+                    self.count_relay(node, payload);
                 }
                 MeshOutput::Broadcast { payload, .. } => {
+                    let links = self.nodes[node].adapter.network().links();
+                    self.transmissions += links.len() as u64;
+                    if is_channel_payload(payload) {
+                        self.channel_transmissions += links.len() as u64;
+                        self.channel_bytes += payload.len() as u64 * links.len() as u64;
+                    }
+                    for info in links {
+                        *self.pending[node].entry(info.link).or_insert(0) += payload.len() as u64;
+                    }
+                    self.count_relay(node, payload);
+                }
+                MeshOutput::TelemetrySend { link, payload, .. } => {
+                    self.transmissions += 1;
+                    *self.pending[node].entry(*link).or_insert(0) += payload.len() as u64;
+                }
+                MeshOutput::TelemetryBroadcast { payload, .. } => {
                     let links = self.nodes[node].adapter.network().links();
                     self.transmissions += links.len() as u64;
                     for info in links {
@@ -972,15 +2281,41 @@ impl Simulation {
                 MeshOutput::Deliver { header, .. } => {
                     if self.delivered_ids[node].insert(header.msg_id) {
                         self.delivered += 1;
-                        self.latencies
-                            .push(now_ms.saturating_sub(header.created_ms));
+                        let latency = now_ms.saturating_sub(header.created_ms);
+                        self.latencies.push(latency);
+                        if self.fresh_hint_ids.contains(&header.msg_id) {
+                            self.fresh_latencies.push(latency);
+                            self.fresh_hint_deliveries += 1;
+                        }
                         if let Some(origin) = self.origin_index.get(&header.origin) {
                             self.delivered_by_origin[*origin] += 1;
+                        }
+                        self.first_delivery_ms
+                            .entry(header.msg_id)
+                            .or_insert(now_ms);
+                        if self
+                            .store_holders
+                            .get(&header.msg_id)
+                            .is_none_or(BTreeSet::is_empty)
+                        {
+                            self.purge_latencies.push(0);
+                            self.purge_recorded.insert(header.msg_id);
                         }
                     } else {
                         self.duplicate_deliveries += 1;
                     }
                 }
+                MeshOutput::ChannelDeliver { header, .. } => {
+                    if self.channel_delivered_ids[node].insert(header.msg_id) {
+                        self.channel_deliveries += 1;
+                    }
+                }
+                MeshOutput::Delivered { origin, .. }
+                    if self.origin_index.get(origin) == Some(&node) =>
+                {
+                    self.receipts += 1;
+                }
+                MeshOutput::CardFetch { .. } => self.card_fetches += 1,
                 _ => {}
             }
         }
@@ -1053,37 +2388,195 @@ impl Simulation {
         }
     }
 
+    /// Hop counts over the current radio graph, used only to model MSH-20's
+    /// presence observation seam. No transmission or engine state is involved.
+    fn hop_distances(&self) -> Vec<Vec<u8>> {
+        let n = self.nodes.len();
+        let mut dist = vec![vec![u8::MAX; n]; n];
+        for (src, row) in dist.iter_mut().enumerate() {
+            let mut queue = VecDeque::new();
+            row[src] = 0;
+            queue.push_back(src);
+            while let Some(at) = queue.pop_front() {
+                let hops = row[at].saturating_add(1);
+                for (next, seen) in row.iter_mut().enumerate() {
+                    if self.ranges[at][next] && *seen == u8::MAX {
+                        *seen = hops;
+                        queue.push_back(next);
+                    }
+                }
+            }
+        }
+        dist
+    }
+
+    /// The neighbour on a shortest path, or `None` when the target is
+    /// unreachable at this instant.
+    fn first_hop(&self, from: usize, to: usize, dist: &[Vec<u8>]) -> Option<usize> {
+        let hops = dist[from][to];
+        if hops == 0 || hops == u8::MAX {
+            return None;
+        }
+        (0..self.nodes.len()).find(|&next| {
+            self.ranges[from][next]
+                && dist[next][to] != u8::MAX
+                && dist[next][to].saturating_add(1) == hops
+        })
+    }
+
+    /// Feeds one round of typed directory facts into every node.
+    ///
+    /// The BFS supplies the same facts the host would learn from presence:
+    /// destination, via-neighbour, hop count and a fresh sequence. They enter
+    /// the engine through MSH-20's `ObserveNode` seam, which both records the
+    /// directory entry and derives an MSH-21 hint when the via-node is a
+    /// verified neighbour. No mesh packet is generated. Off-mode rows get the
+    /// same facts, keeping the fresh-path denominator identical.
+    fn inject_route_hints(&mut self, now_ms: u64) {
+        self.hint_seq = self.hint_seq.saturating_add(1);
+        for set in &mut self.injected_fresh {
+            set.clear();
+        }
+        let dist = self.hop_distances();
+        let n = self.nodes.len();
+        let seq = self.hint_seq;
+        let world_now = self.world.now();
+        let mut observations = Vec::new();
+        let mut fresh_updates = Vec::new();
+        for i in 0..n {
+            let links: Vec<NodeId> = self.nodes[i]
+                .adapter
+                .engine()
+                .neighbors()
+                .iter()
+                .filter_map(|neighbor| neighbor.node_id)
+                .collect();
+            for dst in 0..n {
+                if dst == i || dist[i][dst] == u8::MAX {
+                    continue;
+                }
+                let Some(first) = self.first_hop(i, dst, &dist) else {
+                    continue;
+                };
+                let first_id = self.identities[first].node_id();
+                if !links.contains(&first_id) {
+                    continue;
+                }
+                let destination = self.identities[dst].node_id();
+                observations.push((
+                    i,
+                    NodeObservation {
+                        node: destination,
+                        card_hash: self.nodes[dst].card_hash,
+                        caps: 0,
+                        seq,
+                        hops: dist[i][dst],
+                        via: first_id,
+                        observed_at_ms: now_ms,
+                        location: &[],
+                    },
+                ));
+                fresh_updates.push((i, destination));
+            }
+        }
+        for (i, destination) in fresh_updates {
+            self.injected_fresh[i].insert(destination);
+        }
+        for (i, observation) in observations {
+            let outputs = self.nodes[i]
+                .adapter
+                .engine_mut()
+                .handle(now_ms, MeshInput::ObserveNode { observation })
+                .expect("directory observation is bounded");
+            self.note_directory_changes(&outputs, now_ms);
+            self.count_outputs(i, now_ms, &outputs);
+            self.service_stores(i, world_now, now_ms, outputs.clone());
+            let events = self.nodes[i].adapter.apply(world_now, outputs);
+            for event in events {
+                if let crate::AdapterEvent::SendFailed { .. } = event {
+                    self.send_failures += 1;
+                }
+            }
+        }
+    }
+
     /// Submits one sealed message at the current world time. Staggering
     /// these across the run phase is what lets mobility and scripted contacts
     /// affect delivery instead of finishing before the first contact changes.
     fn submit_one(&mut self, m: usize) {
         let n = self.nodes.len();
-        let (origin, broadcast) = match self.scenario.traffic {
-            Traffic::Balanced => (m % n, false),
+        if let Traffic::Telemetry {
+            origin: source,
+            kind,
+            ..
+        } = self.scenario.traffic
+        {
+            let origin = source.min(n - 1);
+            let now_ms = self.world.now().as_millis() as u64;
+            let payload = vec![(m % 251) as u8; self.scenario.payload_len];
+            self.telemetry_attempts += 1;
+            self.submitted += 1;
+            match self.nodes[origin].adapter.engine_mut().handle(
+                now_ms,
+                MeshInput::SubmitTelemetry {
+                    identity: &self.identities[origin],
+                    kind: TelemetryKind::new(kind),
+                    seq: m as u64 + 1,
+                    payload: &payload,
+                    via: None,
+                },
+            ) {
+                Ok(outputs) => {
+                    self.telemetry_accepted += 1;
+                    self.count_outputs(origin, now_ms, &outputs);
+                    self.service_stores(origin, self.world.now(), now_ms, outputs.clone());
+                    let events = self.nodes[origin].adapter.apply(self.world.now(), outputs);
+                    for event in events {
+                        if let crate::AdapterEvent::SendFailed { .. } = event {
+                            self.send_failures += 1;
+                        }
+                    }
+                }
+                // A throttled submission is a policy result, not a simulator
+                // failure. It must never reach a radio queue.
+                Err(_) => self.telemetry_rejected += 1,
+            }
+            return;
+        }
+        let (origin, broadcast, channel_name) = match self.scenario.traffic {
+            Traffic::Balanced => (m % n, false, None),
             Traffic::Flood {
                 origin: flood,
                 weight,
             } => {
                 let round = weight.max(1) + 1;
                 if m % round == 0 {
-                    (flood.min(n - 1), false)
+                    (flood.min(n - 1), false, None)
                 } else {
                     let honest = n - 1;
                     let slot = (m / round) * weight + (m % round) - 1;
-                    ((flood.min(n - 1) + 1 + slot % honest) % n, false)
+                    ((flood.min(n - 1) + 1 + slot % honest) % n, false, None)
                 }
             }
-            Traffic::Broadcast { origin } => (origin.min(n - 1), true),
+            Traffic::Broadcast { origin } => (origin.min(n - 1), true, None),
             Traffic::MixedBroadcast {
                 origin,
                 direct_every,
             } => {
                 if m % direct_every.max(1) == 0 {
-                    (m % n, false)
+                    (m % n, false, None)
                 } else {
-                    (origin.min(n - 1), true)
+                    (origin.min(n - 1), true, None)
                 }
             }
+            // Presence scenarios submit no application messages, so this is
+            // unreachable for the fixed scenario. Returning keeps the harness
+            // total without a panic on a misconfigured scenario.
+            Traffic::Presence => return,
+            // The typed path returned above; this keeps the match total
+            // without a simulator-only panic.
+            Traffic::Telemetry { origin, .. } => (origin.min(n - 1), false, None),
+            Traffic::Channel { origin, name, .. } => (origin.min(n - 1), true, Some(name)),
         };
         // Destinations stay inside the packet's eight-hop TTL so the
         // baseline measures forwarding, not expiry at an impossible
@@ -1099,9 +2592,19 @@ impl Simulation {
         let mut rng = SealRng::seed_from_u64(self.scenario.seed ^ (m as u64 + 1));
         let plaintext = vec![(m % 251) as u8; self.scenario.payload_len];
         let (header, payload, wire) = if broadcast {
-            // Plain Broadcast: the engine caps TTL at ADR-0001's six hops
-            // on submission. Payload is opaque to the mesh.
+            // Broadcast payloads are opaque to the mesh: a channel is a v1
+            // envelope around the same host bytes. The engine caps TTL at
+            // ADR-0001's six hops on submission.
             let sender = &self.identities[origin];
+            let wire_payload = match channel_name {
+                Some(name) => {
+                    let id = derive_channel_id(name.as_bytes()).expect("fixed channel name");
+                    ChannelEnvelope::new(id, &plaintext)
+                        .expect("fixed opaque payload fits")
+                        .encode()
+                }
+                None => plaintext.clone(),
+            };
             let mut header = Header {
                 class: PacketClass::Broadcast,
                 dst: None,
@@ -1109,14 +2612,16 @@ impl Simulation {
                 origin: *sender.node_id().as_bytes(),
                 created_ms: now_ms,
                 lifetime_s: 600,
-                payload_len: plaintext.len() as u64,
+                payload_len: wire_payload.len() as u64,
                 ttl: 255,
                 hops: 0,
             };
-            let signature = sign_packet(sender, &mut header, &plaintext).expect("fixed key signs");
-            let packet = crate::Packet::new(header, signature, &plaintext).expect("lengths agree");
+            let signature =
+                sign_packet(sender, &mut header, &wire_payload).expect("fixed key signs");
+            let packet =
+                crate::Packet::new(header, signature, &wire_payload).expect("lengths agree");
             let wire = packet.encode();
-            (packet.header, plaintext, wire)
+            (packet.header, wire_payload, wire)
         } else {
             let sender = &self.identities[origin];
             let recipient = &self.identities[dst];
@@ -1129,6 +2634,13 @@ impl Simulation {
             (packet.header, payload, wire)
         };
         let submitted_id = header.msg_id;
+        if !broadcast {
+            let destination = self.identities[dst].node_id();
+            if self.injected_fresh[origin].contains(&destination) {
+                self.fresh_hint_ids.insert(submitted_id);
+                self.fresh_hint_submissions += 1;
+            }
+        }
         let outputs = self.nodes[origin]
             .adapter
             .engine_mut()
@@ -1166,6 +2678,115 @@ impl Simulation {
         }
     }
 
+    /// Restarts every engine at a scenario checkpoint (MSH-29).
+    ///
+    /// The radio facade and its live links stay in place; only the engine is
+    /// replaced. The host snapshots all engines before mutating any of them,
+    /// so a snapshot failure cannot leave a half-restarted simulation. Links
+    /// are re-announced because their capability bits belong to the session,
+    /// not to the routing snapshot.
+    fn restart(&mut self) {
+        self.restart_done = true;
+        let now = self.world.now();
+        let now_ms = now.as_millis() as u64;
+        let restore = self.scenario.restart.is_some_and(|restart| restart.restore);
+        let n = self.nodes.len();
+        let mut snapshots = Vec::with_capacity(n);
+        for i in 0..n {
+            let bytes = crate::Snapshot::snapshot(self.nodes[i].adapter.engine())
+                .expect("engine state has a valid snapshot");
+            self.restart_snapshot_bytes = self.restart_snapshot_bytes.max(bytes.len());
+            snapshots.push(bytes);
+        }
+        let hellos = self.link_hellos.clone();
+        let probes = self.probe_wires.clone();
+        for i in 0..n {
+            let engine_rng = EngineRng::seed_from_u64(self.scenario.seed ^ (i as u64 + 1));
+            let mut engine = MeshEngine::with_config(engine_rng, engine_config(&self.scenario));
+            if restore {
+                engine
+                    .restore(&snapshots[i])
+                    .expect("a snapshot taken from this engine restores");
+            }
+            let _ = self.nodes[i].adapter.replace_engine(engine);
+
+            for (link, remote_hello) in &hellos[i] {
+                let outputs = self.nodes[i]
+                    .adapter
+                    .engine_mut()
+                    .handle(
+                        now_ms,
+                        MeshInput::LinkUp {
+                            link: *link,
+                            remote_hello: remote_hello.clone(),
+                        },
+                    )
+                    .expect("recorded link hello is well formed");
+                self.count_outputs(i, now_ms, &outputs);
+                let events = self.nodes[i].adapter.apply(now, outputs);
+                for event in events {
+                    if let crate::AdapterEvent::SendFailed { .. } = event {
+                        self.send_failures += 1;
+                    }
+                }
+            }
+
+            if let Some((link, channel, payload)) = probes[i].as_ref() {
+                let outputs = self.nodes[i]
+                    .adapter
+                    .engine_mut()
+                    .handle(
+                        now_ms,
+                        MeshInput::Data {
+                            link: *link,
+                            channel: *channel,
+                            payload,
+                            identity: &self.identities[i],
+                        },
+                    )
+                    .expect("a previously relayed wire is still well formed");
+                self.count_outputs(i, now_ms, &outputs);
+                let events = self.nodes[i].adapter.apply(now, outputs);
+                for event in events {
+                    if let crate::AdapterEvent::SendFailed { .. } = event {
+                        self.send_failures += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sends one structurally invalid frame directly through a node's
+    /// network facade. Only MSH-30's simulator scenario calls this: a real
+    /// radio can never drive the engine from this harness hook.
+    fn inject_invalid(&mut self) {
+        if self.injected_invalid >= self.injection.invalid_frames
+            || self.injection.from >= self.nodes.len()
+        {
+            return;
+        }
+        let Some(link) = self.nodes[self.injection.from]
+            .adapter
+            .network()
+            .links()
+            .first()
+            .map(|info| info.link)
+        else {
+            return;
+        };
+        let now = self.world.now();
+        if self.nodes[self.injection.from]
+            .adapter
+            .network_mut()
+            .send(now, link, Channel::Message, vec![0xff])
+            .is_err()
+        {
+            self.send_failures += 1;
+            return;
+        }
+        self.injected_invalid += 1;
+    }
+
     /// Runs the full scenario and returns its metrics.
     pub fn run(mut self) -> Metrics {
         let settle_steps = (self.scenario.settle.as_millis() / TICK.as_millis()) as usize;
@@ -1178,19 +2799,54 @@ impl Simulation {
         self.run_start_ms = self.world.now().as_millis() as u64;
         self.run_started = true;
         self.reset_queue_baseline();
+        let hint_every = HINT_REFRESH.as_millis() as u64;
+        self.inject_route_hints(self.world.now().as_millis() as u64);
         let run_steps = (self.scenario.run.as_millis() / TICK.as_millis()) as usize;
         let steps = run_steps.max(1);
         // Keep the last fifth of the run free so the final message can
         // propagate; otherwise the last submission is cut off at the clock.
         let submit_steps = (steps * 4 / 5).max(1);
+        let burst_telemetry = matches!(
+            self.scenario.traffic,
+            Traffic::Telemetry { burst: true, .. }
+        );
+        let inject_at = (steps / 2).max(1);
+        let inject_every = (steps / 16).max(1);
         for step in 0..steps {
-            if step < submit_steps {
+            if burst_telemetry {
+                // All updates are accepted into the send queue before the
+                // radio gets a tick, which is the slow-link case NET-21
+                // coalescing exists to handle.
+                if step == 0 {
+                    while (self.submitted as usize) < self.scenario.messages {
+                        self.submit_one(self.submitted as usize);
+                    }
+                }
+            } else if step < submit_steps {
                 let target = (step + 1) * self.scenario.messages / submit_steps;
                 while (self.submitted as usize) < target {
                     self.submit_one(self.submitted as usize);
                 }
             }
+            if !self.restart_done {
+                if let Some(restart) = self.scenario.restart {
+                    let now_ms = self.world.now().as_millis() as u64;
+                    if now_ms.saturating_sub(self.run_start_ms) >= restart.at.as_millis() as u64 {
+                        self.restart();
+                    }
+                }
+            }
+            if self.injection.invalid_frames > 0
+                && step >= inject_at
+                && (step - inject_at) % inject_every == 0
+            {
+                self.inject_invalid();
+            }
             self.pump(1);
+            let now_ms = self.world.now().as_millis() as u64;
+            if now_ms % hint_every == 0 {
+                self.inject_route_hints(now_ms);
+            }
         }
         let receptions = self
             .nodes
@@ -1210,6 +2866,71 @@ impl Simulation {
             self.latencies.iter().sum::<u64>() / self.latencies.len() as u64
         };
         let max = self.latencies.iter().copied().max().unwrap_or(0);
+        let learned_nodes_min = self
+            .nodes
+            .iter()
+            .map(|node| node.adapter.engine().presence().len())
+            .min()
+            .unwrap_or(0);
+        let denominator = if self.direct_submitted > 0 {
+            self.direct_submitted
+        } else {
+            self.submitted
+        };
+        let fresh_mean = if self.fresh_latencies.is_empty() {
+            0
+        } else {
+            self.fresh_latencies.iter().sum::<u64>() / self.fresh_latencies.len() as u64
+        };
+        let telemetry_distinct_seqs = self
+            .telemetry_seqs
+            .iter()
+            .flat_map(|streams| streams.values())
+            .map(BTreeSet::len)
+            .sum::<usize>() as u64;
+        let telemetry_max_seqs_per_node = self
+            .telemetry_seqs
+            .iter()
+            .map(|streams| streams.values().map(BTreeSet::len).sum::<usize>())
+            .max()
+            .unwrap_or(0) as u64;
+        let telemetry_max_seq = self
+            .telemetry_seqs
+            .iter()
+            .flat_map(|streams| streams.values())
+            .flat_map(BTreeSet::iter)
+            .copied()
+            .max()
+            .unwrap_or(0);
+        let mut duplicate_packets = 0u64;
+        let mut suppressed_relays = 0u64;
+        let mut store_entries = 0u64;
+        let mut sync_bytes_sent = 0u64;
+        let mut sync_bytes_received = 0u64;
+        let mut neighbour_penalty_events = 0u64;
+        let mut neighbour_penalty_total = 0u64;
+        let mut neighbour_penalty_max = 0u32;
+        let mut penalised_neighbours = 0u64;
+        let mut seen_records = 0u64;
+        let mut suppression_pending = 0u64;
+        for node in &self.nodes {
+            let snapshot = node.adapter.engine().observability_snapshot();
+            duplicate_packets = duplicate_packets.saturating_add(snapshot.duplicate_packets);
+            suppressed_relays = suppressed_relays.saturating_add(snapshot.suppressed_relays);
+            store_entries = store_entries.saturating_add(u64::from(snapshot.store_entries));
+            sync_bytes_sent = sync_bytes_sent.saturating_add(snapshot.sync_bytes_sent);
+            sync_bytes_received = sync_bytes_received.saturating_add(snapshot.sync_bytes_received);
+            neighbour_penalty_events =
+                neighbour_penalty_events.saturating_add(snapshot.neighbour_penalty_events);
+            neighbour_penalty_total =
+                neighbour_penalty_total.saturating_add(snapshot.neighbour_penalty_total);
+            neighbour_penalty_max = neighbour_penalty_max.max(snapshot.neighbour_penalty_max);
+            penalised_neighbours =
+                penalised_neighbours.saturating_add(u64::from(snapshot.penalised_neighbours));
+            seen_records = seen_records.saturating_add(u64::from(snapshot.seen_records));
+            suppression_pending =
+                suppression_pending.saturating_add(u64::from(snapshot.suppression_pending));
+        }
         Metrics {
             scenario: self.scenario.name,
             seed: self.scenario.seed,
@@ -1224,23 +2945,102 @@ impl Simulation {
             radio_bytes: self.radio_bytes_run,
             mean_latency_ms: mean,
             max_latency_ms: max,
-            delivery_ratio: self.delivered as f64
-                / if self.direct_submitted > 0 {
-                    self.direct_submitted
-                } else {
-                    self.submitted
-                } as f64,
+            delivery_ratio: if denominator == 0 {
+                0.0
+            } else {
+                self.delivered as f64 / denominator as f64
+            },
             overhead: self.transmissions as f64 / self.delivered.max(1) as f64,
             duplicate_ratio: self.duplicate_deliveries as f64 / self.delivered.max(1) as f64,
             peak_queued_bytes: self.peak_queued_bytes,
             links_after_settle: self.links_after_settle,
             delivered_by_origin: self.delivered_by_origin,
+            purges: self.purges,
+            delivery_receipts: self.receipts,
+            remaining_copies: self.store_holders.values().map(BTreeSet::len).sum(),
+            remaining_delivered_copies: self
+                .store_holders
+                .iter()
+                .filter(|(id, _)| self.first_delivery_ms.contains_key(id))
+                .map(|(_, holders)| holders.len())
+                .sum(),
+            remaining_delivered_copies_immune: self
+                .store_holders
+                .iter()
+                .filter(|(id, _)| self.first_delivery_ms.contains_key(id))
+                .map(|(id, holders)| {
+                    holders
+                        .iter()
+                        .filter(|node| self.nodes[**node].adapter.engine().is_immune(*id))
+                        .count()
+                })
+                .sum(),
+            max_purge_latency_ms: self.purge_latencies.iter().copied().max().unwrap_or(0),
+            directory_peak_entries: self.directory_peak_entries,
+            directory_expirations: self
+                .nodes
+                .iter()
+                .map(|node| node.adapter.engine().directory().stats().expirations)
+                .sum(),
+            directory_evictions: self
+                .nodes
+                .iter()
+                .map(|node| node.adapter.engine().directory().stats().evictions)
+                .sum(),
+            directory_last_removal_ms: self.directory_last_removal_ms,
+            directory_live_entries: self
+                .nodes
+                .iter()
+                .map(|node| {
+                    node.adapter
+                        .engine()
+                        .directory()
+                        .live_len(self.world.now().as_millis() as u64)
+                })
+                .sum(),
+            fresh_hint_submissions: self.fresh_hint_submissions,
+            fresh_hint_deliveries: self.fresh_hint_deliveries,
+            fresh_hint_mean_latency_ms: fresh_mean,
+            channel_subscribers: self.channel_subscribers,
+            channel_deliveries: self.channel_deliveries,
+            channel_delivered_ids: self.channel_delivered_ids,
+            channel_transmissions: self.channel_transmissions,
+            channel_bytes: self.channel_bytes,
+            restart_snapshot_bytes: self.restart_snapshot_bytes,
+            restart_replays: self.restart_replays,
+            restart_sends_after: self.restart_sends_after,
             unique_receptions_by_node: self
                 .received_ids
                 .iter()
                 .map(|ids| ids.len() as u64)
                 .collect(),
             unique_receptions: self.received_ids.iter().map(BTreeSet::len).sum::<usize>() as u64,
+            presence_converged: self.presence_converged,
+            convergence_ms: self.convergence_ms,
+            learned_nodes_min,
+            card_fetches: self.card_fetches,
+            announcement_sends: self.announcement_sends,
+            announcement_bytes: self.announcement_bytes,
+            steady_announcement_sends: self.steady_announcement_sends,
+            steady_announcement_bytes: self.steady_announcement_bytes,
+            telemetry_attempts: self.telemetry_attempts,
+            telemetry_accepted: self.telemetry_accepted,
+            telemetry_rejected: self.telemetry_rejected,
+            telemetry_receptions: self.telemetry_receptions,
+            telemetry_distinct_seqs,
+            telemetry_max_seqs_per_node,
+            telemetry_max_seq,
+            duplicate_packets,
+            suppressed_relays,
+            store_entries,
+            sync_bytes_sent,
+            sync_bytes_received,
+            neighbour_penalty_events,
+            neighbour_penalty_total,
+            neighbour_penalty_max,
+            penalised_neighbours,
+            seen_records,
+            suppression_pending,
         }
     }
 }
@@ -1249,6 +3049,33 @@ impl Simulation {
 /// share exactly the same path.
 pub fn run(scenario: Scenario) -> Metrics {
     Simulation::new(scenario).run()
+}
+
+/// Whether a mesh send payload is a v1 channel envelope. Used only by the
+/// harness's MSH-23 accounting; the engine keeps no such counter.
+fn is_channel_payload(wire: &[u8]) -> bool {
+    Packet::decode(wire).is_ok_and(|packet| {
+        packet.header.class == PacketClass::Broadcast
+            && packet.payload.first() == Some(&CHANNEL_MAGIC)
+    })
+}
+
+/// Returns the mesh packet inside an optional spray envelope.
+fn packet_bytes(payload: &[u8]) -> Option<&[u8]> {
+    if payload.first() == Some(&crate::SPRAY_MAGIC) && payload.len() >= 6 {
+        let len = u16::from_le_bytes([payload[4], payload[5]]) as usize;
+        payload.get(6..6 + len)
+    } else {
+        Some(payload)
+    }
+}
+
+/// Content address of one emitted message send, through a spray envelope if
+/// present. Control frames return `None` and never count as a replay.
+fn probe_id(payload: &[u8]) -> Option<MessageId> {
+    Packet::decode(packet_bytes(payload)?)
+        .ok()
+        .map(|packet| packet.header.msg_id)
 }
 
 fn near(a: (i64, i64), b: (i64, i64), radius: i64) -> bool {
@@ -1693,6 +3520,54 @@ mod tests {
             delivered_by_origin: vec![1, 1],
             unique_receptions_by_node: vec![2, 2],
             unique_receptions: 4,
+            telemetry_attempts: 0,
+            telemetry_accepted: 0,
+            telemetry_rejected: 0,
+            telemetry_receptions: 0,
+            telemetry_distinct_seqs: 0,
+            telemetry_max_seqs_per_node: 0,
+            telemetry_max_seq: 0,
+            purges: 2,
+            delivery_receipts: 1,
+            remaining_copies: 0,
+            remaining_delivered_copies: 0,
+            remaining_delivered_copies_immune: 0,
+            max_purge_latency_ms: 18,
+            presence_converged: true,
+            convergence_ms: 9_000,
+            learned_nodes_min: 1,
+            card_fetches: 0,
+            announcement_sends: 12,
+            announcement_bytes: 1_800,
+            steady_announcement_sends: 4,
+            steady_announcement_bytes: 600,
+            directory_peak_entries: 0,
+            directory_expirations: 0,
+            directory_evictions: 0,
+            directory_last_removal_ms: 0,
+            directory_live_entries: 0,
+            fresh_hint_submissions: 1,
+            fresh_hint_deliveries: 1,
+            fresh_hint_mean_latency_ms: 12,
+            channel_subscribers: 2,
+            channel_deliveries: 1,
+            channel_delivered_ids: vec![BTreeSet::new(), BTreeSet::new()],
+            channel_transmissions: 3,
+            channel_bytes: 6_144,
+            restart_snapshot_bytes: 0,
+            restart_replays: 0,
+            restart_sends_after: 0,
+            duplicate_packets: 2,
+            suppressed_relays: 3,
+            store_entries: 4,
+            sync_bytes_sent: 5,
+            sync_bytes_received: 6,
+            neighbour_penalty_events: 7,
+            neighbour_penalty_total: 8,
+            neighbour_penalty_max: 2,
+            penalised_neighbours: 1,
+            seen_records: 9,
+            suppression_pending: 10,
         };
         let row = m.csv_row();
         assert_eq!(row.lines().count(), 1);
@@ -1702,7 +3577,7 @@ mod tests {
         );
         assert_eq!(
             row,
-            "test,1,2,3,2,0,8,6,0,1024,12,20,0.6667,4.0000,0.0000,100,1"
+            "test,1,2,3,2,0,8,6,0,1024,12,20,0.6667,4.0000,0.0000,100,1,true,9000,1,0,12,1800,4,600"
         );
     }
 

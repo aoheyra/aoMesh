@@ -76,7 +76,10 @@ capacity. The size bound does not depend on the sweep at all.
   Direct packet whose content matches its claimed `msg_id` (dropping
   `Offer::Duplicate` before it can deliver or relay), and once per
   submission so an origin never re-relays its own message.
-- A restart loses the cache, so dedupe resets across restarts; MSH-29's
-  optional snapshot is the fix if that shows up in measurements.
+- A restart without a snapshot loses the cache and dedupe resets, which a
+  delayed neighbour copy can turn into a re-relay. MSH-29 snapshots the entry
+  map and the eviction order together, so restored nodes keep the same dedupe
+  decisions and the same capacity-eviction point; omitting the order would
+  change behaviour even when every live id survived.
 - The byte ceiling is enforced by `tests/seen_memory.rs`; the capacity
   and window defaults are enumerated by a test in `seen.rs`.

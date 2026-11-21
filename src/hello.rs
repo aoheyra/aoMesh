@@ -48,16 +48,21 @@ pub const MIN_PROTO: u8 = 1;
 ///
 /// Bit 0 advertises MSH-14's anti-entropy sync frames. Bit 1 advertises
 /// MSH-15's range reconciliation. Bit 2 advertises MSH-16's bounded spray
-/// envelope. A peer that lacks all three keeps the plain forwarding path;
-/// a peer with only bit 0 gets the MSH-14 summary exchange. Every bit needs
-/// an ADR entry.
+/// envelope. Bit 3 advertises MSH-17's signed receipt envelope. Bit 4
+/// advertises MSH-19's signed presence announcements. A peer that lacks a bit
+/// keeps the earlier forwarding path; a peer with only bit 0 gets the MSH-14
+/// summary exchange. Every bit needs an ADR entry.
 pub const CAP_SYNC_V1: u32 = 1 << 0;
 /// Capability bit for MSH-15 range-based set reconciliation.
 pub const CAP_SYNC_V2: u32 = 1 << 1;
 /// Capability bit for MSH-16 binary spray copy tickets.
 pub const CAP_SPRAY_V1: u32 = 1 << 2;
+/// Capability bit for MSH-17 signed delivery receipts and immunity gossip.
+pub const CAP_RECEIPT_V1: u32 = 1 << 3;
+/// Capability bit for MSH-19 signed presence announcements.
+pub const CAP_PRESENCE_V1: u32 = 1 << 4;
 /// Feature bits this build sets (ADR-0001).
-pub const CAPS: u32 = CAP_SYNC_V1 | CAP_SYNC_V2 | CAP_SPRAY_V1;
+pub const CAPS: u32 = CAP_SYNC_V1 | CAP_SYNC_V2 | CAP_SPRAY_V1 | CAP_RECEIPT_V1 | CAP_PRESENCE_V1;
 
 /// Encoded length of a v1 hello: fixed, so a wrong length is rejected
 /// before anything is read (ADR-0004).
@@ -477,6 +482,20 @@ mod tests {
         assert_ne!(hello.caps & CAP_SYNC_V1, 0);
         assert_ne!(hello.negotiate(PROTO, CAPS).unwrap().1 & CAP_SYNC_V1, 0);
         assert_eq!(hello.negotiate(PROTO, 0).unwrap().1 & CAP_SYNC_V1, 0);
+    }
+
+    /// MSH-19: an honest hello advertises presence announcements. A peer
+    /// without the bit negotiates it away and keeps the pre-MSH-19 Presence
+    /// relay path.
+    #[test]
+    fn presence_cap_is_advertised_and_can_be_negotiated_away() {
+        let identity = Identity::from_seed([13; 32]);
+        let hello = MeshHello::sign(&identity, [0; 8], [0; 4]).unwrap();
+        assert_ne!(hello.caps & CAP_PRESENCE_V1, 0);
+        assert_ne!(hello.negotiate(PROTO, CAPS).unwrap().1 & CAP_PRESENCE_V1, 0);
+        let old = MeshHello::sign_with_caps(&identity, [0; 8], [0; 4], CAP_SYNC_V1).unwrap();
+        let caps = old.negotiate(PROTO, CAPS).unwrap().1;
+        assert_eq!(caps & CAP_PRESENCE_V1, 0);
     }
 
     /// MSH-15: an honest hello also advertises sync v2. A v1-only peer

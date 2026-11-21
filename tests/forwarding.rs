@@ -7,7 +7,7 @@ mod common;
 use ao_idents::Identity;
 use ao_mesh::{
     AdapterEvent, MeshConfig, MeshEngine, MeshHello, MeshInput, MeshOutput, NetworkAdapter,
-    PacketClass, SprayConfig,
+    PacketClass, ReceiptConfig, SprayConfig,
 };
 use ao_network::{
     AppHello, BeaconFlags, LocalTag, Network, NetworkConfig, SimConfig, SimNode, SimTransport,
@@ -38,6 +38,10 @@ fn node(world: &SimWorld, index: usize) -> Adapter {
             spray: SprayConfig {
                 enabled: false,
                 ..SprayConfig::default()
+            },
+            receipt: ReceiptConfig {
+                enabled: false,
+                ..ReceiptConfig::default()
             },
             ..MeshConfig::default()
         },
@@ -198,6 +202,20 @@ fn assert_delivered_once(events: &[(usize, AdapterEvent)], dst: usize) {
             }
             AdapterEvent::SyncNeed { .. } | AdapterEvent::SyncItem { .. } => {
                 panic!("unexpected sync event in a forwarding test: {event:?}")
+            }
+            AdapterEvent::Purge { .. }
+            | AdapterEvent::Delivered { .. }
+            | AdapterEvent::CardFetch { .. } => {
+                panic!("unexpected receipt or presence event in a forwarding test: {event:?}")
+            }
+            AdapterEvent::DirectoryChanged { .. } => {
+                panic!("unexpected directory event in a forwarding test: {event:?}")
+            }
+            AdapterEvent::TelemetryAccepted { .. } => {
+                panic!("unexpected telemetry event in a forwarding test: {event:?}")
+            }
+            AdapterEvent::ChannelDeliver { .. } => {
+                panic!("unexpected channel event in a forwarding test: {event:?}")
             }
         }
     }

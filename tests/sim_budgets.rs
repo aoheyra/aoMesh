@@ -24,7 +24,10 @@ fn flood_origin_is_throttled_without_hurting_honest_origins() {
         ao_mesh::sim::Traffic::Flood { origin, weight } => (origin, weight),
         ao_mesh::sim::Traffic::Balanced
         | ao_mesh::sim::Traffic::Broadcast { .. }
-        | ao_mesh::sim::Traffic::MixedBroadcast { .. } => panic!("flood scenario expected"),
+        | ao_mesh::sim::Traffic::MixedBroadcast { .. }
+        | ao_mesh::sim::Traffic::Presence
+        | ao_mesh::sim::Traffic::Telemetry { .. }
+        | ao_mesh::sim::Traffic::Channel { .. } => panic!("flood scenario expected"),
     };
     let round = weight + 1;
     let flood_count = scenario.messages.div_ceil(round);

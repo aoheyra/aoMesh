@@ -20,6 +20,7 @@ use ao_idents::NodeId;
 use ao_network::LinkId;
 use std::collections::BTreeMap;
 
+use crate::observability::Counter;
 use crate::packet::PacketClass;
 
 /// Fixed-point scale for token fractions. Telemetry's 32 KiB/hour is about
@@ -41,6 +42,18 @@ pub struct ClassRate {
     /// A shorter window bounds a single burst; a longer one tolerates a
     /// chattier but honest node. The default is ten minutes.
     pub burst_seconds: u64,
+}
+
+impl ClassRate {
+    /// Full bucket for this rate in bytes, before the fixed-point scale.
+    ///
+    /// Used by reports and gates that compare measured channel traffic with
+    /// the Broadcast allowance; it is the calculation the token buckets use
+    /// at construction.
+    #[must_use]
+    pub fn burst_bytes(&self) -> u64 {
+        capacity(*self) / SCALE as u64
+    }
 }
 
 /// Which bucket, if any, refused a relay (MSH-10).
@@ -258,6 +271,9 @@ impl NeighborBudget {
 #[derive(Debug)]
 pub struct BudgetTracker {
     config: BudgetConfig,
+    /// Penalty applications (MSH-30). Decay can erase a score, so the
+    /// cumulative event count cannot be derived from current penalties.
+    penalty_events: Counter,
     origins: BTreeMap<NodeId, ClassBuckets>,
     neighbors: BTreeMap<LinkId, NeighborBudget>,
 }
@@ -266,6 +282,7 @@ impl BudgetTracker {
     pub(crate) fn new(config: BudgetConfig) -> Self {
         Self {
             config,
+            penalty_events: Counter::new(),
             origins: BTreeMap::new(),
             neighbors: BTreeMap::new(),
         }
@@ -293,33 +310,31 @@ impl BudgetTracker {
         if self.config.max_neighbors == 0 || self.config.max_origins_per_neighbor == 0 {
             return BudgetOutcome::NeighborDenied;
         }
-        if !self.origins.contains_key(&origin) && self.origins.len() >= self.config.max_origins {
-            let victim = self
-                .origins
-                .iter()
-                .min_by_key(|(id, buckets)| (buckets.last_ms, **id))
-                .map(|(id, _)| *id);
-            if let Some(victim) = victim {
-                self.origins.remove(&victim);
-            }
-        }
         if !self.neighbors.contains_key(&link) && self.neighbors.len() >= self.config.max_neighbors
         {
             return BudgetOutcome::NeighborDenied;
         }
+        // Copy config before taking disjoint mutable field borrows; the
+        // neighbour map and origin table never alias each other.
         let rates = self.config.rates;
+        let max_origins_per_neighbor = self.config.max_origins_per_neighbor;
         let index = rate_index(class);
         let cost = (bytes as u128).saturating_mul(SCALE).min(u64::MAX as u128) as u64;
-        let origin_buckets = self
-            .origins
-            .entry(origin)
-            .or_insert_with(|| ClassBuckets::new(now, &rates));
+        let origin_buckets = match Self::origin_bucket(
+            &mut self.origins,
+            self.config.max_origins,
+            &rates,
+            now,
+            origin,
+        ) {
+            Some(buckets) => buckets,
+            None => return BudgetOutcome::OriginDenied,
+        };
         let neighbor = self
             .neighbors
             .entry(link)
             .or_insert_with(|| NeighborBudget::new(now));
-        let neighbor_buckets =
-            neighbor.buckets(now, &rates, origin, self.config.max_origins_per_neighbor);
+        let neighbor_buckets = neighbor.buckets(now, &rates, origin, max_origins_per_neighbor);
         neighbor_buckets.last_ms = now;
         let origin_ok = origin_buckets.try_take(now, &rates, index, cost);
         if !origin_ok {
@@ -335,6 +350,137 @@ impl BudgetTracker {
             return BudgetOutcome::NeighborDenied;
         }
         BudgetOutcome::Admitted
+    }
+
+    /// Debits one origin-style bucket without charging a link.
+    ///
+    /// Local submissions (MSH-23) pay their per-origin allowance here. A
+    /// submission has no receiving link, so inventing a sentinel neighbour
+    /// would consume one of the bounded link slots; this uses the same
+    /// origin table and class rate as [`Self::admit`] instead.
+    pub(crate) fn admit_origin(
+        &mut self,
+        now: u64,
+        origin: NodeId,
+        class: PacketClass,
+        bytes: usize,
+    ) -> BudgetOutcome {
+        if !self.config.enforce {
+            return BudgetOutcome::Admitted;
+        }
+        let rates = self.config.rates;
+        let cost = (bytes as u128).saturating_mul(SCALE).min(u64::MAX as u128) as u64;
+        let Some(buckets) = Self::origin_bucket(
+            &mut self.origins,
+            self.config.max_origins,
+            &rates,
+            now,
+            origin,
+        ) else {
+            return BudgetOutcome::OriginDenied;
+        };
+        if buckets.try_take(now, &rates, rate_index(class), cost) {
+            BudgetOutcome::Admitted
+        } else {
+            BudgetOutcome::OriginDenied
+        }
+    }
+
+    /// Restores an origin debit after a paired admission failed.
+    ///
+    /// A local channel submission needs both its origin and its channel to
+    /// admit the same bytes. If the second bucket refuses, the first must not
+    /// keep tokens for a packet that was never emitted (MSH-10's refund rule).
+    pub(crate) fn refund_origin(
+        &mut self,
+        now: u64,
+        origin: NodeId,
+        class: PacketClass,
+        bytes: usize,
+    ) {
+        if !self.config.enforce {
+            return;
+        }
+        let rates = self.config.rates;
+        let cost = (bytes as u128).saturating_mul(SCALE).min(u64::MAX as u128) as u64;
+        // Re-create the entry if the paired channel admission evicted it from
+        // a very small LRU table; otherwise a denied packet silently burns
+        // tokens for an origin that never emitted one. The table stays bounded
+        // because this uses the same insertion path as admission.
+        let Some(buckets) = Self::origin_bucket(
+            &mut self.origins,
+            self.config.max_origins,
+            &rates,
+            now,
+            origin,
+        ) else {
+            return;
+        };
+        let slot = &mut buckets.slots[rate_index(class)];
+        slot.refill(now, rates[rate_index(class)]);
+        slot.tokens = slot.tokens.saturating_add(cost).min(slot.capacity);
+    }
+
+    /// Debits only an origin-style bucket, for MSH-23's per-channel key.
+    ///
+    /// Public channels reuse the same class rates and the same bounded
+    /// LRU token-bucket table as [`Self::admit`]; the synthetic key comes
+    /// from `channel::channel_budget_origin`. No second budget table, timer
+    /// or config knob is introduced, and the link bucket is not charged
+    /// twice for one packet. A denial is always reported as
+    /// [`BudgetOutcome::OriginDenied`]: it is never the neighbour's fault.
+    pub(crate) fn admit_channel(
+        &mut self,
+        now: u64,
+        channel: NodeId,
+        class: PacketClass,
+        bytes: usize,
+    ) -> BudgetOutcome {
+        if !self.config.enforce {
+            return BudgetOutcome::Admitted;
+        }
+        let rates = self.config.rates;
+        let cost = (bytes as u128).saturating_mul(SCALE).min(u64::MAX as u128) as u64;
+        let Some(buckets) = Self::origin_bucket(
+            &mut self.origins,
+            self.config.max_origins,
+            &rates,
+            now,
+            channel,
+        ) else {
+            return BudgetOutcome::OriginDenied;
+        };
+        if buckets.try_take(now, &rates, rate_index(class), cost) {
+            BudgetOutcome::Admitted
+        } else {
+            BudgetOutcome::OriginDenied
+        }
+    }
+
+    fn origin_bucket<'a>(
+        origins: &'a mut BTreeMap<NodeId, ClassBuckets>,
+        max_origins: usize,
+        rates: &[ClassRate; 4],
+        now: u64,
+        origin: NodeId,
+    ) -> Option<&'a mut ClassBuckets> {
+        if max_origins == 0 {
+            return None;
+        }
+        if !origins.contains_key(&origin) && origins.len() >= max_origins {
+            let victim = origins
+                .iter()
+                .min_by_key(|(id, buckets)| (buckets.last_ms, **id))
+                .map(|(id, _)| *id);
+            if let Some(victim) = victim {
+                origins.remove(&victim);
+            }
+        }
+        Some(
+            origins
+                .entry(origin)
+                .or_insert_with(|| ClassBuckets::new(now, rates)),
+        )
     }
 
     /// Adds `amount` to a link's penalty after decaying old score.
@@ -361,6 +507,9 @@ impl BudgetTracker {
                 .saturating_add(steps.saturating_mul(self.config.penalty_decay_ms));
         }
         neighbor.penalty = neighbor.penalty.saturating_add(amount);
+        if amount > 0 {
+            self.penalty_events.add(1);
+        }
         if neighbor.penalty >= self.config.penalty_release_at && !neighbor.released {
             neighbor.released = true;
             return true;
@@ -383,6 +532,12 @@ impl BudgetTracker {
         self.neighbors
             .get(&link)
             .map_or(0, |neighbor| neighbor.penalty)
+    }
+
+    /// Saturating number of penalty applications (MSH-30). Zero-amount calls
+    /// are decay probes, not penalty events, and are not counted.
+    pub(crate) fn penalty_events(&self) -> u64 {
+        self.penalty_events.get()
     }
 
     /// Number of claimed origins with live bucket state.
@@ -516,6 +671,60 @@ mod tests {
     }
 
     #[test]
+    fn channel_key_reuses_the_origin_bucket_without_charging_a_link() {
+        let config = small();
+        let mut tracker = BudgetTracker::new(config);
+        let channel = NodeId::from_bytes([42; 16]);
+        assert_eq!(
+            tracker.admit_channel(0, channel, PacketClass::Broadcast, 400),
+            BudgetOutcome::Admitted
+        );
+        // The same channel is capped by the Broadcast allowance, while the
+        // real origin and every link bucket are untouched.
+        assert_eq!(
+            tracker.admit_channel(0, channel, PacketClass::Broadcast, 201),
+            BudgetOutcome::OriginDenied
+        );
+        assert_eq!(
+            tracker.admit(0, LINK_A, ORIGIN_A, PacketClass::Broadcast, 400),
+            BudgetOutcome::Admitted
+        );
+        assert_eq!(tracker.origins(), 2);
+        let burst = config.rates[1].burst_bytes();
+        assert!(burst > 0);
+        assert_eq!(
+            burst,
+            config.rates[1].bytes_per_hour * config.rates[1].burst_seconds / 3_600
+        );
+    }
+
+    #[test]
+    fn refund_restores_an_origin_evicted_by_the_paired_channel_admission() {
+        let config = BudgetConfig {
+            max_origins: 1,
+            ..small()
+        };
+        let mut tracker = BudgetTracker::new(config);
+        let channel = NodeId::from_bytes([42; 16]);
+        assert_eq!(
+            tracker.admit_origin(0, ORIGIN_A, PacketClass::Broadcast, 200),
+            BudgetOutcome::Admitted
+        );
+        // With one origin slot this evicts A before charging the channel.
+        assert_eq!(
+            tracker.admit_channel(0, channel, PacketClass::Broadcast, 500),
+            BudgetOutcome::Admitted
+        );
+        tracker.refund_origin(0, ORIGIN_A, PacketClass::Broadcast, 200);
+        // A was restored, evicting the nearly empty channel bucket; a fresh
+        // channel bucket can therefore still admit the next packet.
+        assert_eq!(
+            tracker.admit_channel(0, channel, PacketClass::Broadcast, 200),
+            BudgetOutcome::Admitted
+        );
+    }
+
+    #[test]
     fn denied_packet_does_not_consume_the_other_bucket() {
         let config = small();
         let mut tracker = BudgetTracker::new(config);
@@ -609,5 +818,29 @@ mod tests {
         assert!(tracker.penalize(0, LINK_A, 3));
         tracker.link_down(LINK_A);
         assert_eq!(tracker.penalty(LINK_A), 0);
+    }
+
+    #[test]
+    fn penalty_events_count_only_positive_applications() {
+        let mut tracker = BudgetTracker::new(small());
+        assert_eq!(tracker.penalty_events(), 0);
+        assert!(!tracker.penalize(0, LINK_A, 0));
+        assert_eq!(tracker.penalty_events(), 0, "a decay probe is not an event");
+        assert!(!tracker.penalize(1, LINK_A, 2));
+        assert!(tracker.penalize(2, LINK_A, 1));
+        assert_eq!(tracker.penalty_events(), 2);
+        // Decay removes the score but never the cumulative count.
+        assert!(!tracker.penalize(4_000, LINK_A, 0));
+        assert_eq!(tracker.penalty(LINK_A), 0);
+        assert_eq!(tracker.penalty_events(), 2);
+    }
+
+    #[test]
+    fn penalty_event_counter_saturates() {
+        let mut tracker = BudgetTracker::new(small());
+        tracker.penalty_events.set(u64::MAX - 1);
+        let _ = tracker.penalize(0, LINK_A, 1);
+        let _ = tracker.penalize(1, LINK_A, 1);
+        assert_eq!(tracker.penalty_events(), u64::MAX);
     }
 }

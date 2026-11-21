@@ -5,9 +5,10 @@
 //! and no clock is read here. Network durations and mesh milliseconds are
 //! explicit separate inputs; no wall-clock/monotonic conversion is guessed.
 
+use crate::telemetry::TelemetryAdvisory;
 use crate::{MeshEngine, MeshError, MeshInput, MeshOutput};
 use ao_idents::Identity;
-use ao_network::{LinkId, Network, NetworkEvent, SendError, Transport};
+use ao_network::{LinkId, Network, NetworkEvent, SendError, SendOpts, Transport};
 use rand_core::RngCore;
 use std::future::poll_fn;
 use std::task::{Context, Poll};
@@ -26,6 +27,18 @@ pub enum AdapterEvent {
         /// The opened application payload.
         payload: Vec<u8>,
     },
+    /// A signed public-channel Broadcast accepted for a local subscriber
+    /// (MSH-23). The engine verified the origin signature with the key from
+    /// the sender's signed hello and accepted the id in its replay guard;
+    /// the payload is the opaque envelope body, unmodified.
+    ChannelDeliver {
+        /// The channel the message was addressed to.
+        channel_id: crate::ChannelId,
+        /// Packet header, as received.
+        header: crate::Header,
+        /// Opaque application bytes from the envelope.
+        payload: Vec<u8>,
+    },
     /// Network admission failed; SendError retains the original payload.
     SendFailed {
         /// The refusing link.
@@ -40,6 +53,43 @@ pub enum AdapterEvent {
         link: LinkId,
         /// Prefixes the peer is missing.
         prefixes: Vec<[u8; crate::sync::SHORT_ID_BYTES]>,
+    },
+    /// The host store must remove this delivered message (MSH-17).
+    Purge {
+        /// Content address whose copies are no longer needed.
+        id: crate::MessageId,
+    },
+    /// An authenticated receipt reached its sender (MSH-17).
+    Delivered {
+        /// The acknowledged message.
+        id: crate::MessageId,
+        /// Original sender from the acknowledged packet.
+        origin: [u8; 16],
+        /// Authenticated destination that issued the receipt.
+        by: [u8; 16],
+    },
+    /// The host must fetch an identity card it does not yet know (MSH-19).
+    /// The adapter neither resolves nor caches cards.
+    CardFetch {
+        /// Node whose signed announcement advertised the card.
+        node_id: [u8; 16],
+        /// Opaque hash to resolve out of band.
+        card_hash: [u8; 8],
+    },
+    /// Coalesced directory changes for the UI (MSH-20). No network action
+    /// follows; the UI queries `MeshEngine::directory` for details.
+    DirectoryChanged {
+        /// Bounded, ordered change stream.
+        changes: Vec<crate::directory::DirectoryChange>,
+    },
+    /// A Telemetry update was accepted under this latest-wins advisory.
+    /// The adapter has already handed its key and deadline to aoNetwork's
+    /// send queue; the event is for host diagnostics, not another queue.
+    TelemetryAccepted {
+        /// Link that received the update.
+        link: LinkId,
+        /// Policy values mirrored into `SendOpts`.
+        advisory: TelemetryAdvisory,
     },
     /// A peer's item is ready for the store owner to validate and insert.
     SyncItem {
@@ -62,9 +112,25 @@ impl<R: RngCore, T: Transport> NetworkAdapter<R, T> {
     pub fn new(engine: MeshEngine<R>, network: Network<T>) -> Self {
         Self { engine, network }
     }
+    /// Replaces the engine without tearing down the network facade.
+    ///
+    /// A host restoring an MSH-29 snapshot keeps its live radio links and
+    /// re-announces them to the new engine; only the routing state is swapped.
+    /// The previous engine is returned so the caller can drop it explicitly.
+    pub fn replace_engine(&mut self, engine: MeshEngine<R>) -> MeshEngine<R> {
+        std::mem::replace(&mut self.engine, engine)
+    }
     /// Inspect engine state without a second source of truth.
     pub fn engine(&self) -> &MeshEngine<R> {
         &self.engine
+    }
+    /// The engine's versioned diagnostics snapshot (MSH-30).
+    ///
+    /// The host maps these plain integer fields into its own diagnostics
+    /// bundle; the adapter adds no I/O, clock read or second counter.
+    #[must_use]
+    pub fn snapshot(&self) -> crate::MeshSnapshot {
+        self.engine.observability_snapshot()
     }
     /// Inspect the network and its transport.
     pub fn network(&self) -> &Network<T> {
@@ -96,6 +162,16 @@ impl<R: RngCore, T: Transport> NetworkAdapter<R, T> {
         let outputs = self.engine.handle(mesh_now_ms, input)?;
         Ok(self.apply(network_now, outputs))
     }
+    /// Translates mesh milliseconds into aoNetwork's absolute monotonic
+    /// deadline. A clock overflow leaves the frame undated rather than
+    /// inventing a deadline in the past.
+    fn telemetry_opts(now: Duration, advisory: TelemetryAdvisory) -> SendOpts {
+        SendOpts {
+            coalesce_key: Some(*advisory.coalesce_key.as_bytes()),
+            expires_at: now.checked_add(Duration::from_millis(advisory.expires_in_ms)),
+        }
+    }
+
     /// Maps actions to the facade; errors and deliveries are returned, never swallowed.
     /// The adapter reads no clock: `network_now` is passed straight to
     /// every facade command that needs the time.
@@ -119,6 +195,48 @@ impl<R: RngCore, T: Transport> NetworkAdapter<R, T> {
                             .into_iter()
                             .map(|(link, error)| AdapterEvent::SendFailed { link, error }),
                     );
+                }
+                MeshOutput::TelemetrySend {
+                    link,
+                    channel,
+                    payload,
+                    advisory,
+                } => {
+                    let opts = Self::telemetry_opts(network_now, advisory);
+                    if let Err(error) =
+                        self.network
+                            .send_opts(network_now, link, channel, payload, opts)
+                    {
+                        events.push(AdapterEvent::SendFailed { link, error });
+                    } else {
+                        events.push(AdapterEvent::TelemetryAccepted { link, advisory });
+                    }
+                }
+                MeshOutput::TelemetryBroadcast {
+                    channel,
+                    payload,
+                    advisory,
+                } => {
+                    let opts = Self::telemetry_opts(network_now, advisory);
+                    let links: Vec<LinkId> = self
+                        .network
+                        .links()
+                        .into_iter()
+                        .map(|info| info.link)
+                        .collect();
+                    for link in links {
+                        if let Err(error) = self.network.send_opts(
+                            network_now,
+                            link,
+                            channel,
+                            payload.clone(),
+                            opts,
+                        ) {
+                            events.push(AdapterEvent::SendFailed { link, error });
+                        } else {
+                            events.push(AdapterEvent::TelemetryAccepted { link, advisory });
+                        }
+                    }
                 }
                 MeshOutput::Release { link, reason } => {
                     self.network.disconnect(network_now, link, reason)
@@ -148,6 +266,25 @@ impl<R: RngCore, T: Transport> NetworkAdapter<R, T> {
                 }),
                 MeshOutput::Deliver { header, payload } => {
                     events.push(AdapterEvent::Deliver { header, payload })
+                }
+                MeshOutput::ChannelDeliver {
+                    channel_id,
+                    header,
+                    payload,
+                } => events.push(AdapterEvent::ChannelDeliver {
+                    channel_id,
+                    header,
+                    payload,
+                }),
+                MeshOutput::Purge { id } => events.push(AdapterEvent::Purge { id }),
+                MeshOutput::Delivered { id, origin, by } => {
+                    events.push(AdapterEvent::Delivered { id, origin, by })
+                }
+                MeshOutput::CardFetch { node_id, card_hash } => {
+                    events.push(AdapterEvent::CardFetch { node_id, card_hash })
+                }
+                MeshOutput::DirectoryChanged { changes } => {
+                    events.push(AdapterEvent::DirectoryChanged { changes })
                 }
             }
         }

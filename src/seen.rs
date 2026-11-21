@@ -16,6 +16,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
+use crate::observability::Counter;
 use crate::packet::{MessageId, PacketClass};
 
 /// Bounds and lifetimes for a [`SeenCache`].
@@ -78,6 +79,17 @@ pub enum Offer {
     Duplicate,
 }
 
+/// The exact bounded state an MSH-29 snapshot carries.
+///
+/// Both structures are kept, including stale order slots: capacity eviction
+/// is defined in terms of the deque, so dropping a stale slot would change
+/// which recording is shed after a restart.
+#[derive(Debug)]
+pub(crate) struct SeenState {
+    pub(crate) entries: BTreeMap<MessageId, u64>,
+    pub(crate) order: VecDeque<MessageId>,
+}
+
 /// The forwarding dedupe cache (MSH-05), keyed by `msg_id`.
 ///
 /// Both bounds always hold: [`SeenCache::len`] never exceeds
@@ -117,6 +129,9 @@ pub enum Offer {
 #[derive(Debug)]
 pub struct SeenCache {
     config: SeenConfig,
+    /// Duplicate verdicts (MSH-30). The cache owns this count because it owns
+    /// the dedupe decision: no second state can disagree with it.
+    duplicates: Counter,
     /// `msg_id` to its expiry instant (unix ms).
     entries: BTreeMap<MessageId, u64>,
     /// Recording order, oldest first; never longer than `config.capacity`.
@@ -130,10 +145,25 @@ impl SeenCache {
     #[must_use]
     pub fn new(config: SeenConfig) -> Self {
         Self {
+            config,
+            duplicates: Counter::new(),
             entries: BTreeMap::new(),
             order: VecDeque::with_capacity(config.capacity),
-            config,
         }
+    }
+
+    /// Copies the bounded recordings and their order into snapshot state.
+    pub(crate) fn export_state(&self) -> SeenState {
+        SeenState {
+            entries: self.entries.clone(),
+            order: self.order.clone(),
+        }
+    }
+
+    /// Installs a validated snapshot without changing this cache's bounds.
+    pub(crate) fn import_state(&mut self, state: SeenState) {
+        self.entries = state.entries;
+        self.order = state.order;
     }
 
     /// Offers a packet's `msg_id` and reports whether it was already seen
@@ -154,6 +184,7 @@ impl SeenCache {
     pub fn check_and_insert(&mut self, now: u64, class: PacketClass, msg_id: MessageId) -> Offer {
         self.sweep(now);
         if self.is_duplicate(now, &msg_id) {
+            self.duplicates.add(1);
             return Offer::Duplicate;
         }
         // Expired: drop the stale record so the new recording below
@@ -196,6 +227,18 @@ impl SeenCache {
     #[must_use]
     pub fn capacity(&self) -> usize {
         self.config.capacity
+    }
+
+    /// Saturating duplicate verdicts recorded here (MSH-30).
+    pub(crate) fn duplicates(&self) -> u64 {
+        self.duplicates.get()
+    }
+
+    /// Counts one duplicate observed through the pure [`Self::is_duplicate`]
+    /// peek. Called by the delivery and flooded-class gates, which must not
+    /// extend a dedupe window but still need the event in the snapshot.
+    pub(crate) fn note_duplicate(&mut self) {
+        self.duplicates.add(1);
     }
 
     /// Records `msg_id` fresh for `class`'s window, evicting the oldest
@@ -642,5 +685,48 @@ mod tests {
         assert_eq!(cache.capacity(), 4_096);
         assert!(cache.is_empty());
         assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn only_duplicate_verdicts_increment_the_counter() {
+        let mut cache = SeenCache::new(config_with(2, 60_000));
+        assert_eq!(cache.duplicates(), 0);
+        assert_eq!(
+            cache.check_and_insert(0, PacketClass::Direct, id(20)),
+            Offer::Fresh
+        );
+        assert_eq!(
+            cache.duplicates(),
+            0,
+            "a fresh recording is not a duplicate"
+        );
+        assert_eq!(
+            cache.check_and_insert(1, PacketClass::Direct, id(20)),
+            Offer::Duplicate
+        );
+        assert_eq!(cache.duplicates(), 1);
+        // A pure peek does not change dedupe state; the caller's explicit
+        // note is what makes the event visible.
+        assert!(cache.is_duplicate(1, &id(20)));
+        assert_eq!(cache.duplicates(), 1);
+        cache.note_duplicate();
+        assert_eq!(cache.duplicates(), 2);
+        // An expired recording is fresh again, and does not count.
+        assert_eq!(
+            cache.check_and_insert(60_000, PacketClass::Direct, id(20)),
+            Offer::Fresh
+        );
+        assert_eq!(cache.duplicates(), 2);
+    }
+
+    #[test]
+    fn duplicate_counter_saturates() {
+        let mut cache = SeenCache::default();
+        cache.duplicates.set(u64::MAX - 1);
+        let msg_id = id(21);
+        let _ = cache.check_and_insert(0, PacketClass::Direct, msg_id);
+        let _ = cache.check_and_insert(1, PacketClass::Direct, msg_id);
+        let _ = cache.check_and_insert(2, PacketClass::Direct, msg_id);
+        assert_eq!(cache.duplicates(), u64::MAX);
     }
 }
