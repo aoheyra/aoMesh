@@ -244,6 +244,12 @@ impl<R: RngCore, T: Transport> NetworkAdapter<R, T> {
                 MeshOutput::SetHello { tag, app_hello } => {
                     self.network.set_local_hello(tag, app_hello)
                 }
+                MeshOutput::SetLinkHint { peer, preference } => {
+                    self.network.set_link_hint(peer, preference);
+                }
+                MeshOutput::ClearLinkHint { peer } => {
+                    let _ = self.network.clear_link_hint(peer);
+                }
                 MeshOutput::SetBeacon {
                     hint,
                     digest,

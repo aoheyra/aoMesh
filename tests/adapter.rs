@@ -6,8 +6,8 @@ use ao_mesh::{
     PacketClass, SprayConfig,
 };
 use ao_network::{
-    AppHello, BeaconFlags, Channel, DisconnectReason, LinkId, LocalTag, Network, NetworkConfig,
-    SendError, SimConfig, SimNode, SimTransport, SimWorld,
+    AppHello, BeaconFlags, Channel, DisconnectReason, LinkHintPreference, LinkId, LocalTag,
+    Network, NetworkConfig, PeerKey, SendError, SimConfig, SimNode, SimTransport, SimWorld,
 };
 use rand::{SeedableRng, rngs::StdRng};
 use std::task::{Context, Poll, Waker};
@@ -339,4 +339,58 @@ fn async_wrapper_is_pending_without_network_events() {
     let identity = Identity::from_seed([1; 32]);
     let mut future = std::pin::pin!(n.next_event(Duration::ZERO, 0, &identity));
     assert!(std::future::Future::poll(future.as_mut(), &mut cx).is_pending());
+}
+
+#[test]
+fn link_hint_outputs_reach_the_real_network_hint_table() {
+    let (_world, mut nodes) = pair();
+    let peer: PeerKey = nodes[1].network().transport().peer_key();
+    let node = Identity::from_seed([2; 32]).node_id();
+    assert_eq!(
+        nodes[0].network().link_hint(peer),
+        LinkHintPreference::Neutral
+    );
+
+    let events = nodes[0]
+        .handle(
+            std::time::Duration::ZERO,
+            3000,
+            MeshInput::ObserveLinkHint {
+                observation: ao_mesh::LinkHintObservation {
+                    peer,
+                    node,
+                    contact: true,
+                },
+            },
+        )
+        .expect("bounded host fact");
+    assert!(events.is_empty());
+    assert_eq!(
+        nodes[0].network().link_hint(peer),
+        LinkHintPreference::Prefer
+    );
+    assert_eq!(
+        nodes[0].network().link_hints(),
+        vec![(peer, LinkHintPreference::Prefer)]
+    );
+
+    let events = nodes[0]
+        .handle(
+            std::time::Duration::ZERO,
+            4000,
+            MeshInput::ObserveLinkHint {
+                observation: ao_mesh::LinkHintObservation {
+                    peer,
+                    node,
+                    contact: false,
+                },
+            },
+        )
+        .expect("bounded host fact");
+    assert!(events.is_empty());
+    assert_eq!(
+        nodes[0].network().link_hint(peer),
+        LinkHintPreference::Neutral
+    );
+    assert!(nodes[0].network().link_hints().is_empty());
 }

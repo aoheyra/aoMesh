@@ -52,6 +52,7 @@ pub mod engine;
 pub mod expiry;
 mod forward;
 pub mod hello;
+pub mod linkhint;
 pub mod neighbor;
 pub mod observability;
 pub mod packet;
@@ -85,6 +86,10 @@ pub use engine::{MeshEngine, MeshError, MeshInput, MeshOutput};
 pub use hello::{
     CAP_PRESENCE_V1, CAP_RECEIPT_V1, CAP_SPRAY_V1, CAP_SYNC_V1, CAP_SYNC_V2, CAPS, HelloError,
     MeshHello,
+};
+pub use linkhint::{
+    DEFAULT_MAX_PEERS, DEFAULT_MIN_DIVERSE_NODES, DEFAULT_PENALTY_THRESHOLD, LinkHintConfig,
+    LinkHintObservation, LinkHintTable,
 };
 pub use neighbor::{MeshConfig, Neighbor, NeighborTable};
 pub use observability::{MESH_SNAPSHOT_VERSION, MeshSnapshot};

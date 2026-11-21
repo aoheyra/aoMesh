@@ -2,7 +2,7 @@
 
 **The routing and store-and-forward engine of the aoheyra mesh.** A sans-IO Rust crate that decides what happens to a packet: forward it, hold it, suppress it, deliver it, or drop it, across a phone-to-phone mesh where links come and go.
 
-> **Status: pre-alpha, through MSH-30.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest, bounded anti-entropy sync, range-based reconciliation on meeting links, binary spray-and-wait for Direct traffic, signed delivery receipts with bounded store purging, relative-age lifetime ceilings, bounded presence announcements with trickle timing, a bounded ephemeral NodeDirectory with coalesced UI events, bounded reverse-path route hints derived from directory observations, bounded latest-wins telemetry with typed advisory coalescing, local public-channel subscriptions over signed Broadcast envelopes, resource-bounded decoders with fuzz targets in [aoheyra-fuzz](https://github.com/aoheyra/aoheyra-fuzz), versioned restart snapshots for seen-cache, immunity and spray state, and a versioned content-free diagnostics snapshot are implemented.
+> **Status: pre-alpha, through MSH-30.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest, bounded anti-entropy sync, range-based reconciliation on meeting links, binary spray-and-wait for Direct traffic, signed delivery receipts with bounded store purging, relative-age lifetime ceilings, bounded presence announcements with trickle timing, a bounded ephemeral NodeDirectory with coalesced UI events, bounded reverse-path route hints derived from directory observations, bounded advisory neighbour link hints for aoNetwork, bounded latest-wins telemetry with typed advisory coalescing, local public-channel subscriptions over signed Broadcast envelopes, resource-bounded decoders with fuzz targets in [aoheyra-fuzz](https://github.com/aoheyra/aoheyra-fuzz), versioned restart snapshots for seen-cache, immunity and spray state, and a versioned content-free diagnostics snapshot are implemented.
 
 Cargo package name: `ao_mesh`.
 
@@ -33,6 +33,7 @@ aoMesh consumes **aoNetwork** (links and frames) and **aoIdents** (signatures, s
 - **Controls abuse mesh-wide**: per-origin and per-class relay budgets, neighbour penalty scores.
 - Handles **delivery receipts and immunity** so copies are purged after delivery.
 - Maintains bounded **presence** announcements and a mesh-wide **NodeDirectory** from typed observations, with LRU eviction, relative-time expiry and coalesced UI changes; derives bounded **reverse-path route hints** from those facts.
+- Emits bounded **advisory link hints** from contact, diversity and penalty facts. aoNetwork alone forms links and enforces the degree cap.
 - Publishes **Telemetry** as latest-wins ambient state with NET-21 coalescing, and carries **public channels** as bounded envelopes inside signed Broadcast packets with local-only subscriptions.
 - Exposes **bounded diagnostics counters** as a versioned, content-free snapshot for the host.
 - Ships a **simulator harness** with mobility models and metrics, so every routing parameter can be swept and every claim measured.
@@ -534,6 +535,13 @@ cargo run --release --features sim --example routehint_report
 cargo test --release --all-features --test sim_routehint
 ```
 
+MSH-25 adds a paired time-to-link report:
+
+```bash
+cargo run --release --features sim --example linkhint_report
+cargo test --release --all-features --test sim_linkhint
+```
+
 Tests are `cargo test` only: no Miri, callgrind or fuzz campaigns locally.
 CI runs fmt, clippy, tests on three operating systems, `cargo doc`,
 cargo-deny, an MSRV build and miri on every pull request. The weekly 90-minute
@@ -768,6 +776,63 @@ locks every row above.
 ```bash
 cargo run --release --features sim --example routehint_report
 cargo test --release --all-features --test sim_routehint
+```
+
+## Neighbour hints to aoNetwork (MSH-25)
+
+aoMesh sees facts aoNetwork cannot: the host recognises a contact's rotating
+tag, the directory says which nodes a neighbour can reach, and MSH-10 records
+neighbour penalties. The engine turns those facts into advisory
+`MeshOutput::SetLinkHint` / `ClearLinkHint` actions; the adapter calls aoNetwork's
+real `set_link_hint` / `clear_link_hint`. A hint changes candidate ordering and
+skips aoNetwork's four-second initiation delay. It never reserves a slot,
+evicts a link, changes the admission floor or raises the degree cap: aoNetwork
+remains the only component that forms links. No wire field changes.
+
+The host supplies opaque facts through `MeshInput::ObserveLinkHint { observation }`:
+a `PeerKey` reported by the radio, the `NodeId` the host associates with it, and
+whether the contact book recognises it. The engine keeps both values opaque.
+A recognized contact is preferred. An unlinked peer is also preferred when its
+identity is the `via` neighbour of at least `min_diverse_nodes` live directory
+entries whose destinations no currently linked neighbour reaches. A verified
+link to that peer removes the diversity claim. A penalty at or above
+`penalty_threshold` overrides both claims with `Deprioritize`; a `Tick`
+re-evaluates the decision as penalties decay. Revoking a contact or losing all
+support clears the advice.
+
+| Setting | Default | Why |
+|---|---|---|
+| Maximum tracked peers | 64 | Mirrors aoNetwork's default `max_peers` (NET-16) |
+| Penalty threshold | 3 | One invalid packet under MSH-10's default `penalty_invalid` |
+| Minimum diverse nodes | 2 | One noisy announcement is not a diversity claim |
+| Eviction | Lowest preference, then greatest `PeerKey` | Deterministic and identical to aoNetwork's hint table |
+
+The paired report runs scripted contacts 2, 3 and 4 into range of node 0 at
+run start. Both rows use the same seed, topology, traffic and engine
+configuration; only the host-supplied hint plan changes. The one-second bound
+is far below NET-16's unhinted initiation delay. Four fixed seeds are published
+so the "more often" claim is measured, not inferred from one run.
+
+| Scenario | Seed | Linked in bound | Mean link time (ms) | Delivered / submitted | Transmissions | Mean latency (ms) | Overhead |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `linkhint-off-scripted-20-a` | 1297303701 | 0 / 3 | 0 | 16 / 16 | 238 | 687 | 14.8750 |
+| `linkhint-on-scripted-20-a` | 1297303701 | 3 / 3 | 383 | 16 / 16 | 238 | 687 | 14.8750 |
+| `linkhint-off-scripted-20-b` | 1297303702 | 0 / 3 | 0 | 16 / 16 | 238 | 684 | 14.8750 |
+| `linkhint-on-scripted-20-b` | 1297303702 | 3 / 3 | 350 | 16 / 16 | 238 | 684 | 14.8750 |
+| `linkhint-off-scripted-20-c` | 1297303703 | 0 / 3 | 0 | 16 / 16 | 238 | 684 | 14.8750 |
+| `linkhint-on-scripted-20-c` | 1297303703 | 3 / 3 | 366 | 16 / 16 | 238 | 684 | 14.8750 |
+| `linkhint-off-scripted-20-d` | 1297303704 | 0 / 3 | 0 | 16 / 16 | 238 | 684 | 14.8750 |
+| `linkhint-on-scripted-20-d` | 1297303704 | 3 / 3 | 383 | 16 / 16 | 238 | 684 | 14.8750 |
+
+Hints link 12 of 12 seeded contacts within one second against 0 of 12 without
+hints. Delivery, latency, transmissions and overhead are identical in every
+pair, so the win is time-to-link rather than a routing shortcut. `tests/linkhint.rs`
+covers contact, diversity, penalty and bounded-fact behaviour; `tests/adapter.rs`
+asserts the real aoNetwork hint table; `tests/sim_linkhint.rs` locks every row.
+
+```bash
+cargo run --release --features sim --example linkhint_report
+cargo test --release --all-features --test sim_linkhint
 ```
 
 ## Signed delivery receipts and immunity (MSH-17)

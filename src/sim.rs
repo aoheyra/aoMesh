@@ -26,15 +26,17 @@ use crate::presence::{ANNOUNCE_LEN, ANNOUNCE_MAGIC};
 use crate::store::{MemoryStore, MessageStore, StoreLimits, StoreMetadata, StoredMessage};
 use crate::{
     CAP_PRESENCE_V1, CAP_RECEIPT_V1, CAP_SYNC_V1, CAPS, CHANNEL_MAGIC, ChannelEnvelope,
-    DirectoryChange, Header, MeshConfig, MeshEngine, MeshHello, MeshInput, MeshOutput, MessageId,
-    NetworkAdapter, Packet, PacketClass, PresenceConfig, RouteHintMode, SHORT_ID_BYTES, SYNC_MAGIC,
-    SYNC_V2_VERSION, Snapshot, StoreSummary, SuppressionConfig, SyncOffer, TelemetryConfig,
-    TelemetryFrame, TelemetryKind, derive_channel_id, derive_msg_id, sign_packet,
+    DirectoryChange, Header, LinkHintObservation, MeshConfig, MeshEngine, MeshHello, MeshInput,
+    MeshOutput, MessageId, NetworkAdapter, Packet, PacketClass, PresenceConfig, RouteHintMode,
+    SHORT_ID_BYTES, SYNC_MAGIC, SYNC_V2_VERSION, Snapshot, StoreSummary, SuppressionConfig,
+    SyncOffer, TelemetryConfig, TelemetryFrame, TelemetryKind, derive_channel_id, derive_msg_id,
+    sign_packet,
 };
 use ao_idents::{Identity, NodeId, SealedMessage};
 use ao_network::{
-    AppHello, BeaconFlags, Channel, Hello, LinkId, LinkInfo, LocalTag, Network, NetworkConfig,
-    NetworkEvent, SimConfig as WorldConfig, SimNode, SimTransport, SimWorld,
+    AppHello, BeaconFlags, Channel, Hello, LinkHintPreference, LinkId, LinkInfo, LocalTag, Network,
+    NetworkConfig, NetworkEvent, PeerKey, SimConfig as WorldConfig, SimNode, SimTransport,
+    SimWorld,
 };
 use rand::{SeedableRng as SeedableRng09, rngs::StdRng as EngineRng};
 use rand08::{SeedableRng as SeedableRng08, rngs::StdRng as SealRng};
@@ -96,6 +98,23 @@ pub struct Contact {
     pub b: usize,
     /// Whether the pair becomes in range or out of range.
     pub up: bool,
+}
+
+/// Host-side contact facts and the binding for MSH-25's paired report.
+///
+/// The harness plays the role of the contact book: it maps a simulated
+/// contact's radio key to the identity the owner knows. Those are ordinary
+/// host facts supplied through `MeshInput::ObserveLinkHint`; the engine only
+/// emits advice and aoNetwork still forms every link. `bound` is the run
+/// deadline for counting a contact as linked in time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkHintPlan {
+    /// Node whose contact book recognises the peers.
+    pub owner: usize,
+    /// Indices whose tags are known contacts of `owner`.
+    pub contacts: &'static [usize],
+    /// Maximum run-relative time for a contact link to count.
+    pub bound: Duration,
 }
 
 /// How node positions change during the run phase.
@@ -259,6 +278,10 @@ pub struct Scenario {
     pub receipts: bool,
     /// MSH-21 route-hint mode. `Off` keeps every published row unchanged.
     pub route_hint: RouteHintMode,
+    /// Optional MSH-25 contact-fact plan. `None` is the hints-off control;
+    /// with a plan the harness supplies the same facts to the same owner and
+    /// only advisory link hints differ between paired rows.
+    pub link_hints: Option<LinkHintPlan>,
     /// Suppression bounds and timer parameters under test.
     pub suppression: SuppressionConfig,
     /// Whether links advertise and consume MSH-19 announcements.
@@ -317,6 +340,26 @@ pub struct Metrics {
     pub peak_queued_bytes: usize,
     /// Up links once settlement finished.
     pub links_after_settle: usize,
+    /// Designated MSH-25 contacts whose link-up time was observed.
+    ///
+    /// Not part of the MSH-27 CSV; zero when the scenario has no hint plan.
+    pub link_hint_targets: usize,
+    /// Designated contacts linked within the plan's run-relative bound.
+    ///
+    /// Not part of the MSH-27 CSV; MSH-25's primary acceptance measure.
+    pub link_hint_links_within_bound: usize,
+    /// Mean run-relative milliseconds until a designated contact linked.
+    ///
+    /// Not part of the MSH-27 CSV; a link never seen contributes the bound.
+    pub link_hint_mean_link_ms: u64,
+    /// SetLinkHint outputs emitted in the scenario.
+    ///
+    /// Not part of the MSH-27 CSV; proves the advice path stayed bounded.
+    pub link_hint_sets: u64,
+    /// ClearLinkHint outputs emitted in the scenario.
+    ///
+    /// Not part of the MSH-27 CSV.
+    pub link_hint_clears: u64,
     /// Unique deliveries attributed to each submitting node index.
     ///
     /// Not part of the CSV report; MSH-10 uses it to check that a flood
@@ -623,6 +666,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             spray: false,
             receipts: false,
             route_hint: RouteHintMode::Off,
+            link_hints: None,
             suppression: SuppressionConfig::default(),
             presence: false,
             presence_config: PresenceConfig::default(),
@@ -648,6 +692,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             spray: false,
             receipts: false,
             route_hint: RouteHintMode::Off,
+            link_hints: None,
             suppression: SuppressionConfig::default(),
             presence: false,
             presence_config: PresenceConfig::default(),
@@ -673,6 +718,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             spray: false,
             receipts: false,
             route_hint: RouteHintMode::Off,
+            link_hints: None,
             suppression: SuppressionConfig::default(),
             presence: false,
             presence_config: PresenceConfig::default(),
@@ -696,6 +742,7 @@ pub fn baseline_scenarios() -> Vec<Scenario> {
             spray: false,
             receipts: false,
             route_hint: RouteHintMode::Off,
+            link_hints: None,
             suppression: SuppressionConfig::default(),
             presence: false,
             presence_config: PresenceConfig::default(),
@@ -734,6 +781,7 @@ pub fn flood_scenarios() -> Vec<Scenario> {
         spray: false,
         receipts: false,
         route_hint: RouteHintMode::Off,
+        link_hints: None,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -771,6 +819,7 @@ pub fn suppression_scenarios() -> Vec<Scenario> {
         spray: false,
         receipts: false,
         route_hint: RouteHintMode::Off,
+        link_hints: None,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -808,6 +857,7 @@ pub fn channel_scenarios() -> Vec<Scenario> {
         spray: false,
         receipts: false,
         route_hint: RouteHintMode::Off,
+        link_hints: None,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -839,6 +889,7 @@ pub fn spray_scenarios() -> Vec<Scenario> {
         spray: false,
         receipts: false,
         route_hint: RouteHintMode::Off,
+        link_hints: None,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -862,6 +913,7 @@ pub fn spray_scenarios() -> Vec<Scenario> {
         spray: false,
         receipts: false,
         route_hint: RouteHintMode::Off,
+        link_hints: None,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -937,6 +989,7 @@ pub fn observability_scenarios() -> Vec<ObservabilityScenario> {
             spray: true,
             receipts: false,
             route_hint: RouteHintMode::Off,
+            link_hints: None,
             suppression: SuppressionConfig::default(),
             presence: false,
             presence_config: PresenceConfig::default(),
@@ -976,6 +1029,7 @@ pub fn receipt_scenarios() -> Vec<Scenario> {
         spray: true,
         receipts: false,
         route_hint: RouteHintMode::Off,
+        link_hints: None,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -999,6 +1053,7 @@ pub fn receipt_scenarios() -> Vec<Scenario> {
         spray: true,
         receipts: false,
         route_hint: RouteHintMode::Off,
+        link_hints: None,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -1012,6 +1067,7 @@ pub fn receipt_scenarios() -> Vec<Scenario> {
             name: "receipt-enabled-line-20",
             receipts: true,
             route_hint: RouteHintMode::Off,
+            link_hints: None,
             ..line
         },
         scripted.clone(),
@@ -1019,6 +1075,7 @@ pub fn receipt_scenarios() -> Vec<Scenario> {
             name: "receipt-enabled-scripted-200",
             receipts: true,
             route_hint: RouteHintMode::Off,
+            link_hints: None,
             ..scripted
         },
     ]
@@ -1053,6 +1110,7 @@ pub fn presence_scenarios() -> Vec<Scenario> {
         spray: false,
         receipts: false,
         route_hint: RouteHintMode::Off,
+        link_hints: None,
         suppression: SuppressionConfig::default(),
         presence: true,
         presence_config: PresenceConfig {
@@ -1095,6 +1153,7 @@ pub fn telemetry_scenarios() -> Vec<Scenario> {
         spray: false,
         receipts: false,
         route_hint: RouteHintMode::Off,
+        link_hints: None,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -1125,6 +1184,7 @@ pub fn telemetry_scenarios() -> Vec<Scenario> {
         spray: false,
         receipts: false,
         route_hint: RouteHintMode::Off,
+        link_hints: None,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -1159,6 +1219,7 @@ pub fn directory_scenarios() -> Vec<Scenario> {
         spray: false,
         receipts: false,
         route_hint: RouteHintMode::Off,
+        link_hints: None,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -1202,6 +1263,7 @@ pub fn route_hint_scenarios() -> Vec<Scenario> {
         spray: true,
         receipts: false,
         route_hint: RouteHintMode::Off,
+        link_hints: None,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -1225,6 +1287,7 @@ pub fn route_hint_scenarios() -> Vec<Scenario> {
         spray: true,
         receipts: false,
         route_hint: RouteHintMode::Off,
+        link_hints: None,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -1237,25 +1300,109 @@ pub fn route_hint_scenarios() -> Vec<Scenario> {
         Scenario {
             name: "hint-additive-line-20",
             route_hint: RouteHintMode::AdditiveUnicast,
+            link_hints: None,
             ..line.clone()
         },
         Scenario {
             name: "hint-substitute-line-20",
             route_hint: RouteHintMode::SubstituteCopy,
+            link_hints: None,
             ..line
         },
         random.clone(),
         Scenario {
             name: "hint-additive-random-20",
             route_hint: RouteHintMode::AdditiveUnicast,
+            link_hints: None,
             ..random.clone()
         },
         Scenario {
             name: "hint-substitute-random-20",
             route_hint: RouteHintMode::SubstituteCopy,
+            link_hints: None,
             ..random
         },
     ]
+}
+
+/// MSH-25's paired hint-off / hint-on report.
+///
+/// Both rows use the same seed, scripted radio schedule, traffic and engine
+/// configuration; only the advisory link-hint plan changes. Node 0's
+/// recognised contacts (2, 3 and 4) enter radio range at run start. The
+/// harness supplies their tags as host facts in the hint-on row only, so the
+/// measured time-to-link is attributable to aoNetwork's real hint handling.
+/// The one-second bound is far below NET-16's four-second initiation delay
+/// for unhinted candidates.
+pub fn link_hint_scenarios() -> Vec<Scenario> {
+    // Four fixed seeds keep the claim statistical: the paired rows differ
+    // only in the hint plan, and the same traffic schedule runs for each seed.
+    const SEEDS: [u64; 4] = [1_297_303_701, 1_297_303_702, 1_297_303_703, 1_297_303_704];
+    const CONTACTS: &[usize] = &[2, 3, 4];
+    let contacts = vec![
+        Contact {
+            at_ms: 0,
+            a: 0,
+            b: 2,
+            up: true,
+        },
+        Contact {
+            at_ms: 0,
+            a: 0,
+            b: 3,
+            up: true,
+        },
+        Contact {
+            at_ms: 0,
+            a: 0,
+            b: 4,
+            up: true,
+        },
+    ];
+    const NAMES: [(&str, &str); 4] = [
+        ("linkhint-off-scripted-20-a", "linkhint-on-scripted-20-a"),
+        ("linkhint-off-scripted-20-b", "linkhint-on-scripted-20-b"),
+        ("linkhint-off-scripted-20-c", "linkhint-on-scripted-20-c"),
+        ("linkhint-off-scripted-20-d", "linkhint-on-scripted-20-d"),
+    ];
+    let mut scenarios = Vec::with_capacity(SEEDS.len() * 2);
+    for (seed, (off, on)) in SEEDS.into_iter().zip(NAMES) {
+        let base = Scenario {
+            name: off,
+            seed,
+            nodes: 20,
+            topology: Topology::Scripted(contacts.clone()),
+            mobility: Mobility::Scripted,
+            settle: Duration::from_secs(10),
+            run: Duration::from_secs(12),
+            messages: 16,
+            payload_len: 128,
+            traffic: Traffic::Balanced,
+            enforce_budgets: true,
+            enforce_suppression: true,
+            spray: false,
+            receipts: false,
+            route_hint: RouteHintMode::Off,
+            link_hints: None,
+            suppression: SuppressionConfig::default(),
+            presence: false,
+            presence_config: PresenceConfig::default(),
+            directory: None,
+            telemetry: TelemetryConfig::default(),
+            restart: None,
+        };
+        scenarios.push(base.clone());
+        scenarios.push(Scenario {
+            name: on,
+            link_hints: Some(LinkHintPlan {
+                owner: 0,
+                contacts: CONTACTS,
+                bound: Duration::from_secs(1),
+            }),
+            ..base
+        });
+    }
+    scenarios
 }
 
 /// MSH-29's paired restart case.
@@ -1281,6 +1428,7 @@ pub fn restart_scenarios() -> Vec<Scenario> {
         spray: true,
         receipts: true,
         route_hint: RouteHintMode::Off,
+        link_hints: None,
         suppression: SuppressionConfig::default(),
         presence: false,
         presence_config: PresenceConfig::default(),
@@ -1400,6 +1548,9 @@ pub struct Simulation {
     telemetry_seqs: Vec<TelemetrySeqs>,
     origin_index: BTreeMap<[u8; 16], usize>,
     links_after_settle: usize,
+    /// First run-relative millisecond at which each designated contact had
+    /// an up link at the plan's owner, keyed by the contact's radio key.
+    link_hint_link_ms: BTreeMap<PeerKey, u64>,
     receipts: u64,
     purges: u64,
     store_holders: BTreeMap<MessageId, BTreeSet<usize>>,
@@ -1676,6 +1827,7 @@ impl Simulation {
             telemetry_seqs: vec![BTreeMap::new(); n],
             origin_index,
             links_after_settle: 0,
+            link_hint_link_ms: BTreeMap::new(),
             receipts: 0,
             purges: 0,
             store_holders: BTreeMap::new(),
@@ -1714,8 +1866,77 @@ impl Simulation {
             injection: Injection::default(),
             injected_invalid: 0,
         };
+        sim.inject_link_hints();
         sim.apply_ranges();
         sim
+    }
+
+    /// Supplies the same host contact facts to the same owner in both paired
+    /// rows only when the plan is enabled. The assertion checks the real
+    /// aoNetwork API: advice must land in its hint table before any radio
+    /// event is pumped.
+    fn inject_link_hints(&mut self) {
+        let Some(plan) = self.scenario.link_hints else {
+            return;
+        };
+        assert!(plan.owner < self.nodes.len(), "hint plan owner must exist");
+        for &index in plan.contacts {
+            assert!(index < self.nodes.len(), "hint plan contact must exist");
+            let peer = self.nodes[index].adapter.network().transport().peer_key();
+            let node = self.identities[index].node_id();
+            let now = self.world.now();
+            let events = self.nodes[plan.owner]
+                .adapter
+                .handle(
+                    now,
+                    now.as_millis() as u64,
+                    MeshInput::ObserveLinkHint {
+                        observation: LinkHintObservation {
+                            peer,
+                            node,
+                            contact: true,
+                        },
+                    },
+                )
+                .expect("fixed host link fact is bounded");
+            assert!(
+                events.is_empty(),
+                "a host fact produces no host event: {events:?}"
+            );
+            assert_eq!(
+                self.nodes[plan.owner].adapter.network().link_hint(peer),
+                LinkHintPreference::Prefer,
+                "advice must reach aoNetwork's real hint table"
+            );
+        }
+    }
+
+    /// Records the first run-relative time a designated contact had a link
+    /// up at the plan's owner. Only the owner is sampled, so both paired rows
+    /// observe exactly the same radio events.
+    fn observe_link_hint_links(&mut self, node: usize, now_ms: u64) {
+        let Some(plan) = self.scenario.link_hints else {
+            return;
+        };
+        if node != plan.owner || !self.run_started {
+            return;
+        }
+        let elapsed = now_ms.saturating_sub(self.run_start_ms);
+        for &index in plan.contacts {
+            let peer = self.nodes[index].adapter.network().transport().peer_key();
+            if self.link_hint_link_ms.contains_key(&peer) {
+                continue;
+            }
+            let linked = self.nodes[node]
+                .adapter
+                .network()
+                .links()
+                .iter()
+                .any(|info| info.peer == peer);
+            if linked {
+                let _ = self.link_hint_link_ms.insert(peer, elapsed);
+            }
+        }
     }
 
     fn apply_ranges(&mut self) {
@@ -2086,6 +2307,7 @@ impl Simulation {
                         self.send_failures += 1;
                     }
                 }
+                self.observe_link_hint_links(i, now_ms);
             }
             if self.scenario.presence && !self.presence_converged && self.run_started {
                 let learned = self
@@ -2925,7 +3147,12 @@ impl Simulation {
         let mut penalised_neighbours = 0u64;
         let mut seen_records = 0u64;
         let mut suppression_pending = 0u64;
+        let mut link_hint_sets = 0u64;
+        let mut link_hint_clears = 0u64;
         for node in &self.nodes {
+            let (sets, clears) = node.adapter.engine().link_hints().counters();
+            link_hint_sets = link_hint_sets.saturating_add(sets);
+            link_hint_clears = link_hint_clears.saturating_add(clears);
             let snapshot = node.adapter.engine().observability_snapshot();
             duplicate_packets = duplicate_packets.saturating_add(snapshot.duplicate_packets);
             suppressed_relays = suppressed_relays.saturating_add(snapshot.suppressed_relays);
@@ -2943,6 +3170,32 @@ impl Simulation {
             suppression_pending =
                 suppression_pending.saturating_add(u64::from(snapshot.suppression_pending));
         }
+        let (link_hint_targets, link_hint_links_within_bound, link_hint_mean_link_ms) =
+            match self.scenario.link_hints {
+                Some(plan) => {
+                    let bound = plan.bound.as_millis() as u64;
+                    let mut total = 0u64;
+                    let mut within = 0usize;
+                    for &index in plan.contacts {
+                        let peer = self.nodes[index].adapter.network().transport().peer_key();
+                        let elapsed = self.link_hint_link_ms.get(&peer).copied().unwrap_or(bound);
+                        total = total.saturating_add(elapsed.min(bound));
+                        if self
+                            .link_hint_link_ms
+                            .get(&peer)
+                            .is_some_and(|linked| *linked <= bound)
+                        {
+                            within += 1;
+                        }
+                    }
+                    (
+                        plan.contacts.len(),
+                        within,
+                        total / plan.contacts.len().max(1) as u64,
+                    )
+                }
+                None => (0, 0, 0),
+            };
         Metrics {
             scenario: self.scenario.name,
             seed: self.scenario.seed,
@@ -2966,6 +3219,11 @@ impl Simulation {
             duplicate_ratio: self.duplicate_deliveries as f64 / self.delivered.max(1) as f64,
             peak_queued_bytes: self.peak_queued_bytes,
             links_after_settle: self.links_after_settle,
+            link_hint_targets,
+            link_hint_links_within_bound,
+            link_hint_mean_link_ms,
+            link_hint_sets,
+            link_hint_clears,
             delivered_by_origin: self.delivered_by_origin,
             purges: self.purges,
             delivery_receipts: self.receipts,
@@ -3533,6 +3791,11 @@ mod tests {
             duplicate_ratio: 0.0,
             peak_queued_bytes: 100,
             links_after_settle: 1,
+            link_hint_targets: 0,
+            link_hint_links_within_bound: 0,
+            link_hint_mean_link_ms: 0,
+            link_hint_sets: 0,
+            link_hint_clears: 0,
             delivered_by_origin: vec![1, 1],
             unique_receptions_by_node: vec![2, 2],
             unique_receptions: 4,

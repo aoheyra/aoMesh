@@ -575,6 +575,54 @@ budget gate are unchanged; no published MSH-27 threshold was lowered. The exact
 CSV row and command are in the README; `tests/sim_channels.rs` locks the row, so
 reachability or budget regressions fail as exact changes. The four published
 MSH-27 rows are unchanged.
+## MSH-25 implementation
+
+Link hints are advisory policy, not a fifth packet class or a radio command.
+Two designs were considered. Letting the host call aoNetwork directly is
+simpler but scatters contact, directory and penalty policy across applications
+and cannot be tested in the sans-IO engine. Keeping a bounded advisory table in
+aoMesh and passing typed `SetLinkHint` / `ClearLinkHint` outputs through the
+existing adapter costs one small `BTreeMap` and one output per change, but keeps
+one owner for the policy, keeps the engine deterministic and lets the simulator
+assert the real aoNetwork hint table. The second design was chosen; aoNetwork
+still owns link admission and the degree cap.
+
+A host fact names an opaque `PeerKey`, the associated opaque `NodeId` and a
+contact flag. `Prefer` comes from a recognised contact or from directory
+diversity: an unlinked identity that is `via` for `min_diverse_nodes` live
+entries whose destinations no linked neighbour reaches. `Deprioritize` comes
+from a time-decayed MSH-10 penalty at or above the threshold and overrides
+contact and diversity. Diversity uses at most two passes over the bounded
+directory; a fact with no advice consumes no slot. Eviction matches aoNetwork's
+lowest-preference then greatest-key rule, and emits a clear so the two tables
+cannot diverge. Every bound is in `LinkHintConfig`.
+
+| Setting | Default | Reason |
+|---|---|---|
+| Maximum tracked peers | 64 | Mirrors aoNetwork's default `max_peers` (NET-16) |
+| Penalty threshold | 3 | One invalid packet under MSH-10's default `penalty_invalid` |
+| Minimum diverse nodes | 2 | One announcement is noise, two is the smallest stable signal |
+
+The paired `link_hint_scenarios()` changes only the host hint plan. Four fixed
+seeds each script contacts 2, 3 and 4 into node 0's range at run start; the
+one-second bound is below NET-16's four-second unhinted initiation delay.
+
+| Scenario | Seed | Linked in bound | Mean link time (ms) | Delivered / submitted | Transmissions | Mean latency (ms) | Overhead |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `linkhint-off-scripted-20-a` | 1297303701 | 0 / 3 | 0 | 16 / 16 | 238 | 687 | 14.8750 |
+| `linkhint-on-scripted-20-a` | 1297303701 | 3 / 3 | 383 | 16 / 16 | 238 | 687 | 14.8750 |
+| `linkhint-off-scripted-20-b` | 1297303702 | 0 / 3 | 0 | 16 / 16 | 238 | 684 | 14.8750 |
+| `linkhint-on-scripted-20-b` | 1297303702 | 3 / 3 | 350 | 16 / 16 | 238 | 684 | 14.8750 |
+| `linkhint-off-scripted-20-c` | 1297303703 | 0 / 3 | 0 | 16 / 16 | 238 | 684 | 14.8750 |
+| `linkhint-on-scripted-20-c` | 1297303703 | 3 / 3 | 366 | 16 / 16 | 238 | 684 | 14.8750 |
+| `linkhint-off-scripted-20-d` | 1297303704 | 0 / 3 | 0 | 16 / 16 | 238 | 684 | 14.8750 |
+| `linkhint-on-scripted-20-d` | 1297303704 | 3 / 3 | 383 | 16 / 16 | 238 | 684 | 14.8750 |
+
+Hints link 12 of 12 contacts within the bound against 0 of 12 without hints.
+Delivery, latency, transmissions and overhead are identical in each pair, so
+the gain is time-to-link with no routing or airtime regression. No MSH-27
+threshold was changed.
+
 ## MSH-28 implementation
 
 This issue hardens byte and host-slice boundaries; it changes no routing rate,

@@ -488,6 +488,28 @@ leaves every forwarding decision unchanged. Config defaults are 1024 entries,
 300,000 ms lifetime, an eight-hop ceiling and `SubstituteCopy`; the measured
 rows and seeds are in the MSH-21 section of the README.
 
+## Advisory neighbour link hints (MSH-25)
+
+No packet, hello, sync or radio wire field changes. Link hints are host-to-engine
+facts and engine-to-host advice, never peer protocol bytes. The host sends
+`MeshInput::ObserveLinkHint` with an opaque aoNetwork `PeerKey`, the `NodeId` it
+associates with that peer, and a contact-book flag. The engine emits
+`MeshOutput::SetLinkHint` or `ClearLinkHint`; the adapter calls aoNetwork's
+`set_link_hint` / `clear_link_hint`. Hints affect candidate ordering and the
+initiation delay only. aoNetwork still decides whether to dial, admits the
+link and enforces the degree cap.
+
+A recognised contact is `Prefer`. An unlinked identity that is the `via`
+neighbour of at least `min_diverse_nodes` live directory entries whose
+destinations are not already reachable through linked neighbours is also
+`Prefer`; a verified link to that identity removes the diversity claim. A
+penalty at or above `penalty_threshold`, using the time-decayed value on a
+`Tick`, overrides both with `Deprioritize`. Revocation or loss of support emits
+`ClearLinkHint`. The table holds at most `max_peers` facts (64 by default) and
+evicts lowest preference then greatest `PeerKey`, matching aoNetwork's own
+table. Facts that yield no advice never take a slot. The paired report and
+seeds are in the MSH-25 section of the README.
+
 ## Signed delivery receipts (MSH-17)
 
 `MeshHello` adds `CAP_RECEIPT_V1` (`1 << 3`). The packet header, signature

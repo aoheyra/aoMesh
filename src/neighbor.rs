@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use crate::budget::BudgetConfig;
 use crate::channel::ChannelConfig;
 use crate::directory::DirectoryConfig;
+use crate::linkhint::LinkHintConfig;
 use crate::presence::PresenceConfig;
 use crate::receipt::ReceiptConfig;
 use crate::routehint::RouteHintConfig;
@@ -49,6 +50,8 @@ pub struct MeshConfig {
     pub directory: DirectoryConfig,
     /// Reverse-path hint table and Direct forwarding mode (MSH-21).
     pub route_hint: RouteHintConfig,
+    /// Advisory link-hint policy sent to aoNetwork (MSH-25).
+    pub link_hints: LinkHintConfig,
     /// Telemetry freshness, hop limit, coalescing and throttle (MSH-22).
     pub telemetry: TelemetryConfig,
     /// Bounds for local public-channel subscriptions (MSH-23).
@@ -85,6 +88,7 @@ impl Default for MeshConfig {
             presence: PresenceConfig::default(),
             directory: DirectoryConfig::default(),
             route_hint: RouteHintConfig::default(),
+            link_hints: LinkHintConfig::default(),
             telemetry: TelemetryConfig::default(),
             channels: ChannelConfig::default(),
         }
