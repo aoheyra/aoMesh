@@ -90,3 +90,44 @@ stays within 2.9 points of the no-flood control. The four refreshed MSH-27
 scenarios stayed inside their existing directional bounds. No rate default in
 the table changed; `max_origins_per_neighbor` was added as a bounded memory
 parameter, not a routing-rate change.
+
+## MSH-11 implementation
+
+Broadcast and Presence packets are held in a bounded pending table keyed by
+the content-bound `msg_id`. A node counts **distinct links** that carry the
+same id during a seeded assessment window; copies from one neighbour are one
+copy. Reaching the copy threshold cancels the relay and records the id in the
+seen-cache. Reaching the deadline first re-encodes one relay with the class
+TTL from the table above, decrements `ttl`, increments `hops`, and sends to
+every verified neighbour except those already counted. Direct and Telemetry
+keep their existing paths; no wire field changes.
+
+| Setting | Default | Reason |
+|---|---|---|
+| Pending entries | 1024 | Bounds memory while covering a contact's worth of distinct content |
+| Reference degree / copies | 4 / 3 | Calibrated by the 50-node sweep: 45.20% fewer transmissions, Direct ratio unchanged |
+| Copy bounds | 1 to 6 | Sparse graphs still forward; hostile or extreme degrees cannot mint unbounded work |
+| Base delay | 60-140 ms, seeded | Long enough for neighbour copies, short enough for a contact |
+| Final delay | 20-600 ms, shrinking with degree | Dense groups decide sooner without letting sparse groups relay blind |
+| Class TTLs | 8, 6, 3, 3 | Same table as above; submission and relay both clamp |
+
+Three threshold policies were considered. A fixed `k = 2` is simple but
+leaves most of the flood's redundancy in dense graphs. A fixed `k = 1`
+removes almost all transmissions but isolates nodes that only hear one copy.
+A degree-scaled `k` with fractional seeded rounding is the chosen option: it
+spends relays where neighbours are scarce and cancels them where the mesh
+already offered several chances. The delay shrinks with degree for the same
+reason. The reference degree is four, calibrated by the 50-node sweep; bounds
+keep `k` and the delay finite for hostile degree claims. State is bounded at
+1024 pending messages and evicted by earliest deadline.
+
+The simulator ablation sets `SuppressionConfig::enabled = false`, restoring
+immediate flooding without changing topology, identities or traffic. Suppression
+only observes packets that MSH-10 admitted, so a budget denial cannot start a
+timer or blame the neighbour that carried it. On the fixed 50-node mixed case
+(seed `1297304013`), transmissions fall from 5801 to 3316 (42.84%) and the
+Direct delivery ratio stays at 0.2000. Unique Broadcast receptions fall from
+2197 to 1456: cancelling relays is expected to reduce how far a flood travels,
+so that diagnostic is reported alongside the acceptance numbers rather than
+hidden. The four published MSH-27 baselines are unchanged because they carry no
+flooded classes.

@@ -38,8 +38,10 @@ registered in aoIdents ADR-0001. The policy: relays verify Broadcast and
 Presence always, Direct only while their CPU budget allows, and never
 Telemetry; the recipient always verifies a Direct packet addressed to it
 (`sign::verify_for_relay`, `sign::verify_origin`). MSH-04 ships the calls;
-MSH-09 runs the recipient's check for local delivery. Relay-side checks
-follow with the issues that build those paths (MSH-10, MSH-11).
+MSH-09 runs the recipient's check for local delivery, and MSH-11 checks the
+content id of every flooded packet before adding it to suppression state.
+The remaining relay-side verification paths belong to the class-specific
+issues (MSH-19, MSH-22, MSH-23).
 
 `msg_id` is a content address, in two domain-separated steps under
 `aoheyra/mesh/v1/msg-id`:
@@ -216,6 +218,33 @@ score decays by 1 per minute; at 12 the engine emits `MeshOutput::Release` with
 `DisconnectReason::AbuseDetected` once until `LinkDown`. aoNetwork owns any
 blacklist and reconnection decision. The simulator's `enforce` switch disables
 both buckets only for ablation runs; it is never a production tuning knob.
+
+## Broadcast suppression (MSH-11)
+
+No wire field changes: suppression is a local decision for `Broadcast` and
+`Presence`. A received copy must first re-derive its content id; a mismatch is
+rejected and charged to the sending link. A fresh id is held in a bounded
+pending table keyed by that id, with at most
+`SuppressionConfig::max_entries` entries (default 1024) evicted by earliest
+deadline. The node counts **distinct sending links**, so retransmissions from
+one neighbour are only one copy.
+
+A seeded assessment delay shrinks as the verified neighbour degree grows.
+Before the deadline the node sends nothing. If the seeded copy threshold is
+reached from different links, the pending entry is cancelled and the
+seen-cache records the id: the mesh has already given this node enough
+chances to hear the content, and this node adds no duplicate. If the timer
+wins, the node re-encodes the packet with `ttl` capped at the class value,
+decrements `ttl` once, increments `hops`, records the id and sends one copy
+to every verified neighbour except the links already counted. The configured
+threshold is fractional for most degrees; the seeded rounding draw keeps its
+expected value exact without making the engine non-deterministic.
+
+`Direct` keeps the MSH-08 path unchanged, `Telemetry` is dropped as before,
+and locally submitted packets are clamped to their ADR-0001 class TTL before
+signing. `SuppressionConfig::enabled` is a simulator ablation switch only.
+The pending table never holds payload bytes borrowed from a neighbour: the
+relay bytes are encoded once when the first copy arrives.
 
 ## Simulation evidence (MSH-27)
 

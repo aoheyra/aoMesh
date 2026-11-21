@@ -6,6 +6,7 @@ use ao_network::{Hello, LinkId};
 use std::collections::BTreeMap;
 
 use crate::budget::BudgetConfig;
+use crate::suppress::SuppressionConfig;
 
 /// Limits for engine-owned state. These do not enforce radio topology policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,6 +19,8 @@ pub struct MeshConfig {
     pub replay: ReplayConfig,
     /// Relay-budget rates, bounds and penalties (MSH-10).
     pub budgets: BudgetConfig,
+    /// Counter-based suppression, assessment timers and class TTLs (MSH-11).
+    pub suppression: SuppressionConfig,
 }
 
 impl Default for MeshConfig {
@@ -30,13 +33,15 @@ impl Default for MeshConfig {
     /// ids, is aoIdents' entry cap (about 1.5 MiB only if every slot
     /// holds one, which per-link rate limiting and the 24 h expiry
     /// keep far out of reach in normal use). The budget defaults are
-    /// ADR-0001's class rates (MSH-10).
+    /// ADR-0001's class rates (MSH-10) and suppression defaults are its
+    /// per-class TTLs plus the measured 50-node sweep (MSH-11).
     fn default() -> Self {
         Self {
             max_neighbors: 32,
             replay: ReplayConfig::new(1_024, 86_400_000, 64)
                 .expect("the documented defaults are within aoIdents' bounds"),
             budgets: BudgetConfig::default(),
+            suppression: SuppressionConfig::default(),
         }
     }
 }
