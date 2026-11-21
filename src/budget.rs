@@ -20,6 +20,7 @@ use ao_idents::NodeId;
 use ao_network::LinkId;
 use std::collections::BTreeMap;
 
+use crate::observability::Counter;
 use crate::packet::PacketClass;
 
 /// Fixed-point scale for token fractions. Telemetry's 32 KiB/hour is about
@@ -270,6 +271,9 @@ impl NeighborBudget {
 #[derive(Debug)]
 pub struct BudgetTracker {
     config: BudgetConfig,
+    /// Penalty applications (MSH-30). Decay can erase a score, so the
+    /// cumulative event count cannot be derived from current penalties.
+    penalty_events: Counter,
     origins: BTreeMap<NodeId, ClassBuckets>,
     neighbors: BTreeMap<LinkId, NeighborBudget>,
 }
@@ -278,6 +282,7 @@ impl BudgetTracker {
     pub(crate) fn new(config: BudgetConfig) -> Self {
         Self {
             config,
+            penalty_events: Counter::new(),
             origins: BTreeMap::new(),
             neighbors: BTreeMap::new(),
         }
@@ -502,6 +507,9 @@ impl BudgetTracker {
                 .saturating_add(steps.saturating_mul(self.config.penalty_decay_ms));
         }
         neighbor.penalty = neighbor.penalty.saturating_add(amount);
+        if amount > 0 {
+            self.penalty_events.add(1);
+        }
         if neighbor.penalty >= self.config.penalty_release_at && !neighbor.released {
             neighbor.released = true;
             return true;
@@ -524,6 +532,12 @@ impl BudgetTracker {
         self.neighbors
             .get(&link)
             .map_or(0, |neighbor| neighbor.penalty)
+    }
+
+    /// Saturating number of penalty applications (MSH-30). Zero-amount calls
+    /// are decay probes, not penalty events, and are not counted.
+    pub(crate) fn penalty_events(&self) -> u64 {
+        self.penalty_events.get()
     }
 
     /// Number of claimed origins with live bucket state.
@@ -804,5 +818,29 @@ mod tests {
         assert!(tracker.penalize(0, LINK_A, 3));
         tracker.link_down(LINK_A);
         assert_eq!(tracker.penalty(LINK_A), 0);
+    }
+
+    #[test]
+    fn penalty_events_count_only_positive_applications() {
+        let mut tracker = BudgetTracker::new(small());
+        assert_eq!(tracker.penalty_events(), 0);
+        assert!(!tracker.penalize(0, LINK_A, 0));
+        assert_eq!(tracker.penalty_events(), 0, "a decay probe is not an event");
+        assert!(!tracker.penalize(1, LINK_A, 2));
+        assert!(tracker.penalize(2, LINK_A, 1));
+        assert_eq!(tracker.penalty_events(), 2);
+        // Decay removes the score but never the cumulative count.
+        assert!(!tracker.penalize(4_000, LINK_A, 0));
+        assert_eq!(tracker.penalty(LINK_A), 0);
+        assert_eq!(tracker.penalty_events(), 2);
+    }
+
+    #[test]
+    fn penalty_event_counter_saturates() {
+        let mut tracker = BudgetTracker::new(small());
+        tracker.penalty_events.set(u64::MAX - 1);
+        let _ = tracker.penalize(0, LINK_A, 1);
+        let _ = tracker.penalize(1, LINK_A, 1);
+        assert_eq!(tracker.penalty_events(), u64::MAX);
     }
 }

@@ -35,6 +35,9 @@
 //! and the `fuzz/` targets check those limits without changing the sans-IO
 //! core. MSH-29 snapshots the bounded seen-cache, immunity list and spray
 //! tickets so a restart cannot re-relay traffic the node already handled.
+//! MSH-30 adds saturating counters and a versioned, content-free
+//! [`MeshSnapshot`] that the host can map into its diagnostics bundle without
+//! any extra I/O.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -50,6 +53,7 @@ pub mod expiry;
 mod forward;
 pub mod hello;
 pub mod neighbor;
+pub mod observability;
 pub mod packet;
 pub mod presence;
 pub mod receipt;
@@ -83,6 +87,7 @@ pub use hello::{
     MeshHello,
 };
 pub use neighbor::{MeshConfig, Neighbor, NeighborTable};
+pub use observability::{MESH_SNAPSHOT_VERSION, MeshSnapshot};
 pub use packet::{Header, MessageId, Packet, PacketClass, PacketError, SIGNATURE_LEN};
 pub use presence::{
     ANNOUNCE_LEN, ANNOUNCE_MAGIC, ANNOUNCE_VERSION, Announcement, PresenceConfig, PresenceError,

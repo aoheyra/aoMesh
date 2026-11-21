@@ -81,6 +81,9 @@ pub(crate) fn on_data(
         // pipeline accepts, so a failed forgery leaves the key free
         // for the honest copy of the same content.
         if seen.is_duplicate(now, &packet.header.msg_id) {
+            // The peek itself changes no dedupe state, but the repeat is a
+            // forwarding duplicate and belongs in the MSH-30 snapshot.
+            seen.note_duplicate();
             return Action::Drop;
         }
         return Action::Deliver {

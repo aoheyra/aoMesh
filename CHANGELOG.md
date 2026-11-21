@@ -113,6 +113,20 @@ link capabilities stay host-owned. The format is bounded at 4 MiB, typed errors
 reject malformed or version-mismatched bytes atomically, and the fixed-seed
 line-20 report shows 14 post-restart re-relays without restore against zero with
 restore, with delivery unchanged at 20/20.
+MSH-30 adds bounded observability. `MeshSnapshot` exposes saturating counters
+for duplicate packets, suppressed relays, encoded sync bytes and neighbour
+penalty events, plus gauges derived from existing bounded state for store ids,
+current penalties, seen records and pending suppression windows. The snapshot
+is versioned plain integer data with no packet content, ids, keys or personal
+data, and `MeshEngine::observability_snapshot` / `NetworkAdapter::snapshot` read it without
+allocation, I/O or a second source of truth. `MeshConfig` gains a `seen` field
+so the seen-record gauge has the same documented 4096-entry bound as the cache.
+The fixed mixed 20-node scenario with seed `1297304021` reports 323 duplicates,
+120 suppressed relays, 88 store ids, 820 sync bytes in each direction and four
+penalty events from injected malformed frames. These values were remeasured on
+the accumulated MSH-19 stack after the two-distinct-link suppression floor
+changed which relays cancel a flood; no wire format or MSH-27 threshold
+changed. The host maps this snapshot into aoheyra's APP-15 bundle.
 
 MSH-17 adds signed delivery receipts and bounded store immunity. An
 authenticated delivery emits a cap-gated receipt envelope carrying a signed

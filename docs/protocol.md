@@ -683,3 +683,24 @@ Data streams and store quotas. The `fuzz/` crate adds `libFuzzer` targets for
 packet decoding, engine input streams and sync frames; nightly CI runs each for
 one hour with a 16 KiB maximum input, a 2048 MiB RSS limit and a 10-second
 per-input timeout. No one-hour campaign is part of local verification.
+## Diagnostics snapshot (MSH-30)
+
+`MeshSnapshot` is host-local plain data, not a wire message. Its `version`
+field selects the field layout; version 1 carries saturating `u64` counters for
+duplicate forwarding verdicts, cancelled flood relays, encoded sync bytes sent
+and received, and positive neighbour penalty applications. It also carries
+`u32` gauges for live store ids, current penalty totals/maxima and counts,
+seen-cache records and pending suppression windows. Store occupancy is the
+count from the latest `MeshInput::StoreSummary`: the engine owns no store and
+never invents a byte count.
+
+The counters live in the module that makes the decision, so a snapshot cannot
+disagree with routing state. Malformed or unverified frames are penalties, not
+sync bytes; zero-amount decay probes are not penalty events. All values are
+deterministic for a fixed input stream and hostile traffic can only saturate a
+counter, never grow a map. No field contains packet content, message ids, keys,
+identities or personal data. `MeshEngine::observability_snapshot` and
+`NetworkAdapter::snapshot` expose the same value without I/O or allocation, so
+aoheyra can map it directly into its APP-15 diagnostics bundle. Adding or
+changing a field is a snapshot schema change and bumps `MESH_SNAPSHOT_VERSION`;
+it does not change packet, sync or beacon bytes.
