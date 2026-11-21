@@ -46,12 +46,15 @@ pub const MIN_PROTO: u8 = 1;
 
 /// Feature bits this build sets.
 ///
-/// Bit 0 advertises MSH-14's anti-entropy sync frames. A peer without it
-/// never receives a sync frame, which is the v1 fallback: ordinary packet
-/// forwarding still works. Every bit needs an ADR entry.
+/// Bit 0 advertises MSH-14's anti-entropy sync frames. Bit 1 advertises
+/// MSH-15's range reconciliation. A peer that lacks both keeps the plain
+/// forwarding path; a peer with only bit 0 gets the MSH-14 summary exchange.
+/// Every bit needs an ADR entry.
 pub const CAP_SYNC_V1: u32 = 1 << 0;
+/// Capability bit for MSH-15 range-based set reconciliation.
+pub const CAP_SYNC_V2: u32 = 1 << 1;
 /// Feature bits this build sets (ADR-0001).
-pub const CAPS: u32 = CAP_SYNC_V1;
+pub const CAPS: u32 = CAP_SYNC_V1 | CAP_SYNC_V2;
 
 /// Encoded length of a v1 hello: fixed, so a wrong length is rejected
 /// before anything is read (ADR-0004).
@@ -157,6 +160,33 @@ impl MeshHello {
             card_hash,
             proto: PROTO,
             caps: CAPS,
+            store_digest,
+            signing_pk: *public.signing_pk(),
+            agreement_pk: *public.agreement_pk(),
+            signature: [0; 64],
+        };
+        let body = hello.body();
+        hello.signature = *identity.sign(HELLO_DOMAIN, &body)?.as_bytes();
+        Ok(hello)
+    }
+
+    /// Builds and signs a hello with an explicit capability set.
+    ///
+    /// Hosts normally use [`Self::sign`]. This seam lets simulators and
+    /// compatibility tests advertise a subset of this build's capabilities
+    /// to exercise fallback without changing the signed layout.
+    pub fn sign_with_caps(
+        identity: &Identity,
+        card_hash: [u8; 8],
+        store_digest: [u8; 4],
+        caps: u32,
+    ) -> Result<Self, IdentError> {
+        let public = identity.public();
+        let mut hello = Self {
+            node_id: identity.node_id(),
+            card_hash,
+            proto: PROTO,
+            caps: caps & CAPS,
             store_digest,
             signing_pk: *public.signing_pk(),
             agreement_pk: *public.agreement_pk(),
@@ -444,6 +474,20 @@ mod tests {
         assert_ne!(hello.caps & CAP_SYNC_V1, 0);
         assert_ne!(hello.negotiate(PROTO, CAPS).unwrap().1 & CAP_SYNC_V1, 0);
         assert_eq!(hello.negotiate(PROTO, 0).unwrap().1 & CAP_SYNC_V1, 0);
+    }
+
+    /// MSH-15: an honest hello also advertises sync v2. A v1-only peer
+    /// negotiates it away and keeps the MSH-14 summary exchange.
+    #[test]
+    fn sync_v2_cap_is_advertised_and_negotiates_down_to_v1() {
+        let identity = Identity::from_seed([12; 32]);
+        let hello = MeshHello::sign(&identity, [0; 8], [0; 4]).unwrap();
+        assert_ne!(hello.caps & CAP_SYNC_V2, 0);
+        assert_ne!(hello.negotiate(PROTO, CAPS).unwrap().1 & CAP_SYNC_V2, 0);
+        let v1_only = MeshHello::sign_with_caps(&identity, [0; 8], [0; 4], CAP_SYNC_V1).unwrap();
+        let caps = v1_only.negotiate(PROTO, CAPS).unwrap().1;
+        assert_ne!(caps & CAP_SYNC_V1, 0);
+        assert_eq!(caps & CAP_SYNC_V2, 0);
     }
 
     /// Done when: the encoded hello carries exactly the v1 layout. The

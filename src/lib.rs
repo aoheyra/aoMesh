@@ -47,7 +47,7 @@ pub mod sync;
 pub use adapter::{AdapterEvent, NetworkAdapter};
 pub use budget::{BudgetConfig, BudgetOutcome, BudgetTracker, ClassRate};
 pub use engine::{MeshEngine, MeshError, MeshInput, MeshOutput};
-pub use hello::{HelloError, MeshHello};
+pub use hello::{CAP_SYNC_V1, CAP_SYNC_V2, CAPS, HelloError, MeshHello};
 pub use neighbor::{MeshConfig, Neighbor, NeighborTable};
 pub use packet::{Header, MessageId, Packet, PacketClass, PacketError, SIGNATURE_LEN};
 pub use seen::{Offer, SeenCache, SeenConfig};
@@ -55,8 +55,10 @@ pub use sign::{
     RelayOutcome, VerifyError, derive_msg_id, sign_packet, verify_for_relay, verify_origin,
 };
 pub use suppress::SuppressionConfig;
-pub use sync::{BeaconTracker, SHORT_ID_BYTES, StoreSummary, SummaryConfig};
-pub use sync::{SyncConfig, SyncFrame, SyncOffer};
+pub use sync::{
+    BeaconTracker, RangeKey, RangeSummary, SHORT_ID_BYTES, SYNC_MAGIC, SYNC_V2_VERSION,
+    SYNC_VERSION, StoreSummary, SummaryConfig, SyncConfig, SyncFrame, SyncFrameV2, SyncOffer,
+};
 
 // A signed hello must fit the opaque blob aoNetwork allows (NET-04's
 // MAX_APP_HELLO); this fails at compile time if the layout ever grows.

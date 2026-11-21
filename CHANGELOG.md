@@ -7,6 +7,17 @@ change without notice until v0.1.0, and consumers pin by git tag
 
 ## Unreleased
 
+MSH-15 adds range-based reconciliation for links that advertise both sync
+capability bits. Each side hashes binary ranges of the canonical id space,
+splits only differing ranges and exchanges full ids in small leaves. The
+existing `SyncNeed` / `SyncItems` transfer then moves the actual packets, so
+the host still owns the store and peers with only `CAP_SYNC_V1` keep the
+MSH-14 summary path. Version-2 sync frames use the same magic and five-byte
+header with tags for Root, Ranges, Request, Ids and Ready; after both sides
+send Ready the contact uses the existing `Item` and `Done` frames. The
+`sync_v2_report` example measures 2,018 bytes for v2 against 16,188 bytes for
+v1 on stores of 1000 and 1001 messages with seed `0x515f_2026`.
+
 MSH-14 adds bounded anti-entropy sync for links that advertise `CAP_SYNC_V1`.
 The engine compares store digests, exchanges eight-byte id prefixes and asks
 the host for the encoded packets it owes through `SyncNeed`/`SyncItems`.
