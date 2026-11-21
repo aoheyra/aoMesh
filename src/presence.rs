@@ -640,6 +640,29 @@ mod tests {
         }
     }
 
+    fn local_ann(seq: u64, card: u8, caps: u32) -> Announcement {
+        Announcement {
+            card_hash: [card; 8],
+            caps,
+            seq,
+            signing_pk: [0; 32],
+            agreement_pk: [0; 32],
+            binding: [0; 64],
+        }
+    }
+
+    fn signed_ann(identity: &Identity, seq: u64, card: u8, caps: u32) -> Announcement {
+        let public = identity.public();
+        Announcement {
+            card_hash: [card; 8],
+            caps,
+            seq,
+            signing_pk: *public.signing_pk(),
+            agreement_pk: *public.agreement_pk(),
+            binding: *public.agreement_binding().as_bytes(),
+        }
+    }
+
     #[test]
     fn body_round_trips_every_field() {
         let a = Announcement {
@@ -688,14 +711,7 @@ mod tests {
     #[test]
     fn a_signed_announcement_verifies_at_every_hop_including_after_relay() {
         let origin = Identity::from_seed([31; 32]);
-        let facts = Announcement {
-            card_hash: [0xA5; 8],
-            caps: CAPS,
-            seq: 7,
-            signing_pk: [0; 32],
-            agreement_pk: [0; 32],
-            binding: [0; 64],
-        };
+        let facts = signed_ann(&origin, 7, 0xA5, CAPS);
         let (id, wire) =
             encode_announcement(1_000, &origin, facts, 3, 1_800).expect("identity signs");
         let mut packet = Packet::decode(&wire).expect("announcement decodes");
@@ -759,6 +775,7 @@ mod tests {
         let origin = [9; 16];
         let _ = t.observe(10_000, origin, ann(1, 1));
         let _ = t.observe(10_000 + 1_800_000, origin, ann(2, 2));
+        t.expire(10_000 + 3_600_000);
         assert!(t.is_empty());
     }
 
@@ -809,18 +826,36 @@ mod tests {
         t.set_caps(LinkId::new(1), CAP_PRESENCE_V1);
         // A new identity waits only the quick delay, then backs off.
         assert_eq!(t.on_tick(0, [1; 8], CAPS), None);
-        assert_eq!(t.on_tick(10, [1; 8], CAPS), Some(ann(1, 1)));
+        assert_eq!(
+            t.on_tick(10, [1; 8], CAPS),
+            Some(local_ann(1, 1, CAPS))
+        );
         assert_eq!(t.on_tick(50, [1; 8], CAPS), None);
-        assert_eq!(t.on_tick(110, [1; 8], CAPS), Some(ann(2, 1)));
+        assert_eq!(
+            t.on_tick(110, [1; 8], CAPS),
+            Some(local_ann(2, 1, CAPS))
+        );
         assert_eq!(t.on_tick(200, [1; 8], CAPS), None);
-        assert_eq!(t.on_tick(310, [1; 8], CAPS), Some(ann(3, 1)));
+        assert_eq!(
+            t.on_tick(310, [1; 8], CAPS),
+            Some(local_ann(3, 1, CAPS))
+        );
         assert_eq!(t.on_tick(500, [1; 8], CAPS), None);
-        assert_eq!(t.on_tick(710, [1; 8], CAPS), Some(ann(4, 1)));
-        assert_eq!(t.on_tick(1_110, [1; 8], CAPS), Some(ann(5, 1)));
+        assert_eq!(
+            t.on_tick(710, [1; 8], CAPS),
+            Some(local_ann(4, 1, CAPS))
+        );
+        assert_eq!(
+            t.on_tick(1_110, [1; 8], CAPS),
+            Some(local_ann(5, 1, CAPS))
+        );
         // A card change is quick too and resets the interval.
         assert_eq!(t.on_tick(1_111, [2; 8], CAPS), None);
         // The sequence keeps increasing so the changed card wins latest-wins.
-        assert_eq!(t.on_tick(1_121, [2; 8], CAPS), Some(ann(6, 2)));
+        assert_eq!(
+            t.on_tick(1_121, [2; 8], CAPS),
+            Some(local_ann(6, 2, CAPS))
+        );
         assert_eq!(t.on_tick(1_150, [2; 8], CAPS), None);
     }
 
@@ -832,7 +867,10 @@ mod tests {
         assert_eq!(t.on_tick(0, [1; 8], CAPS), None);
         t.set_caps(LinkId::new(2), CAP_PRESENCE_V1);
         assert_eq!(t.on_tick(0, [1; 8], CAPS), None);
-        assert_eq!(t.on_tick(1_000, [1; 8], CAPS), Some(ann(1, 1)));
+        assert_eq!(
+            t.on_tick(1_000, [1; 8], CAPS),
+            Some(local_ann(1, 1, CAPS))
+        );
         t.link_down(LinkId::new(2));
         assert!(!t.has_capable_links());
     }

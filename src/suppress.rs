@@ -41,9 +41,9 @@ pub struct SuppressionConfig {
     pub k_at_degree_ref: usize,
     /// Configured lower bound for the degree-scaled copy threshold.
     ///
-    /// [`SuppressionTable::observe`] always requires at least two distinct
-    /// sending links, because one copy cannot prove the flood reached this
-    /// node's neighbours.
+    /// The suppression table always requires at least two distinct sending
+    /// links, because one copy cannot prove the flood reached this node's
+    /// neighbours.
     pub min_k: usize,
     /// Upper bound for the degree-scaled copy threshold.
     pub max_k: usize,
