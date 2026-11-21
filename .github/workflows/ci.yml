@@ -11,6 +11,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: aoheyra/aoMesh-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   style:
     name: Style
@@ -93,6 +97,7 @@ jobs:
           command: check
 
   miri:
+    if: github.repository == 'aoheyra/aoMesh' || github.event_name == 'pull_request'
     name: Miri
     runs-on: ubuntu-latest
     steps:
