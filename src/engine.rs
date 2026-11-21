@@ -1520,7 +1520,7 @@ impl<R: RngCore> MeshEngine<R> {
             Err(_) => return Vec::new(),
         };
         let mut outputs = Vec::new();
-        if fresh && self.channels.subscribed(frame.channel) {
+        if fresh && !self.seen.is_duplicate(now, &id) && self.channels.subscribed(frame.channel) {
             outputs.push(MeshOutput::ChannelMessage {
                 header: packet.header,
                 channel: frame.channel,

@@ -295,3 +295,30 @@ fn generic_submit_cannot_bypass_channel_admission_and_unknown_version_is_rejecte
         1
     );
 }
+
+#[test]
+fn resetting_channel_policy_never_bypasses_global_seen_delivery_guard() {
+    let sender = Identity::from_seed([24; 32]);
+    let receiver = Identity::from_seed([25; 32]);
+    let target = ChannelId::from_name("campus");
+    let mut config = MeshConfig::default();
+    config.suppression.enabled = false;
+    let mut e = MeshEngine::with_config(StdRng::seed_from_u64(23), config);
+    link(&mut e, 1, &sender, ao_mesh::hello::CAPS);
+    e.channels_mut().subscribe(target).unwrap();
+    let wire = channel::encode(&sender, 0, target, b"once", 6).unwrap();
+    assert_eq!(
+        data(&mut e, &receiver, &wire, 1)
+            .iter()
+            .filter(|o| matches!(o, MeshOutput::ChannelMessage { .. }))
+            .count(),
+        1
+    );
+    *e.channels_mut() = ChannelTracker::new(ChannelConfig::default());
+    e.channels_mut().subscribe(target).unwrap();
+    assert!(
+        data(&mut e, &receiver, &wire, 2)
+            .iter()
+            .all(|o| !matches!(o, MeshOutput::ChannelMessage { .. }))
+    );
+}
