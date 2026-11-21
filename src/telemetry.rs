@@ -548,11 +548,21 @@ mod tests {
             })
         );
         assert_eq!(t.origin_count(), 1);
+        // The stale copies neither replaced seq 4 nor restarted the rate
+        // window: the cap still ends 10 s after the first admitted update.
         assert_eq!(
-            admit(&mut t, 11_000, &ORIGIN, 7, 5),
+            admit(&mut t, 10_000, &ORIGIN, 7, 4),
+            Err(TelemetryError::Stale {
+                last_seq: 4,
+                seen: 4
+            })
+        );
+        assert_eq!(
+            admit(&mut t, 10_000, &ORIGIN, 7, 5),
             Err(TelemetryError::RateLimited { retry_ms: 1_000 })
         );
-        assert_eq!(admit(&mut t, 12_000, &ORIGIN, 7, 5).unwrap().seq, 5);
+        // At the boundary the window has elapsed, so a newer sequence passes.
+        assert_eq!(admit(&mut t, 11_000, &ORIGIN, 7, 5).unwrap().seq, 5);
     }
 
     #[test]
