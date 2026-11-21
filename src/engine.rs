@@ -110,7 +110,19 @@ pub enum MeshInput<'a> {
         /// A selected neighbour, or all current neighbours.
         via: Option<LinkId>,
     },
-    /// Originate one latest-wins Telemetry update (MSH-22).
+    /// Originate a signed plaintext public-channel message (MSH-23).
+    ///
+    /// Applies channel and origin limits before sending only to capable peers.
+    /// Publication neither subscribes this node nor emits a local echo.
+    SubmitChannel {
+        /// Borrowed signing identity.
+        identity: &'a Identity,
+        /// Exact hashed channel name.
+        channel: crate::ChannelId,
+        /// Signed plaintext application bytes.
+        payload: &'a [u8],
+    },
+    /// Originate a latest-wins Telemetry update.
     ///
     /// The engine frames the opaque payload with `kind` and a monotonic
     /// `seq`, signs it with the existing Telemetry class and returns an
@@ -151,7 +163,18 @@ pub enum MeshOutput {
         /// Complete encoded packet.
         payload: Vec<u8>,
     },
-    /// Queue one Telemetry update on one link under a NET-21 coalesce key.
+    /// Deliver authenticated plaintext for a local public-channel subscription.
+    ///
+    /// Payload is public plaintext, distinct from sealed Direct delivery.
+    ChannelMessage {
+        /// Authenticated packet header.
+        header: Header,
+        /// Local subscribed channel.
+        channel: crate::ChannelId,
+        /// Signed plaintext application bytes.
+        payload: Vec<u8>,
+    },
+    /// Queue a telemetry update.
     ///
     /// The advisory is a bounded policy statement, not a radio command: the
     /// adapter hands it to aoNetwork's real send-queue options.
@@ -290,6 +313,8 @@ pub enum MeshError {
     Directory(DirectoryError),
     /// A Telemetry policy or framing failure; no packet is emitted.
     Telemetry(crate::telemetry::TelemetryError),
+    /// Public channel rejection.
+    Channel(crate::ChannelError),
 }
 impl core::fmt::Display for MeshError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -300,6 +325,7 @@ impl core::fmt::Display for MeshError {
             Self::Receipt(error) => write!(f, "receipt failed: {error}"),
             Self::Presence(error) => write!(f, "presence failed: {error}"),
             Self::Directory(error) => write!(f, "directory observation failed: {error}"),
+            Self::Channel(error) => write!(f, "{error}"),
             Self::Telemetry(error) => write!(f, "telemetry rejected: {error}"),
         }
     }
@@ -332,6 +358,7 @@ pub struct MeshEngine<R: RngCore> {
     directory: NodeDirectory,
     hints: RouteHintTable,
     telemetry: TelemetryTracker,
+    channels: crate::ChannelTracker,
 }
 impl<R: RngCore> MeshEngine<R> {
     /// Creates an engine with the default limits (`MeshConfig::default`).
@@ -366,6 +393,7 @@ impl<R: RngCore> MeshEngine<R> {
             directory: NodeDirectory::new(config.directory),
             hints: RouteHintTable::new(config.route_hint),
             telemetry: TelemetryTracker::new(config.telemetry),
+            channels: crate::ChannelTracker::new(config.channels),
         }
     }
     /// Read-only bookkeeping, not a list of authenticated identities.
@@ -423,6 +451,14 @@ impl<R: RngCore> MeshEngine<R> {
     #[cfg(feature = "sim")]
     pub(crate) fn is_immune(&self, id: MessageId) -> bool {
         self.receipt.is_immune(id)
+    }
+    /// Configure local channel subscriptions. No membership goes on the wire.
+    pub fn channels_mut(&mut self) -> &mut crate::ChannelTracker {
+        &mut self.channels
+    }
+    /// Read bounded public-channel policy state.
+    pub fn channels(&self) -> &crate::ChannelTracker {
+        &self.channels
     }
     /// Processes one input at caller-supplied milliseconds.
     ///
@@ -965,6 +1001,9 @@ impl<R: RngCore> MeshEngine<R> {
                     {
                         outputs.extend(self.on_presence_data(now, link, packet, outcome)?);
                     }
+                    crate::PacketClass::Broadcast if crate::channel::is_channel(packet.payload) => {
+                        outputs.extend(self.on_channel_data(now, link, packet, outcome));
+                    }
                     crate::PacketClass::Broadcast | crate::PacketClass::Presence => {
                         if !suppress::content_valid(&packet) {
                             self.neighbors.reject(link);
@@ -1034,6 +1073,34 @@ impl<R: RngCore> MeshEngine<R> {
                 }
                 Ok(outputs)
             }
+            MeshInput::SubmitChannel {
+                identity,
+                channel,
+                payload,
+            } => {
+                let bytes = crate::channel::encode(
+                    identity,
+                    now,
+                    channel,
+                    payload,
+                    self.config.suppression.broadcast_ttl,
+                )
+                .map_err(MeshError::Channel)?;
+                let packet = Packet::decode(&bytes).map_err(MeshError::Packet)?;
+                self.channels
+                    .admit(
+                        now,
+                        channel,
+                        packet.header.origin,
+                        packet.header.msg_id,
+                        packet.header.lifetime_s,
+                    )
+                    .map_err(MeshError::Channel)?;
+                let _ = self
+                    .seen
+                    .check_and_insert(now, packet.header.class, packet.header.msg_id);
+                Ok(self.send_to_channel_links(bytes, &BTreeSet::new()))
+            }
             MeshInput::SubmitTelemetry {
                 identity,
                 kind,
@@ -1100,6 +1167,13 @@ impl<R: RngCore> MeshEngine<R> {
                     if self.neighbors.get(link).is_none() {
                         return Err(MeshError::UnknownLink(link));
                     }
+                }
+                // Channel framing has a single admission path; generic Submit
+                // cannot bypass its origin/channel limits or capability gate.
+                if header.class == crate::PacketClass::Broadcast
+                    && crate::channel::is_channel(payload)
+                {
+                    return Err(MeshError::Channel(crate::ChannelError::Malformed));
                 }
                 // ADR-0001's per-class hop limit applies to locally
                 // submitted packets as well as relays. Clamp before
@@ -1381,6 +1455,134 @@ impl<R: RngCore> MeshEngine<R> {
         outputs
     }
 
+    fn channel_peer(&self, link: LinkId) -> bool {
+        self.neighbors.get(link).is_some_and(|n| {
+            n.node_id.is_some()
+                && crate::MeshHello::decode(n.remote_hello.app_hello.as_bytes())
+                    .is_ok_and(|h| h.caps & crate::hello::CAP_CHANNEL_V1 != 0)
+        })
+    }
+    fn send_to_channel_links(
+        &self,
+        bytes: Vec<u8>,
+        excluded: &BTreeSet<LinkId>,
+    ) -> Vec<MeshOutput> {
+        self.neighbors
+            .iter()
+            .filter(|n| {
+                n.node_id.is_some() && !excluded.contains(&n.link) && self.channel_peer(n.link)
+            })
+            .map(|n| MeshOutput::Send {
+                link: n.link,
+                channel: Channel::Message,
+                payload: bytes.clone(),
+            })
+            .collect()
+    }
+    fn on_channel_data(
+        &mut self,
+        now: u64,
+        link: LinkId,
+        packet: Packet<'_>,
+        outcome: BudgetOutcome,
+    ) -> Vec<MeshOutput> {
+        if !self
+            .neighbors
+            .get(link)
+            .is_some_and(|n| self.channel_peer(n.link))
+        {
+            return Vec::new();
+        }
+        let frame = match crate::ChannelFrame::verify(&packet) {
+            Ok(frame) => frame,
+            Err(_) => {
+                self.neighbors.reject(link);
+                let release = self
+                    .budgets
+                    .penalize(now, link, self.config.budgets.penalty_invalid);
+                return Self::release_if_penalised(link, release);
+            }
+        };
+        if outcome != BudgetOutcome::Admitted {
+            return Vec::new();
+        }
+        let id = packet.header.msg_id;
+        // Pending duplicate copies must still reach suppression's distinct-link counter.
+        let fresh = match self.channels.admit(
+            now,
+            frame.channel,
+            packet.header.origin,
+            id,
+            packet.header.lifetime_s,
+        ) {
+            Ok(()) => true,
+            Err(crate::ChannelError::Duplicate) => false,
+            Err(_) => return Vec::new(),
+        };
+        let mut outputs = Vec::new();
+        if fresh && self.channels.subscribed(frame.channel) {
+            outputs.push(MeshOutput::ChannelMessage {
+                header: packet.header,
+                channel: frame.channel,
+                payload: frame.payload.to_vec(),
+            });
+        }
+        if self.seen.is_duplicate(now, &id) {
+            return outputs;
+        }
+        let Some(relay) = suppress::relay_bytes(packet, self.config.suppression.broadcast_ttl)
+        else {
+            let _ = self
+                .seen
+                .check_and_insert(now, crate::PacketClass::Broadcast, id);
+            return outputs;
+        };
+        if !self.config.suppression.enabled {
+            let _ = self
+                .seen
+                .check_and_insert(now, crate::PacketClass::Broadcast, id);
+            outputs.extend(self.send_to_channel_links(relay, &BTreeSet::from([link])));
+            return outputs;
+        }
+        let degree = self
+            .neighbors
+            .iter()
+            .filter(|n| n.node_id.is_some() && n.link != link && self.channel_peer(n.link))
+            .count();
+        let threshold = self
+            .config
+            .suppression
+            .copy_threshold(degree, &mut self.rng)
+            .max(2);
+        let deadline_ms = now.saturating_add(
+            self.config
+                .suppression
+                .assessment_delay(degree, &mut self.rng),
+        );
+        match self.suppression.observe(Sighting {
+            now,
+            msg_id: id,
+            class: crate::PacketClass::Broadcast,
+            sender: link,
+            threshold,
+            deadline_ms,
+            relay,
+        }) {
+            suppress::Observe::Pending => {}
+            suppress::Observe::Suppressed => {
+                let _ = self
+                    .seen
+                    .check_and_insert(now, crate::PacketClass::Broadcast, id);
+            }
+            suppress::Observe::RelayNow(due) => {
+                let _ = self
+                    .seen
+                    .check_and_insert(now, crate::PacketClass::Broadcast, id);
+                outputs.extend(self.send_to_channel_links(due.bytes, &due.senders));
+            }
+        }
+        outputs
+    }
     /// Fires completed MSH-11 assessment windows. A dedupe record is written
     /// only when this node actually transmits, so a later copy can still
     /// cancel nothing but will be recognised as a duplicate.
@@ -1390,7 +1592,12 @@ impl<R: RngCore> MeshEngine<R> {
         let mut outputs = Vec::new();
         for entry in due {
             let _ = self.seen.check_and_insert(now, entry.class, entry.msg_id);
-            if entry.class == crate::PacketClass::Presence {
+            if Packet::decode(&entry.bytes).is_ok_and(|p| {
+                p.header.class == crate::PacketClass::Broadcast
+                    && crate::channel::is_channel(p.payload)
+            }) {
+                outputs.extend(self.send_to_channel_links(entry.bytes, &entry.senders));
+            } else if entry.class == crate::PacketClass::Presence {
                 outputs.extend(self.send_to_capable_links(entry.bytes, &entry.senders));
             } else {
                 outputs.extend(self.send_to_links(entry.bytes, &entry.senders));

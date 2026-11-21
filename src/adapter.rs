@@ -17,6 +17,15 @@ use std::time::Duration;
 /// Host-visible results of applying engine actions.
 #[derive(Debug)]
 pub enum AdapterEvent {
+    /// Authenticated signed plaintext on a locally subscribed public channel.
+    ChannelMessage {
+        /// Authenticated header.
+        header: crate::Header,
+        /// Subscribed channel identifier.
+        channel: crate::ChannelId,
+        /// Unencrypted opaque application bytes.
+        payload: Vec<u8>,
+    },
     /// A local delivery authenticated by MSH-09: the payload is the
     /// opened plaintext after the seal, origin-signature and replay
     /// checks accepted it.
@@ -151,6 +160,17 @@ impl<R: RngCore, T: Transport> NetworkAdapter<R, T> {
         let mut events = Vec::new();
         for output in outputs {
             match output {
+                MeshOutput::ChannelMessage {
+                    header,
+                    channel,
+                    payload,
+                } => {
+                    events.push(AdapterEvent::ChannelMessage {
+                        header,
+                        channel,
+                        payload,
+                    });
+                }
                 MeshOutput::Send {
                     link,
                     channel,
