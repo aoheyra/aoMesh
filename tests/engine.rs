@@ -41,6 +41,23 @@ fn hello_of(identity: &Identity) -> Hello {
         app_hello: AppHello::new(signed.encode().to_vec()).unwrap(),
     }
 }
+/// A link-up with no store items starts MSH-14 and sends one digest frame.
+fn assert_sync_digest(outputs: Vec<MeshOutput>, link: LinkId) {
+    match outputs.as_slice() {
+        [
+            MeshOutput::Send {
+                link: actual,
+                channel: Channel::Bulk,
+                payload,
+            },
+        ] => {
+            assert_eq!(*actual, link);
+            assert_eq!(payload.first(), Some(&0x53), "sync magic");
+        }
+        _ => panic!("expected one sync digest frame, got {outputs:?}"),
+    }
+}
+
 fn header(class: PacketClass, len: usize) -> Header {
     Header {
         class,
@@ -127,16 +144,16 @@ fn default_bound_and_every_input_change_only_their_owned_state() {
     );
     let mut e = engine(2);
     let link = LinkId::new(1);
-    assert!(
+    assert_sync_digest(
         e.handle(
             10,
             MeshInput::LinkUp {
                 link,
-                remote_hello: hello()
-            }
+                remote_hello: hello(),
+            },
         )
-        .unwrap()
-        .is_empty()
+        .unwrap(),
+        link,
     );
     let n = e.neighbors().get(link).unwrap();
     assert_eq!(n.connected_at_ms, 10);
@@ -328,16 +345,16 @@ fn neighbour_flood_is_bounded_and_refused_links_are_released() {
         },
     )
     .unwrap();
-    assert!(
+    assert_sync_digest(
         e.handle(
             100001,
             MeshInput::LinkUp {
                 link: LinkId::new(10001),
-                remote_hello: hello()
-            }
+                remote_hello: hello(),
+            },
         )
-        .unwrap()
-        .is_empty()
+        .unwrap(),
+        LinkId::new(10001),
     );
     let mut none = engine(0);
     assert_eq!(
@@ -649,16 +666,16 @@ fn link_up_records_the_verified_node_id_from_the_hello() {
     let mut e = engine(2);
     let identity = Identity::from_seed([0x77; 32]);
     let link = LinkId::new(5);
-    assert!(
+    assert_sync_digest(
         e.handle(
             10,
             MeshInput::LinkUp {
                 link,
-                remote_hello: hello_of(&identity)
-            }
+                remote_hello: hello_of(&identity),
+            },
         )
-        .unwrap()
-        .is_empty()
+        .unwrap(),
+        link,
     );
     assert_eq!(
         e.neighbors().get(link).unwrap().node_id,

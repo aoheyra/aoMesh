@@ -488,6 +488,10 @@ impl Simulation {
                 ..scenario.suppression
             };
             let engine = MeshEngine::with_config(engine_rng, engine_config);
+            // Baseline nodes have empty stores. The hello and beacon must
+            // advertise the engine's actual digest, otherwise every link
+            // looks different and MSH-14 starts a needless sync contact.
+            let store_digest = engine.sync().local_digest();
             let mut adapter =
                 NetworkAdapter::new(engine, Network::new(NetworkConfig::default(), radio));
             let tag = {
@@ -497,7 +501,8 @@ impl Simulation {
                 out.copy_from_slice(&t[..16]);
                 LocalTag::new(out)
             };
-            let signed = MeshHello::sign(&identity, [0; 8], [0; 4]).expect("fixed identity signs");
+            let signed =
+                MeshHello::sign(&identity, [0; 8], store_digest).expect("fixed identity signs");
             let applied = adapter.apply(
                 world.now(),
                 vec![
@@ -507,7 +512,7 @@ impl Simulation {
                     },
                     MeshOutput::SetBeacon {
                         hint: next(&mut rng).to_be_bytes(),
-                        digest: [0; 4],
+                        digest: store_digest,
                         flags: BeaconFlags {
                             accepting: true,
                             ..BeaconFlags::default()

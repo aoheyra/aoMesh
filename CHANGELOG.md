@@ -7,6 +7,18 @@ change without notice until v0.1.0, and consumers pin by git tag
 
 ## Unreleased
 
+MSH-14 adds bounded anti-entropy sync for links that advertise `CAP_SYNC_V1`.
+The engine compares store digests, exchanges eight-byte id prefixes and asks
+the host for the encoded packets it owes through `SyncNeed`/`SyncItems`.
+Incoming `SyncItem` packets are bounds- and content-address-checked before the
+host inserts them; final authenticity stays with the store owner. A two-phase
+`Done` handshake releases the opportunistic link only after both directions
+have finished, and a 20-second deadline releases a stalled contact. The sync
+frames use magic `0x53`, version `1` and a five-byte header on aoNetwork's Bulk
+channel; peers without the capability bit keep the MSH-13 beacon path. A
+SimWorld acceptance case with seed `0x5147_2026` converges two stores on the
+same four ids after a 20-second meeting and observes the link release.
+
 The MSH-27 baseline fixture was regenerated against aoNetwork `492e148c`
 (Net 25 flow control). The refreshed sibling changed simulated link formation:
 waypoint and community delivery improved, waypoint overhead fell, community

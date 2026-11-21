@@ -2,7 +2,7 @@
 
 **The routing and store-and-forward engine of the aoheyra mesh.** A sans-IO Rust crate that decides what happens to a packet: forward it, hold it, suppress it, deliver it, or drop it, across a phone-to-phone mesh where links come and go.
 
-> **Status: pre-alpha, through MSH-13.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries and the debounced beacon digest are implemented.
+> **Status: pre-alpha, through MSH-14.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest and bounded anti-entropy sync on meeting links are implemented.
 
 Cargo package name: `ao_mesh`.
 
@@ -78,7 +78,7 @@ Lifetimes, TTLs, copy counts and budgets are **defaults with documented reasons*
    aoNetwork  (NetworkEvent in, actions out)      aoIdents (sign, open, replay)
 ```
 
-**Engine inputs:** `LinkUp`, `LinkDown`, `Data`, `Tick`, `Submit`. **Outputs:** `Send`, `Broadcast`, `Release`, `Deliver`, `SetHello`, `SetBeacon`.
+**Engine inputs:** `LinkUp`, `LinkDown`, `Data`, `Tick`, `Submit`, `StoreSummary`, `SyncItems`. **Outputs:** `Send`, `Broadcast`, `Release`, `Deliver`, `SetHello`, `SetBeacon`, `SyncNeed`, `SyncItem`, `ReleaseOpportunistic`.
 
 ### Engine and adapter (MSH-06)
 
@@ -110,8 +110,11 @@ guard accepts. Refusals and forged content addresses are counted against the
 sending neighbour.
 
 With feature `adapter`, `NetworkAdapter` owns the facade and engine in one
-caller task. All seven output variants map to commands or host events;
-`SendFailed` returns the link and original payload through `SendError`.
+caller task. All nine output variants map to network commands or host events;
+`SyncNeed` asks the host to resolve store ids, `SyncItem` hands an incoming
+packet to the host store, and `ReleaseOpportunistic` calls aoNetwork's
+`Network::release`, which closes only opportunistic links. `SendFailed`
+returns the link and original payload through `SendError`.
 `poll_event` and its `next_event` future need no runtime dependency and work
 in a Tokio-owned task. Each pump takes the local `Identity` by borrow so
 MSH-09 can open deliveries; the engine retains no key. The host supplies
@@ -421,3 +424,41 @@ cancels a pending change, and a backwards clock never shortens the window. No
 wire format changes: aoNetwork's beacon already carries the four-byte digest.
 `tests/sync_summary.rs` proves the equality/change property with two
 `MemoryStore` instances and the beacon behaviour through the engine.
+
+## Anti-entropy sync v1 (MSH-14)
+
+When two nodes meet, a link whose MeshHello advertises `CAP_SYNC_V1` starts a
+bounded anti-entropy exchange on aoNetwork's Bulk channel. The engine never
+opens the host's store: it compares the peer's four-byte beacon digest with its
+cached summary, exchanges sorted eight-byte id prefixes, and emits `SyncNeed`
+for the missing prefixes. The host resolves each prefix through
+`MessageStore::get` and submits the encoded packet with `MeshInput::SyncItems`.
+Incoming `SyncItem` events carry complete encoded packets for the host to
+insert; the engine verifies bounds, the content address and the storable class,
+while final signature verification and insertion policy stay with the store
+owner. Telemetry is never synced.
+
+| Setting | Default | Why |
+|---|---|---|
+| Per-contact byte budget | 256 KiB | Bounds work and airtime for one meeting |
+| Per-frame byte budget | 15 KiB | Fits inside aoNetwork's 16 KiB Bulk frame |
+| Summary entries | 1024 | Matches the store bound; larger summaries are rejected |
+| Contact deadline | 20 s | Long enough for a slow contact, bounded against a stalled peer |
+
+`SyncFrame` uses a five-byte header: magic `0x53`, version `1`, a tag for
+Digest/Summary/Item/Done and a two-byte body length. A peer without the sync
+capability bit is ignored by the sync path and keeps the MSH-13 beacon path; no
+sync frames are sent. Equal digests end the contact without a release, since
+the link may still carry ordinary forwarding traffic. Each side sends only the
+ids the other lacks and waits for the peer's `Done` before emitting
+`ReleaseOpportunistic`, so the link is not closed while packets are still in
+flight. The deadline releases a stalled
+contact once, and a link drop clears its session so a later encounter restarts
+cleanly.
+
+`tests/sync_v1.rs` covers bounded frames, host seams, drop recovery and
+both-direction release; `src/hello.rs` covers the capability bit and its
+negotiated fallback. `tests/sync_convergence.rs` drives the
+real adapter over aoNetwork `SimWorld` with seed `0x5147_2026`: after a 20-second
+contact the two stores converge on the same four ids and the opportunistic link
+is released.

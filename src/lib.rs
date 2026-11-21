@@ -56,6 +56,7 @@ pub use sign::{
 };
 pub use suppress::SuppressionConfig;
 pub use sync::{BeaconTracker, SHORT_ID_BYTES, StoreSummary, SummaryConfig};
+pub use sync::{SyncConfig, SyncFrame, SyncOffer};
 
 // A signed hello must fit the opaque blob aoNetwork allows (NET-04's
 // MAX_APP_HELLO); this fails at compile time if the layout ever grows.

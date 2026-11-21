@@ -264,6 +264,48 @@ pending beacon, and a backwards clock cannot shorten the wait. The hint bytes
 are opaque to the mesh, and the four-byte digest uses the beacon field already
 defined by aoNetwork, so no packet or hello layout changes.
 
+## Anti-entropy sync v1 (MSH-14)
+
+MSH-14 adds engine-to-engine control frames on aoNetwork's `Channel::Bulk`.
+They are not mesh packets: they carry no origin signature. The items inside
+them are complete encoded mesh packets, checked by the receiving engine for
+bounded decode, a matching content address and a storable class before they
+are handed to the host store. The store owner remains responsible for final
+signature verification and insertion policy.
+
+A `MeshHello` advertises `CAP_SYNC_V1` in its capability bits. The bit uses an
+existing hello field, so the wire layout is unchanged. If the negotiated caps
+do not include it, the engine sends no sync frames and both nodes continue to
+use the MSH-13 beacon digest only. A peer speaking a different sync version is
+rejected by the frame decoder and leaves the session to its deadline.
+
+Every frame starts with a five-byte header:
+
+| Offset | Length | Meaning |
+|---|---|---|
+| 0 | 1 | Magic `0x53` |
+| 1 | 1 | Sync version (`1`) |
+| 2 | 1 | Tag: `1` Digest, `2` Summary, `3` Item, `4` Done |
+| 3..5 | 2 | Body length, big endian |
+
+`Digest` carries the four-byte summary digest. `Summary` carries that digest,
+a two-byte entry count and that many sorted eight-byte id prefixes; a count
+above 1024 is rejected before any allocation. `Item` carries one complete
+encoded mesh packet, bounded by the 15 KiB per-frame limit and the 256 KiB
+per-contact budget. `Done` has an empty body.
+
+The exchange is symmetric. Each side compares the peer's summary with its
+cached local summary, computes the prefixes the peer lacks, and asks its host
+for those packets with `MeshOutput::SyncNeed`. The host answers with
+`MeshInput::SyncItems`. Equal digests end the exchange without a release,
+because the link may still carry ordinary traffic. A node sends `Done` only
+after it has sent everything it owes and received everything it expected; it
+emits `MeshOutput::ReleaseOpportunistic` only after the peer's `Done`. The
+adapter maps that output to aoNetwork's `Network::release`, which closes
+opportunistic links and leaves stable links alone. A 20-second deadline
+releases a stalled contact once, and a link drop removes the session so a
+later meeting starts from a fresh digest.
+
 ## Simulation evidence (MSH-27)
 
 No wire format changes. Feature `sim` drives the codec and engine over aoNetwork's
