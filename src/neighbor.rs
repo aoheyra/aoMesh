@@ -5,6 +5,8 @@ use ao_idents::{NodeId, ReplayConfig};
 use ao_network::{Hello, LinkId};
 use std::collections::BTreeMap;
 
+use crate::budget::BudgetConfig;
+
 /// Limits for engine-owned state. These do not enforce radio topology policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MeshConfig {
@@ -14,6 +16,8 @@ pub struct MeshConfig {
     /// message-id window, the timestamp tolerance and the sender cap
     /// for [`ao_idents::ReplayGuard`].
     pub replay: ReplayConfig,
+    /// Relay-budget rates, bounds and penalties (MSH-10).
+    pub budgets: BudgetConfig,
 }
 
 impl Default for MeshConfig {
@@ -25,12 +29,14 @@ impl Default for MeshConfig {
     /// contacts a day is well beyond the MVP's. The product, 65536
     /// ids, is aoIdents' entry cap (about 1.5 MiB only if every slot
     /// holds one, which per-link rate limiting and the 24 h expiry
-    /// keep far out of reach in normal use).
+    /// keep far out of reach in normal use). The budget defaults are
+    /// ADR-0001's class rates (MSH-10).
     fn default() -> Self {
         Self {
             max_neighbors: 32,
             replay: ReplayConfig::new(1_024, 86_400_000, 64)
                 .expect("the documented defaults are within aoIdents' bounds"),
+            budgets: BudgetConfig::default(),
         }
     }
 }

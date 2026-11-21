@@ -119,6 +119,17 @@ pub enum PacketClass {
 }
 
 impl PacketClass {
+    /// All classes in budget-priority order: Direct first, Telemetry last.
+    #[must_use]
+    pub const fn all() -> [Self; 4] {
+        [
+            Self::Direct,
+            Self::Broadcast,
+            Self::Presence,
+            Self::Telemetry,
+        ]
+    }
+
     fn to_wire(self) -> u8 {
         self as u8
     }

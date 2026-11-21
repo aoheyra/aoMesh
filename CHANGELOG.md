@@ -7,6 +7,19 @@ change without notice until v0.1.0, and consumers pin by git tag
 
 ## Unreleased
 
+MSH-10 adds per-origin and per-neighbour token buckets with the ADR-0001 class
+rates and a ten-minute burst. Relays debit both buckets before sending copies;
+local delivery is unaffected. Invalid, unverified and over-budget traffic adds
+a decaying penalty, and a link crossing the threshold is released once with
+`DisconnectReason::AbuseDetected`. `MeshConfig` gains a `budgets: BudgetConfig`
+field, `MeshEngine::budgets` exposes read-only state, and `PacketClass::all`
+lists classes in priority order. The simulator gains `Traffic::Flood`,
+per-origin delivery metrics, `flood_scenarios` and an `enforce` ablation
+switch. The fixed flood case shows the origin's delivery falling from 0.7867
+to 0.3067 while honest origins are not harmed by the throttle; details and
+seeds are in the README and ADR-0001. The four published MSH-27 baselines are
+unchanged.
+
 MSH-27 adds a deterministic SimWorld harness behind feature `sim`. It drives
 signed hellos, link events and the engine through the adapter across a 20-node
 line, a 50-node random waypoint network, a 100-node community network and a
@@ -16,6 +29,7 @@ enforce directional regression bounds on delivery ratio, overhead, latency,
 duplicates, radio bytes and peak queue occupancy. The adapter gains
 `engine_mut` and `network_mut` so the harness can count outputs before they
 are applied. Published seeds and numbers are in the README.
+
 MSH-09 authenticates local delivery. A Direct packet addressed to this node
 must carry an aoIdents sealed payload bound to the immutable header content
 address; the engine opens it against a borrowed local identity, requires the
