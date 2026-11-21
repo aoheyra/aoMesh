@@ -195,6 +195,18 @@ or stale timestamp produces no delivery and increments
 delivery only after acceptance; relays are recorded before forwarding to
 keep their loop invariant.
 
+## Simulation evidence (MSH-27)
+
+No wire format changes. Feature `sim` drives the codec and engine over aoNetwork's
+paused `SimWorld` with fixed seeds, signed hellos, mobility and scripted
+contacts. It reports delivery ratio, latency, overhead, duplicate ratio, radio
+bytes and queue occupancy as CSV; the published seeds, numbers and regeneration
+commands are in the README section "Simulator harness and baseline". The
+nightly `sim` workflow fails on any directional regression against those
+numbers, so protocol or routing changes must state their measured effect. See
+[the simulator baseline decision](adr/simulator-baseline.md) for the scenario
+and metric choices.
+
 ## Local storage metadata
 
 MSH-12 stores encoded packets unchanged. Local copies_left, priority,

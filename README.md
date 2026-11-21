@@ -187,6 +187,48 @@ Failed checks and forged content addresses increment
 `Neighbor::rejected_packets` and never produce a delivery; policy drops do
 not. Decision record: [ADR-0005](docs/adr/0005-local-delivery-pipeline.md).
 
+### Simulator harness and baseline (MSH-27)
+
+Feature `sim` adds a deterministic host-side harness on aoNetwork's paused
+`SimWorld`. It drives real signed hellos, link events and the engine through
+the adapter, then reports delivery, latency, overhead, duplicates, radio
+bytes and queue occupancy. Scenarios cover a 20-node line, a 50-node random
+waypoint network, a 100-node four-community network and a 200-node chain with
+scripted shortcut contacts. Seeds, positions, traffic and sealing streams are
+fixed, so every row reproduces exactly.
+
+```bash
+cargo run --release --features sim --example sim_report
+cargo run --release --features sim --example sim_report -- baselines.csv
+cargo test --release --all-features --test sim_baseline
+```
+
+The first command prints the CSV; the second writes it to a file. The third
+enforces the published thresholds and fails on a regression; the nightly
+workflow in `.github/workflows/sim.yml` runs both. Bounds are directional:
+higher delivery and lower overhead, latency, duplicates, radio bytes and peak
+queue occupancy pass. `tests/sim_baseline.rs` records the exact gate values.
+
+CSV columns: `scenario,seed,nodes,submitted,delivered,duplicate_deliveries,
+transmissions,receptions,send_failures,radio_bytes,mean_latency_ms,
+max_latency_ms,delivery_ratio,overhead,duplicate_ratio,peak_queued_bytes,
+links_after_settle`. Ratios are fractions and print with four decimal places.
+
+Published baseline (Rust stable, release profile, fixed seeds):
+
+| Scenario | Nodes | Seed | Delivered / submitted | Delivery ratio | Overhead | Mean / max latency (ms) | Radio bytes | Peak queued bytes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `line-20` | 20 | 1297303584 | 20 / 20 | 1.0000 | 9.6500 | 730 / 1200 | 102065 | 550 |
+| `waypoint-50` | 50 | 1297303632 | 29 / 50 | 0.5800 | 135.8966 | 506 / 1200 | 1537858 | 11394 |
+| `community-100` | 100 | 1297303652 | 74 / 80 | 0.9250 | 328.5541 | 713 / 1200 | 10917151 | 32814 |
+| `scripted-200` | 200 | 1297303752 | 100 / 100 | 1.0000 | 34.5500 | 561 / 1200 | 1536915 | 6600 |
+
+`send_failures` and duplicate deliveries are zero in every scenario. The
+mobile scenarios are deliberately lossy under TTL 8: random-waypoint contacts
+leave some destinations farther than eight hops, which is the baseline later
+spray-and-wait and sync work must beat. The topology and metric choices are
+recorded in [the simulator baseline decision](docs/adr/simulator-baseline.md).
+
 ## Targets and evidence
 
 Performance claims are measured in the simulator harness (MSH-27), never asserted:
@@ -195,7 +237,7 @@ Performance claims are measured in the simulator harness (MSH-27), never asserte
 - Spray-and-wait: delivery close to epidemic routing at a fraction of the transmissions under mobility.
 - Sync v2: bytes per contact drop measurably against v1 for stores of 1000+ messages.
 
-Metrics: delivery ratio, latency, overhead (transmissions per delivery), duplicate ratio, buffer occupancy. Reports are CSV; nightly CI enforces thresholds and fails on regression.
+Metrics: delivery ratio, latency, overhead (transmissions per delivery), duplicate ratio, buffer occupancy. Reports are CSV (see the [MSH-27 baseline](#simulator-harness-and-baseline-msh-27)); nightly CI enforces thresholds and fails on regression.
 
 ## Features
 
@@ -203,6 +245,7 @@ Metrics: delivery ratio, latency, overhead (transmissions per delivery), duplica
 |---|---|
 | *(default)* | The sans-IO core only. No `tokio`, no I/O |
 | `adapter` | Runtime-neutral async glue usable by a Tokio-owned task; pumps `NetworkEvent` into the engine and actions out |
+| `sim` | Deterministic SimWorld scenarios, CSV metrics and baseline gates; implies `adapter` and never enters the sans-IO core |
 
 ## Development
 
@@ -215,8 +258,9 @@ cargo test --all-features
 cargo deny check
 cargo doc --no-deps --all-features
 
-# Simulator scenarios and metrics (after MSH-27)
-cargo run --release --example sim_report
+# Simulator scenarios and metrics
+cargo run --release --features sim --example sim_report
+cargo test --release --all-features --test sim_baseline
 ```
 
 Tests are `cargo test` only: no Miri or callgrind locally. CI runs fmt, clippy, tests on three operating systems, `cargo doc`, cargo-deny, an MSRV build and miri on every pull request.

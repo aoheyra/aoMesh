@@ -31,6 +31,8 @@ pub mod neighbor;
 pub mod packet;
 pub mod seen;
 pub mod sign;
+#[cfg(feature = "sim")]
+pub mod sim;
 pub mod store;
 
 #[cfg(feature = "adapter")]
