@@ -17,8 +17,12 @@ one-shot `CardFetch` host events are implemented in the new `presence` module.
 The fixed 50-node report on seed `1297304021` learns 49 of 49 peers in 50 ms,
 emits no card fetches, and uses 15,480 B/h per source at steady state against
 the 64 KiB/h budget. The one-copy cancellation in MSH-11 suppression is also
-fixed at the algorithm level: the effective threshold is floored at two
-distinct sending links for every flooded class, with a unit regression. The
+fixed at the algorithm level: the degree-derived threshold is floored at two
+distinct sending links on degree-one paths, where one arrival otherwise
+extinguishes the flood, while denser graphs keep the degree-scaled threshold
+and the configured lower bound. With that floor in the caller, the fixed
+50-node suppression scenario saves 43.51% of transmissions on seed
+`1297304013` with delivery unchanged. The
 MSH-17 enabled 200-node report consequently sends 27,926 instead of 27,958
 packets on seed `1297303752`; delivery, receipts, purges and purge latency are
 unchanged.
@@ -121,10 +125,10 @@ is versioned plain integer data with no packet content, ids, keys or personal
 data, and `MeshEngine::observability_snapshot` / `NetworkAdapter::snapshot` read it without
 allocation, I/O or a second source of truth. `MeshConfig` gains a `seen` field
 so the seen-record gauge has the same documented 4096-entry bound as the cache.
-The fixed mixed 20-node scenario with seed `1297304021` reports 323 duplicates,
-120 suppressed relays, 88 store ids, 820 sync bytes in each direction and four
-penalty events from injected malformed frames. These values were remeasured on
-the accumulated MSH-19 stack after the two-distinct-link suppression floor
+The fixed mixed 20-node scenario with seed `1297304021` reports 321 duplicates,
+166 suppressed relays, 88 store ids, 820 sync bytes in each direction and four
+penalty events from injected malformed frames. These values were remeasured
+after refining the two-link suppression floor to degree-one paths, which
 changed which relays cancel a flood; no wire format or MSH-27 threshold
 changed. The host maps this snapshot into aoheyra's APP-15 bundle.
 

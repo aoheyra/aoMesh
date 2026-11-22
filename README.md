@@ -327,7 +327,7 @@ changes.
 | Setting | Default | Why |
 |---|---|---|
 | Reference degree / copies | 4 / 3 | 50-node sweep: cancels 45% of transmissions without moving Direct delivery |
-| Copy bounds | 1 to 6 configured, 2 effective | Keeps sparse graphs forwarding; one copy cannot prove neighbours heard a flood |
+| Copy bounds | 1 to 6 configured; 2 on degree-one paths | A single arrival cannot prove neighbours heard a line flood; denser graphs keep the degree-scaled threshold |
 | Base delay | 60-140 ms, seeded | Long enough for neighbour copies, short enough for a contact |
 | Final delay | 20-600 ms, shrinking with degree | Dense groups decide sooner |
 | Class TTL | Direct 8, Broadcast 6, Presence 3, Telemetry 3 | ADR-0001 table, clamped on submission too |
@@ -1029,11 +1029,12 @@ are injected from node 0 after traffic starts. The measured report row is:
 
 | Scenario | Seed | Submitted / delivered | Duplicates | Suppressed | Store ids | Sync bytes sent / received | Penalty events | Seen / pending |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| `observability-mixed-20` | 1297304021 | 40 / 6 | 323 | 120 | 88 | 820 / 820 | 4 | 552 / 0 |
+| `observability-mixed-20` | 1297304021 | 40 / 6 | 321 | 166 | 88 | 820 / 820 | 4 | 547 / 0 |
 
-The row was remeasured on the accumulated MSH-19 stack: the two-distinct-link
-suppression floor changed which relays cancel a flood, so it is not comparable
-to the original 367/193/89/512/7 measurement. No MSH-27 threshold was lowered.
+The row was remeasured after refining the two-link suppression floor to
+degree-one paths: which relays cancel a flood changed again, so it is not
+comparable to the original 367/193/89/512/7 measurement or the intermediate
+323/120/552 row. No MSH-27 threshold was lowered.
 Current penalties are zero at the end because scores decay after the four
 events; `neighbour_penalty_events` is the durable evidence that the hostile
 neighbour was accounted for. `tests/sim_observability.rs` locks every value,

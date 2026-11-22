@@ -107,7 +107,7 @@ suppression table. No wire field changes.
 |---|---|---|
 | Pending entries | 1024 | Bounds memory while covering a contact's worth of distinct content |
 | Reference degree / copies | 4 / 3 | Calibrated by the 50-node sweep: 45.20% fewer transmissions, Direct ratio unchanged |
-| Copy bounds | 1 to 6 configured, 2 effective | Sparse graphs still forward; hostile or extreme degrees cannot mint unbounded work |
+| Copy bounds | 1 to 6 configured; 2 on degree-one paths | Sparse line paths still forward; denser graphs keep the calibrated threshold and hostile degrees cannot mint unbounded work |
 | Base delay | 60-140 ms, seeded | Long enough for neighbour copies, short enough for a contact |
 | Final delay | 20-600 ms, shrinking with degree | Dense groups decide sooner without letting sparse groups relay blind |
 | Class TTLs | 8, 6, 3, 3 | Same table as above; submission and relay both clamp |
@@ -119,15 +119,18 @@ the MSH-19 convergence work reproduced that failure on degree-one paths, where
 one arrival cancelled the only relay and extinguished the flood at the first
 hop. A degree-scaled `k` with fractional seeded rounding is the chosen option:
 it spends relays where neighbours are scarce and cancels them where the mesh
-already offered several chances. The effective threshold is now floored at two
-distinct sending links for every flooded class, so `min_k = 1` can no longer
-produce that isolation. This is a routing fix, not a scenario special case.
-The delay shrinks with degree for the same reason. The reference degree is
-four, calibrated by the 50-node sweep; bounds keep `k` and the delay finite
-for hostile degree claims. State is bounded at 1024 pending messages and
-evicted by earliest deadline. CI rechecks the fixed suppression scenario
-without lowering its thresholds; the published Direct-only baselines carry no
-flooded classes and are unaffected.
+already offered several chances. A degree-derived threshold of one is floored
+at two distinct sending links on a degree-one path, where the single arrival
+would otherwise extinguish the flood; from degree two the configured lower
+bound applies and `min_k = 1` can cancel a relay where the mesh offered enough
+other links. This keeps the routing fix without a global floor that suppressed
+the calibrated savings in denser graphs. The delay shrinks with degree for the
+same reason. The reference degree is four, calibrated by the 50-node sweep;
+bounds keep `k` and the delay finite for hostile degree claims. State is bounded
+at 1024 pending messages and evicted by earliest deadline. The fixed
+50-node mixed scenario saves 43.51% of transmissions on seed `1297304013` with
+delivery unchanged; CI rechecks it without lowering its thresholds, and the
+published Direct-only baselines carry no flooded classes and are unaffected.
 
 The simulator ablation sets `SuppressionConfig::enabled = false`, restoring
 immediate flooding without changing topology, identities or traffic. Suppression
@@ -672,12 +675,13 @@ links. Store occupancy is the live id count from the latest host summary, not
 a byte count. Manifest data and content are excluded from the snapshot.
 
 The fixed mixed scenario has seed `1297304021`, 20 nodes and four malformed
-frames injected from node 0. It reports 40 submitted / 6 delivered, 323
-duplicate packets, 120 suppressed relays, 88 store ids, 820 sync bytes sent
-and received, four penalty events, 552 seen records and no pending suppression
+frames injected from node 0. It reports 40 submitted / 6 delivered, 321
+duplicate packets, 166 suppressed relays, 88 store ids, 820 sync bytes sent
+and received, four penalty events, 547 seen records and no pending suppression
 windows. The original 367/193/89/512/7 row was measured before MSH-19 raised
-the suppression floor to two distinct sending links; the row was remeasured on
-the accumulated stack rather than weakening any gate. Current penalties are
+the suppression floor, and the intermediate 323/120/552 row before that floor
+was narrowed to degree-one paths; both were remeasured rather than weakening
+any gate. Current penalties are
 zero at the end by design because scores decay; the cumulative event counter
 is the durable evidence. These metrics are additive and outside the MSH-27 CSV
 schema, so no baseline threshold was weakened. The host maps this plain snapshot into APP-15; aoMesh

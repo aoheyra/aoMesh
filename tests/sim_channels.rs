@@ -6,8 +6,9 @@
 
 use ao_mesh::sim::{Metrics, Traffic, channel_scenarios, run};
 
-// MSH-19 raised suppression's effective floor to two distinct sending links,
-// so every line relay forwards once. The pre-MSH-19 expectation was two sends.
+// MSH-19 floored the suppression threshold at two distinct links on
+// degree-one paths, so every line relay forwards once. The pre-MSH-19
+// expectation was two sends.
 const EXPECTED_ROW: &str = "channel-line-20,1297304023,20,1,2,2,12,3048,43690,true";
 
 #[test]

@@ -114,7 +114,15 @@ impl SuppressionConfig {
         let whole = numerator / reference;
         let fraction = numerator % reference;
         let extra = u128::from(fraction > 0 && u128::from(rng.next_u64()) % reference < fraction);
-        let min = self.min_k.max(1) as u128;
+        // A node with no more than one other neighbour cannot prove the
+        // flood reached anybody past itself, so it always forwards. From
+        // degree two the configured bound applies and the degree-scaled
+        // threshold spends the remaining relays where copies are scarce.
+        let min = if degree <= 1 {
+            2.max(self.min_k.max(1))
+        } else {
+            self.min_k.max(1)
+        } as u128;
         let max = self.max_k.max(min as usize) as u128;
         (whole + extra).clamp(min, max) as usize
     }
@@ -304,12 +312,11 @@ impl SuppressionTable {
                 self.entries.remove(&victim);
             }
         }
-        // One copy proves only that this node heard the packet. Cancelling on
-        // it would let suppression extinguish a flood at the first hop,
-        // especially on a line or a small-degree graph. Every degree-scaled
-        // threshold is therefore floored at two distinct sending links; if no
-        // second copy arrives, `take_due` relays when the timer fires.
-        let threshold = threshold.max(2);
+        // `copy_threshold` already floors degree-one paths at two distinct
+        // sending links. Beyond that, the caller's degree-scaled threshold
+        // decides: a single copy may cancel a relay where the mesh offered
+        // enough other links, and otherwise `take_due` forwards on time.
+        let threshold = threshold.max(1);
         let mut senders = BTreeSet::new();
         senders.insert(sender);
         if senders.len() >= threshold {
@@ -461,15 +468,21 @@ mod tests {
     }
 
     #[test]
-    fn a_single_copy_is_never_enough_to_cancel_a_flood() {
-        let mut table = SuppressionTable::new(config());
+    fn a_single_copy_is_never_enough_on_a_degree_one_path() {
+        let cfg = config();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        // The caller derives the threshold from its degree; a line has one
+        // neighbour past the sender and must always forward once.
+        let threshold = cfg.copy_threshold(1, &mut rng);
+        assert_eq!(threshold, 2);
+        let mut table = SuppressionTable::new(cfg);
         assert_eq!(
-            table.observe(sight(0, ID, LINK_A, 1, 100, vec![1])),
+            table.observe(sight(0, ID, LINK_A, threshold, 100, vec![1])),
             Observe::Pending,
             "a degree-one neighbour must not extinguish the flood"
         );
         assert_eq!(
-            table.observe(sight(1, ID, LINK_B, 1, 100, vec![1])),
+            table.observe(sight(1, ID, LINK_B, threshold, 100, vec![1])),
             Observe::Suppressed
         );
     }
@@ -533,7 +546,10 @@ mod tests {
 
     #[test]
     fn only_cancelled_relays_increment_the_suppression_counter() {
-        let mut table = SuppressionTable::new(config());
+        let cfg = config();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(2);
+        let sparse_threshold = cfg.copy_threshold(1, &mut rng);
+        let mut table = SuppressionTable::new(cfg);
         assert_eq!(table.suppressed_relays(), 0);
         assert_eq!(
             table.observe(sight(0, ID, LINK_A, 3, 100, vec![1])),
@@ -562,16 +578,16 @@ mod tests {
         );
         assert_eq!(table.take_due(10).len(), 1);
         assert_eq!(table.suppressed_relays(), 1);
-        // The MSH-19 floor requires a second distinct link even when the
-        // requested threshold is one; the genuine cancellation still counts.
+        // The caller floors a degree-one path at two distinct links; the
+        // genuine cancellation still counts.
         let floored = MessageId::from_bytes([5; 16]);
         assert_eq!(
-            table.observe(sight(0, floored, LINK_A, 1, 100, vec![3])),
+            table.observe(sight(0, floored, LINK_A, sparse_threshold, 100, vec![3])),
             Observe::Pending
         );
         assert_eq!(table.suppressed_relays(), 1);
         assert_eq!(
-            table.observe(sight(1, floored, LINK_B, 1, 100, vec![3])),
+            table.observe(sight(1, floored, LINK_B, sparse_threshold, 100, vec![3])),
             Observe::Suppressed
         );
         assert_eq!(table.suppressed_relays(), 2);

@@ -236,10 +236,11 @@ deadline. The node counts **distinct sending links**, so retransmissions from
 one neighbour are only one copy.
 
 A seeded assessment delay shrinks as the verified neighbour degree grows.
-Before the deadline the node sends nothing. The effective threshold is the
-seeded degree-scaled value floored at two distinct links: one copy proves only
-that this node heard the packet, and cancelling on it extinguished floods on
-degree-one paths. If the effective threshold is reached from different links,
+Before the deadline the node sends nothing. The threshold is the seeded
+degree-scaled value; on a degree-one path it is floored at two distinct links,
+because one copy proves only that this node heard the packet and cancelling on
+it extinguished line floods. Denser graphs keep the configured lower bound.
+If the threshold is reached from different links,
 the pending entry is cancelled and the seen-cache records the id: the mesh has
 already given this node enough chances to hear the content, and this node adds
 no duplicate. If the timer

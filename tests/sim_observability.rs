@@ -39,8 +39,8 @@ fn expected() -> Expected {
         nodes: 20,
         submitted: 40,
         delivered: 6,
-        duplicate_packets: 323,
-        suppressed_relays: 120,
+        duplicate_packets: 321,
+        suppressed_relays: 166,
         store_entries: 88,
         sync_bytes_sent: 820,
         sync_bytes_received: 820,
@@ -48,7 +48,7 @@ fn expected() -> Expected {
         neighbour_penalty_total: 0,
         neighbour_penalty_max: 0,
         penalised_neighbours: 0,
-        seen_records: 552,
+        seen_records: 547,
         suppression_pending: 0,
     }
 }
