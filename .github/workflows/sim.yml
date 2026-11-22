@@ -9,8 +9,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: aoheyra/aoMesh-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   baseline:
+    if: github.repository == 'aoheyra/aoMesh' || github.event_name == 'pull_request'
     name: Published baseline
     runs-on: ubuntu-latest
     steps:
