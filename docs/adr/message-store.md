@@ -1,6 +1,6 @@
 # ADR: bounded MessageStore (MSH-12)
 
-Status: proposed by issue #20 implementation.
+Status: accepted; implemented in MSH-12 and shipped in v0.1.0.
 
 The store trait is independent of engine I/O, routing and persistence. The app
 implements SQLite and invokes `store::conformance::check` with a factory that

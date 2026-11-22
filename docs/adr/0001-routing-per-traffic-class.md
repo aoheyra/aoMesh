@@ -13,7 +13,7 @@ Units: TTL = hop limit; Copies = copies in the network; Lifetime = how long a co
 | Direct | spray-and-wait with reverse-path hints | 8 | 255 | 24 h | 1 MiB/h | 1 |
 | Broadcast and channels | counter-based suppression | 6 | 1 per node (forward once) | 6 h | 256 KiB/h | 2 |
 | Presence | trickle-timed gossip | 3 | 1 per node | 30 min | 64 KiB/h | 3 |
-| Telemetry (location) | announce, latest-wins, no storage | 3 | 1 per node | 30 s | 32 KiB/h | 4 |
+| Telemetry (location) | announce, latest-wins, never stored | 3 | 1 per node | store ceiling 5 min, relay freshness 30 s | 32 KiB/h | 4 |
 
 ## Reasons
 
@@ -23,7 +23,7 @@ Units: TTL = hop limit; Copies = copies in the network; Lifetime = how long a co
 
 **Presence — TTL 3, 30 min, 64 KiB/h.** A 150-byte signed announcement carries the origin's card hash, capabilities, sequence and existing public identity. Trickle refreshes from 1 minute to a 15-minute steady bound, so a packet only has to outlive one missed period; three hops cover the immediate neighbourhood where presence is useful; the budget bounds Sybil spam to a few dozen announcements per hour. With the measured 258-byte average wire frame, one source's steady refresh is 15,480 B/h against the 64 KiB/h allowance.
 
-**Telemetry — TTL 3, 30 s, 32 KiB/h.** Location is worthless when stale, so nothing is stored and the newest wins; MSH-22 tightened the freshness ceiling from this table's original 5 min to 30 s because a moving contact cannot act on minute-old ambient state, and the paired simulator rows below show that the one-per-origin/10 s cap still leaves the newest update reaching the three-hop radius. Three hops is the bound for "who is near me"; being the lowest budget, telemetry is the first class shed under pressure.
+**Telemetry — TTL 3, store ceiling 5 min, relay freshness 30 s, 32 KiB/h.** Location is worthless when stale, so nothing is stored and the newest wins. The `LifetimePolicy` store ceiling remains the original 5 min even though telemetry is never stored; MSH-22 tightened the separate relay freshness window to 30 s because a moving contact cannot act on minute-old ambient state, and the paired simulator rows below show that the one-per-origin/10 s cap still leaves the newest update reaching the three-hop radius. Three hops is the bound for "who is near me"; being the lowest budget, telemetry is the first class shed under pressure.
 
 **Priority order.** User-visible content (Direct, Broadcast) before ambient state (Presence); presence self-refreshes through trickle and telemetry through latest-wins, so neither loses anything to a short delay. Nothing above can be starved by anything below, mirroring aoNetwork's control-over-bulk rule.
 
@@ -671,10 +671,10 @@ errors. `FrameTooLarge(usize)` carries the claimed length for diagnosis.
 16 KiB and 4000 allocations across 1000 hostile sync frames, at most 256 KiB
 for repeated 100,000-id summary inputs, at most 32 MiB and 128 allocations per
 input across 1200 hostile engine Data inputs, and store quotas that never
-exceed `StoreLimits`. The three `fuzz/` targets run nightly for one hour each
-with `libFuzzer` under AddressSanitizer; their dev-only dependencies are
-justified in the README. Core dependencies and the sans-IO boundary are
-unchanged.
+exceed `StoreLimits`. The three `libFuzzer` targets live in
+[aoheyra-fuzz](https://github.com/aoheyra/aoheyra-fuzz) with their dev-only
+dependencies and weekly schedule; no fuzz crate or workflow is kept here.
+Core dependencies and the sans-IO boundary are unchanged.
 ## Restart snapshot parameters (MSH-29)
 
 The snapshot carries routing bookkeeping only; it does not change any class

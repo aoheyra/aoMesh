@@ -1,14 +1,16 @@
 # Lifetime and expiry policy (MSH-18)
 
-Status: proposed implementation for issue #25.
+Status: accepted; implemented in MSH-18 and shipped in v0.1.0.
 
 ## Decision
 
-LifetimePolicy supplies configurable per-class local ceilings. Defaults preserve
-ADR-0001: Direct 24 h, Broadcast 6 h, Presence 30 min, Telemetry freshness 5 min.
-The values in issue #25 are examples, not a change to the accepted defaults.
-Zero disables retention for a class. Telemetry remains non-storable regardless
-of its freshness ceiling. No relay budgets or wire fields change.
+LifetimePolicy supplies configurable per-class local store ceilings. Defaults
+preserve ADR-0001: Direct 24 h, Broadcast 6 h, Presence 30 min, Telemetry
+5 min. The 5 min value is the `LifetimePolicy` ceiling used by store backends;
+MSH-22's 30 s value is the separate relay-freshness window in
+`TelemetryConfig`. The values in issue #25 are examples, not a change to the
+accepted defaults. Zero disables retention for a class. Telemetry remains
+non-storable regardless of its ceiling. No relay budgets or wire fields change.
 
 Effective lifetime is min(sender lifetime, local class ceiling). Consumed age
 is age at receipt plus elapsed local monotonic time. created_ms is never read

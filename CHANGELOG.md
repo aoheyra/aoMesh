@@ -7,6 +7,13 @@ match exactly (AGENTS.md, section 8).
 
 ## Unreleased
 
+MSH-31 brings the written defaults, baseline table and public-parameter
+references in line with the code. The release notes now describe the pre-alpha,
+untagged state; no tags are created or moved. Two no-behavior Rust 1.85 cleanups
+use `Entry::Vacant` in `SyncTracker` and stop the route-hint rustdoc linking to
+a private method. `tests/release_docs.rs` guards all three copies against drift
+and records that fuzz targets live in aoheyra-fuzz.
+
 Document the pre-release sibling seam. `ao_mesh` stays at version `0.1.0` and
 consumes `ao_network` and `ao_idents` as untagged git sources. A consumer that
 depends on those siblings directly must use the same untagged URLs (no tag,
@@ -92,7 +99,7 @@ MSH-17 enabled 200-node report consequently sends 27,926 instead of 27,958
 packets on seed `1297303752`; delivery, receipts, purges and purge latency are
 unchanged.
 
-Breaking unreleased API change: `MeshInput::Tick` now takes a borrowed
+Breaking API change before v0.1.0: `MeshInput::Tick` now takes a borrowed
 `Identity` and an eight-byte card hash. New host seams are
 `MeshInput::KnownCards` and `MeshOutput::CardFetch` (surfaced by the adapter as
 `AdapterEvent::CardFetch`); `poll_event` and `next_event` signatures are
@@ -159,7 +166,7 @@ replacing the old two-transmission expectation from the pre-MSH-19 tree. No
 published MSH-27 threshold was lowered. Bounds, typed errors and the exact
 simulator row are in the README, ADR-0001 and `docs/protocol.md`.
 
-Breaking unreleased API additions: `MeshConfig` gained `channels`, `Neighbor`
+Breaking API additions before v0.1.0: `MeshConfig` gained `channels`, `Neighbor`
 gained `signing_pk`, `NeighborTable::insert` takes that key, and the input,
 output, adapter-event and error enums gained channel variants. Exhaustive
 matches in `tests/forwarding.rs` and `tests/sim_budgets.rs` were updated.
@@ -168,12 +175,13 @@ Packet decoding remains allocation-free; sync frame bodies are capped at 8198
 bytes before copying, summary construction and `SyncItems` handling read at
 most 1024 entries, and a reachable delivery-path debug assertion was removed.
 `SyncFrame::decode`, `SyncFrameV2::decode`, `SyncError` and `SyncV2Error` are
-public with typed `FrameTooLarge(usize)` rejections. New `fuzz/` targets cover
-packet decoding, engine input streams and sync frames; nightly CI runs each for
-one hour with a 16 KiB input cap, 2048 MiB RSS limit and 10-second timeout.
-`tests/resource_bounds.rs` pins allocation and CPU-proxy ceilings with a
-counting allocator. The separate fuzz crate uses dev-only `libfuzzer-sys` and
-`rand`; core dependencies and the sans-IO boundary are unchanged.
+public with typed `FrameTooLarge(usize)` rejections. The `libFuzzer` targets
+for packet decoding, engine input streams and sync frames live in
+[aoheyra-fuzz](https://github.com/aoheyra/aoheyra-fuzz), with a 16 KiB input
+cap, 2048 MiB RSS limit and 10-second timeout; no fuzz crate or workflow is
+kept in this repository. `tests/resource_bounds.rs` pins allocation and
+CPU-proxy ceilings with a counting allocator. Fuzz dev-only dependencies stay
+in aoheyra-fuzz; core dependencies and the sans-IO boundary are unchanged.
 MSH-29 adds versioned restart snapshots through the `Snapshot` trait on
 `MeshEngine`. A host stores the bytes and restores them into a fresh engine with
 the same config and RNG seed; seen-cache entries and eviction order, receipt
@@ -311,7 +319,7 @@ record: ADR-0005. Tests cover every pipeline step at unit level and
 authenticated delivery, duplicates, tampering and penalties at engine level;
 the simulator forwarding cases now deliver through this pipeline.
 
-Breaking unreleased API change: `MeshEngine::new` and `with_config` no longer
+Breaking API change before v0.1.0: `MeshEngine::new` and `with_config` no longer
 take a local `NodeId`; `MeshInput::Data` takes a borrowed `identity`;
 `NetworkAdapter::poll_event` and `next_event` take a borrowed `identity` per
 pump; `Neighbor` gained `rejected_packets`; `MeshConfig` gained `replay`.
@@ -337,20 +345,20 @@ peer's introduction before recording anything: a valid hello yields the
 derived `NodeId` on the neighbour, an invalid, oversize or
 version-incompatible one is dropped without an identity (the entry
 keeps counting traffic; only a full table releases the link).
-Breaking unreleased API change: `Neighbor` gained the public
+Breaking API change before v0.1.0: `Neighbor` gained the public
 `node_id: Option<NodeId>` field, and `NeighborTable::insert` is
 engine-internal with new `contains`/`has_room` admission checks.
 
 MSH-32 threads the host's monotonic network clock through the adapter:
 `NetworkAdapter::handle` and `apply` take `network_now: Duration` and pass it
 to every facade command that needs time (`send`, `broadcast`, `disconnect`).
-Breaking unreleased API change: those two methods gained the leading
+Breaking API change before v0.1.0: those two methods gained the leading
 `network_now` parameter.
 
 MSH-06 adds bounded per-link state, signed Submit commands, typed submission
 errors and the optional NetworkAdapter. No runtime dependency is added.
 
-Breaking unreleased API change: MeshInput now borrows submission identity and
+Breaking API change before v0.1.0: MeshInput now borrows submission identity and
 payload; MeshEngine::handle returns Result<Vec<MeshOutput>, MeshError>.
 Data is structurally counted, not authenticated or delivered. MSH-07/08/09
 remain separate work.
@@ -361,6 +369,6 @@ interface (`MSH-01`), configuration (`MSH-02`), the v1 packet codec
 (`MSH-03`), origin signatures with content-derived `msg_id` (`MSH-04`),
 and the bounded forwarding seen-cache (`MSH-05`, ADR-0003).
 
-Breaking API changes within the unreleased window: `Packet::new`
+Breaking API changes before v0.1.0: `Packet::new`
 takes the origin signature, and `Header.msg_id` is a `MessageId`
 rather than a raw byte array.

@@ -12,7 +12,7 @@ use crate::packet::{MSG_ID_LEN, MessageId, Packet};
 use crate::store::MessageStore;
 use ao_network::LinkId;
 use blake3::Hasher;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
 /// Number of message-id bytes in one compact summary entry.
 ///
@@ -1308,9 +1308,9 @@ impl SyncTracker {
         };
         match frame {
             SyncFrame::Digest(digest) => {
-                self.sessions
-                    .entry(link)
-                    .or_insert_with(|| SyncSession::new(now, self.config.timeout_ms, false));
+                if let Entry::Vacant(entry) = self.sessions.entry(link) {
+                    entry.insert(SyncSession::new(now, self.config.timeout_ms, false));
+                }
                 if digest == self.local_digest() {
                     return self.finish(link);
                 }

@@ -145,7 +145,7 @@ impl RouteHintTable {
     }
 
     /// The fresh hint for one destination, if any. A backwards `now` cannot
-    /// revive an entry whose local lifetime has passed.
+    /// revive an entry that has already been expired by `expire`.
     #[must_use]
     pub fn hint(&self, now: u64, destination: NodeId) -> Option<RouteHint> {
         let now = now.max(self.clock_floor_ms);

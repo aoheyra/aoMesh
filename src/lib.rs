@@ -32,8 +32,8 @@
 //! subscriptions stay local, relays keep no subscription state, and the
 //! channel key reuses MSH-10's bucket table and MSH-11's suppression. MSH-28
 //! bounds every decoder and host-supplied stream; `tests/resource_bounds.rs`
-//! and the `fuzz/` targets check those limits without changing the sans-IO
-//! core. MSH-29 snapshots the bounded seen-cache, immunity list and spray
+//! and the centralised aoheyra-fuzz targets check those limits without changing
+//! the sans-IO core. MSH-29 snapshots the bounded seen-cache, immunity list and spray
 //! tickets so a restart cannot re-relay traffic the node already handled.
 //! MSH-30 adds saturating counters and a versioned, content-free
 //! [`MeshSnapshot`] that the host can map into its diagnostics bundle without
