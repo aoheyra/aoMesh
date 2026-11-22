@@ -8,8 +8,8 @@ use crate::channel::{
 use crate::deliver;
 use crate::directory::{DirectoryChange, DirectoryError, NodeDirectory, NodeObservation};
 use crate::forward::{self, Action};
-use crate::linkhint::{HintChange, LinkHintObservation, LinkHintTable};
 use crate::hop::{HopFrameError, HopTracker, encode_control};
+use crate::linkhint::{HintChange, LinkHintObservation, LinkHintTable};
 use crate::neighbor::{MeshConfig, NeighborTable};
 use crate::observability::{MESH_SNAPSHOT_VERSION, MeshSnapshot, saturating_u32};
 use crate::presence::{self, PresenceError, PresenceTracker};
