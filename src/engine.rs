@@ -692,9 +692,6 @@ impl<R: RngCore> MeshEngine<R> {
                 let signing_pk = hello.map(|hello| hello.signing_pk);
                 self.neighbors
                     .insert(now, link, remote_hello, node_id, signing_pk);
-                if let Some(node) = node_id {
-                    self.link_hints.link_up(node, link);
-                }
                 let caps = hello.and_then(|hello| {
                     hello
                         .negotiate(crate::hello::PROTO, crate::hello::CAPS)
@@ -735,7 +732,6 @@ impl<R: RngCore> MeshEngine<R> {
                 self.receipt.link_down(link);
                 self.presence.link_down(link);
                 self.hints.link_down(link);
-                self.link_hints.link_down(link);
                 Ok(Vec::new())
             }
             MeshInput::Data {

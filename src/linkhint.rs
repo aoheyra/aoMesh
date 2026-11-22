@@ -98,18 +98,18 @@ pub(crate) enum HintChange {
 struct Entry {
     node: NodeId,
     contact: bool,
-    link: Option<LinkId>,
     preference: LinkHintPreference,
 }
 
 /// Deterministic, bounded advisory state. No radio commands are issued here.
+///
+/// Link identity is read from the bounded [`NeighborTable`] on every decision;
+/// this table never duplicates that state. A `LinkUp` that precedes the host
+/// fact therefore still applies, because the neighbour entry already exists.
 #[derive(Debug)]
 pub struct LinkHintTable {
     config: LinkHintConfig,
     entries: BTreeMap<PeerKey, Entry>,
-    /// Verified links by mesh identity. LinkUp can precede the host fact that
-    /// names the same identity, so the association must survive until then.
-    links: BTreeMap<NodeId, BTreeSet<LinkId>>,
     /// Number of SetLinkHint outputs emitted, for resource-bound tests and
     /// simulator diagnostics.
     sets: u64,
@@ -124,7 +124,6 @@ impl LinkHintTable {
         Self {
             config,
             entries: BTreeMap::new(),
-            links: BTreeMap::new(),
             sets: 0,
             clears: 0,
         }
@@ -163,39 +162,16 @@ impl LinkHintTable {
         (self.sets, self.clears)
     }
 
-    /// Records a verified link for the peer whose identity matches `node`.
-    pub(crate) fn link_up(&mut self, node: NodeId, link: LinkId) {
-        self.links.entry(node).or_default().insert(link);
-        for entry in self.entries.values_mut() {
-            if entry.node == node && entry.link.is_none() {
-                entry.link = Some(link);
-            }
-        }
-    }
-
-    /// Forgets the link associated with `link` without dropping the advice:
-    /// a peer that goes out of range may come back and should keep its
-    /// contact preference (NET-16 hints also survive range loss).
-    pub(crate) fn link_down(&mut self, link: LinkId) {
-        for links in self.links.values_mut() {
-            links.remove(&link);
-        }
-        self.links.retain(|_, links| !links.is_empty());
-        for entry in self.entries.values_mut() {
-            if entry.link == Some(link) {
-                entry.link = self
-                    .links
-                    .get(&entry.node)
-                    .and_then(|links| links.iter().next().copied());
-            }
-        }
-    }
-
     /// The verified link currently associated with `node`, if any.
-    fn link_for(&self, node: NodeId) -> Option<LinkId> {
-        self.links
-            .get(&node)
-            .and_then(|links| links.iter().next().copied())
+    ///
+    /// The neighbour table is the only owner of link state. Reading it here
+    /// keeps a fact that arrives after `LinkUp` consistent with one that
+    /// arrives before it, and bounds this map by `MeshConfig::max_neighbors`.
+    fn link_for(node: NodeId, neighbors: &NeighborTable) -> Option<LinkId> {
+        neighbors
+            .iter()
+            .find(|neighbor| neighbor.node_id == Some(node))
+            .map(|neighbor| neighbor.link)
     }
 
     /// Applies one host fact and returns the advice changes, in `PeerKey`
@@ -217,7 +193,7 @@ impl LinkHintTable {
             node,
             contact,
         } = observation;
-        let link = self.link_for(node);
+        let link = Self::link_for(node, neighbors);
         let old = self
             .entries
             .get(&peer)
@@ -225,11 +201,17 @@ impl LinkHintTable {
         let mut entry = Entry {
             node,
             contact,
-            link,
             preference: old,
         };
-        let preference =
-            Self::preference_for(now, &entry, &self.config, directory, neighbors, budgets);
+        let preference = Self::preference_for(
+            now,
+            &entry,
+            link,
+            &self.config,
+            directory,
+            neighbors,
+            budgets,
+        );
         // Do not spend a slot on a fact that yields no advice: a host may
         // flood revocations for peers it never recognised.
         if preference == LinkHintPreference::Neutral && !self.entries.contains_key(&peer) {
@@ -274,8 +256,16 @@ impl LinkHintTable {
         }
         let mut changes = Vec::new();
         for (&peer, entry) in &mut self.entries {
-            let preference =
-                Self::preference_for(now, entry, &self.config, directory, neighbors, budgets);
+            let link = Self::link_for(entry.node, neighbors);
+            let preference = Self::preference_for(
+                now,
+                entry,
+                link,
+                &self.config,
+                directory,
+                neighbors,
+                budgets,
+            );
             let old = entry.preference;
             entry.preference = preference;
             let change = Self::classify(old, preference);
@@ -314,20 +304,19 @@ impl LinkHintTable {
     fn preference_for(
         now: u64,
         entry: &Entry,
+        link: Option<LinkId>,
         config: &LinkHintConfig,
         directory: &NodeDirectory,
         neighbors: &NeighborTable,
         budgets: &BudgetTracker,
     ) -> LinkHintPreference {
-        if let Some(link) = entry.link {
-            if budgets.penalty_at(now, link) >= config.penalty_threshold {
-                return LinkHintPreference::Deprioritize;
-            }
+        if link.is_some_and(|link| budgets.penalty_at(now, link) >= config.penalty_threshold) {
+            return LinkHintPreference::Deprioritize;
         }
         if entry.contact
             || Self::adds_diversity(
                 now,
-                entry.link.is_some(),
+                link.is_some(),
                 entry.node,
                 config,
                 directory,
@@ -401,7 +390,7 @@ mod tests {
     use super::*;
     use crate::budget::BudgetConfig;
     use crate::directory::{DirectoryConfig, NodeObservation};
-    use ao_network::LinkHintPreference as Pref;
+    use ao_network::{AppHello, Hello, LinkHintPreference as Pref, LocalTag};
 
     fn table(max_peers: usize) -> LinkHintTable {
         LinkHintTable::new(LinkHintConfig {
@@ -417,6 +406,22 @@ mod tests {
 
     fn neighbors() -> NeighborTable {
         NeighborTable::new(4)
+    }
+
+    /// A linked neighbour, built through the same bounded table the engine
+    /// uses so the hint policy reads exactly the state it sees in production.
+    fn linked_neighbors(node: NodeId, link: LinkId) -> NeighborTable {
+        let mut table = neighbors();
+        let hello = Hello {
+            proto_min: 1,
+            proto_max: 1,
+            caps: 0,
+            max_frame: 16_384,
+            tag: LocalTag::new([0; 16]),
+            app_hello: AppHello::new(Vec::new()).expect("empty app hello fits"),
+        };
+        table.insert(0, link, hello, Some(node), None);
+        table
     }
 
     fn budgets() -> BudgetTracker {
@@ -497,23 +502,26 @@ mod tests {
         let _ = budget.penalize(0, link, 3);
         let mut table = table(2);
         let peer = PeerKey::new([5; 16]);
+        let node = NodeId::from_bytes([7; 16]);
         let _ = table.observe(
             0,
             LinkHintObservation {
                 peer,
-                node: NodeId::from_bytes([7; 16]),
+                node,
                 contact: true,
             },
             &directory(),
             &neighbors(),
             &budget,
         );
-        table.link_up(NodeId::from_bytes([7; 16]), link);
-        let changes = table.refresh(0, &directory(), &neighbors(), &budget);
+        // LinkUp precedes the next tick; the policy reads the linked state
+        // from the neighbour table rather than keeping a second copy.
+        let linked = linked_neighbors(node, link);
+        let changes = table.refresh(0, &directory(), &linked, &budget);
         assert_eq!(changes, vec![(peer, HintChange::Set(Pref::Deprioritize))]);
 
         let clean = budgets();
-        let changes = table.refresh(1, &directory(), &neighbors(), &clean);
+        let changes = table.refresh(1, &directory(), &linked, &clean);
         assert_eq!(changes, vec![(peer, HintChange::Set(Pref::Prefer))]);
     }
 
@@ -525,7 +533,7 @@ mod tests {
         let mut table = table(2);
         let node = NodeId::from_bytes([9; 16]);
         let peer = PeerKey::new([4; 16]);
-        table.link_up(node, LinkId::new(7));
+        let linked = linked_neighbors(node, LinkId::new(7));
         let advice = table.observe(
             0,
             LinkHintObservation {
@@ -534,7 +542,7 @@ mod tests {
                 contact: false,
             },
             &dir,
-            &neighbors(),
+            &linked,
             &budgets(),
         );
         assert!(advice.is_empty(), "an already linked peer adds no new path");
@@ -548,7 +556,7 @@ mod tests {
         let link = LinkId::new(11);
         let _ = budget.penalize(0, link, 3);
         let mut table = table(2);
-        table.link_up(node, link);
+        let linked = linked_neighbors(node, link);
 
         let advice = table.observe(
             0,
@@ -558,7 +566,7 @@ mod tests {
                 contact: true,
             },
             &directory(),
-            &neighbors(),
+            &linked,
             &budget,
         );
         assert_eq!(
