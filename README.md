@@ -328,7 +328,7 @@ keep their existing paths and no wire field changes.
 
 | Setting | Default | Why |
 |---|---|---|
-| Reference degree / copies | 4 / 3 | 50-node sweep: cancels 45% of transmissions without moving Direct delivery |
+| Reference degree / copies | 4 / 3 | 50-node sweep (seed `1297304013`): 43.51% fewer transmissions, Direct ratio unchanged |
 | Copy bounds | 1 to 6 configured; 2 on chains and Presence | Keeps degree-one paths forwarding; dense Broadcast floods keep the calibrated threshold |
 | Base delay | 60-140 ms, seeded | Long enough for neighbour copies, short enough for a contact |
 | Final delay | 20-600 ms, shrinking with degree | Dense groups decide sooner |

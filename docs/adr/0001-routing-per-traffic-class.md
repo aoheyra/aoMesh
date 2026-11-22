@@ -106,7 +106,7 @@ suppression table. No wire field changes.
 | Setting | Default | Reason |
 |---|---|---|
 | Pending entries | 1024 | Bounds memory while covering a contact's worth of distinct content |
-| Reference degree / copies | 4 / 3 | Calibrated by the 50-node sweep: 45.20% fewer transmissions, Direct ratio unchanged |
+| Reference degree / copies | 4 / 3 | Calibrated by the 50-node sweep (seed `1297304013`): 43.51% fewer transmissions, Direct ratio unchanged |
 | Copy bounds | 1 to 6 configured; 2 on chains and Presence | Sparse paths still forward; hostile or extreme degrees cannot mint unbounded work |
 | Base delay | 60-140 ms, seeded | Long enough for neighbour copies, short enough for a contact |
 | Final delay | 20-600 ms, shrinking with degree | Dense groups decide sooner without letting sparse groups relay blind |
@@ -123,9 +123,9 @@ already offered several chances. The two-link floor is kept only where it
 proves something: a chain relay with at most one other link, and every Presence
 announcement on a capability-gated link. Applying the floor to every flooded
 class also disabled the calibrated `min_k = 1` cancellations on dense Broadcast
-nodes, which cut MSH-11's measured saving to 14.58%. Scoping the floor by
-topology and class restores the saving without reopening the degree-one
-failure. The delay shrinks with degree for the same reason. The reference
+nodes: on seed `1297304013` the best parameter sweep reached only a 33.72%
+reduction against the required 40%. Scoping the floor by topology and class
+restores a measured 43.51% reduction without reopening the degree-one failure. The delay shrinks with degree for the same reason. The reference
 degree is four, calibrated by the 50-node sweep; bounds keep `k` and the delay
 finite for hostile degree claims. State is bounded at 1024 pending messages
 and evicted by earliest deadline. CI rechecks the fixed suppression scenario

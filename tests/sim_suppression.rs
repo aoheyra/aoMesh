@@ -6,11 +6,19 @@
 use ao_mesh::sim::{run, suppression_scenarios};
 
 #[test]
-fn suppression_reduces_transmissions_without_hurting_delivery() {
+fn suppression_seed_1297304013_cuts_flood_without_hurting_delivery() {
+    // FIX 38 regression seed: the pre-fix two-link floor on every flooded
+    // class capped this case at a 33.72% saving against the same 5801 flood.
     let scenario = suppression_scenarios()
         .into_iter()
         .next()
         .expect("suppression scenario is configured");
+    assert_eq!(
+        scenario.seed, 1_297_304_013,
+        "FIX 38 regression seed changed"
+    );
+    assert_eq!(scenario.nodes, 50);
+    assert_eq!(scenario.messages, 100);
     let mut ablation = scenario.clone();
     ablation.enforce_suppression = false;
     let suppressed = run(scenario.clone());
@@ -26,6 +34,15 @@ fn suppression_reduces_transmissions_without_hurting_delivery() {
     println!("transmission reduction: {reduction:.4}");
     println!("delivery suppressed={suppressed_ratio:.4} flooded={flooded_ratio:.4}");
 
+    assert_eq!(suppressed.seed, 1_297_304_013, "suppression seed changed");
+    assert_eq!(flooded.transmissions, 5801, "flood baseline changed");
+    assert_eq!(
+        suppressed.transmissions, 3277,
+        "FIX 38 scoped-floor transmission count changed"
+    );
+    assert_eq!(suppressed.delivered, 2);
+    assert_eq!(flooded.delivered, 2);
+    assert_eq!(suppressed.unique_receptions, 1479);
     assert!(
         reduction >= 0.40,
         "suppression only saved {:.1}% of transmissions",

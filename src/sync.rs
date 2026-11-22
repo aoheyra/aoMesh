@@ -12,7 +12,7 @@ use crate::packet::{MSG_ID_LEN, MessageId, Packet};
 use crate::store::MessageStore;
 use ao_network::LinkId;
 use blake3::Hasher;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
 /// Number of message-id bytes in one compact summary entry.
 ///
@@ -1308,9 +1308,8 @@ impl SyncTracker {
         };
         match frame {
             SyncFrame::Digest(digest) => {
-                if !self.sessions.contains_key(&link) {
-                    self.sessions
-                        .insert(link, SyncSession::new(now, self.config.timeout_ms, false));
+                if let Entry::Vacant(entry) = self.sessions.entry(link) {
+                    entry.insert(SyncSession::new(now, self.config.timeout_ms, false));
                 }
                 if digest == self.local_digest() {
                     return self.finish(link);
@@ -1408,11 +1407,7 @@ impl SyncTracker {
     }
 
     /// Sends host-provided items within the contact's byte budget.
-    pub(crate) fn on_offers<'a>(
-        &mut self,
-        link: LinkId,
-        offers: &[SyncOffer<'a>],
-    ) -> Vec<SyncAction> {
+    pub(crate) fn on_offers(&mut self, link: LinkId, offers: &[SyncOffer<'_>]) -> Vec<SyncAction> {
         if !self.config.enabled {
             return Vec::new();
         }
