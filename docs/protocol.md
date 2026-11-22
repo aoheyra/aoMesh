@@ -2,7 +2,9 @@
 
 Implemented by the `packet` module (MSH-03). Decision record:
 [ADR-0002](adr/0002-packet-wire-format.md). Traffic classes come from
-[ADR-0001](adr/0001-routing-per-traffic-class.md).
+[ADR-0001](adr/0001-routing-per-traffic-class.md). The `v0.1.0` release
+preparation documents these v1 formats without changing them; the defaults and
+baseline evidence are recorded in [the release notes](release-notes.md).
 
 ## Layout
 
@@ -698,7 +700,7 @@ paused `SimWorld` with fixed seeds, signed hellos, mobility and scripted
 contacts. It reports delivery ratio, latency, overhead, duplicate ratio, radio
 bytes and queue occupancy as CSV; the published seeds, numbers and regeneration
 commands are in the README section "Simulator harness and baseline". The
-nightly `sim` workflow fails on any directional regression against those
+daily `sim` workflow fails on any directional regression against those
 numbers, so protocol or routing changes must state their measured effect. See
 [the simulator baseline decision](adr/simulator-baseline.md) for the scenario
 and metric choices.
@@ -747,10 +749,11 @@ A delivery-path `debug_assert_eq!` that hostile input could reach in debug
 builds was replaced by a checked outcome; a rejection is still recorded, but a
 malformed packet cannot panic the process. `tests/resource_bounds.rs` pins
 allocation and CPU-proxy ceilings for decoders, summary streams, hostile engine
-Data streams and store quotas. The `fuzz/` crate adds `libFuzzer` targets for
-packet decoding, engine input streams and sync frames; nightly CI runs each for
-one hour with a 16 KiB maximum input, a 2048 MiB RSS limit and a 10-second
-per-input timeout. No one-hour campaign is part of local verification.
+Data streams and store quotas. The `libFuzzer` targets for packet decoding,
+engine input streams and sync frames live in
+[aoheyra-fuzz](https://github.com/aoheyra/aoheyra-fuzz) with their seeds,
+pinned revisions and weekly schedule; this repository keeps neither a fuzz
+crate nor a fuzz workflow. No fuzz campaign is part of local verification.
 ## Diagnostics snapshot (MSH-30)
 
 `MeshSnapshot` is host-local plain data, not a wire message. Its `version`

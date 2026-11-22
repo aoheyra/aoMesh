@@ -75,12 +75,16 @@ Release profile, stable Rust, fixed seeds from `baseline_scenarios()`:
 
 | Scenario | Seed | Delivered / submitted | Delivery ratio | Overhead | Mean / max latency (ms) | Radio bytes | Peak queued bytes |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `line-20` | 1297303584 | 20 / 20 | 1.0000 | 9.6500 | 730 / 1200 | 102065 | 550 |
-| `waypoint-50` | 1297303632 | 29 / 50 | 0.5800 | 135.8966 | 506 / 1200 | 1537858 | 11394 |
-| `community-100` | 1297303652 | 74 / 80 | 0.9250 | 328.5541 | 713 / 1200 | 10917151 | 32814 |
-| `scripted-200` | 1297303752 | 100 / 100 | 1.0000 | 34.5500 | 561 / 1200 | 1536915 | 6600 |
+| `line-20` | 1297303584 | 20 / 20 | 1.0000 | 9.6500 | 727 / 1200 | 102065 | 550 |
+| `waypoint-50` | 1297303632 | 31 / 50 | 0.6200 | 125.7742 | 551 / 1200 | 2080893 | 12375 |
+| `community-100` | 1297303652 | 75 / 80 | 0.9375 | 328.7067 | 676 / 1200 | 13031341 | 33290 |
+| `scripted-200` | 1297303752 | 100 / 100 | 1.0000 | 34.5500 | 561 / 1200 | 1850727 | 6600 |
 
-Every scenario has zero send failures and zero duplicate deliveries.
+Every scenario has zero send failures and zero duplicate deliveries. These are
+the rows carried by the `v0.1.0` tag and by the README; a
+`release_docs::published_baseline_matches_readme_and_adr` test keeps the three
+copies identical. Regenerate them with
+`cargo run --release --features sim --example sim_report -- baselines.csv`.
 
 MSH-19 adds one separate scenario rather than changing the four gates above.
 `presence_scenarios()` uses seed `1297304021` on a static 50-node circulant

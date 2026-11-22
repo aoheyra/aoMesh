@@ -6,6 +6,12 @@
 
 Cargo package name: `ao_mesh`.
 
+## Documentation reference
+
+The baseline evidence, public defaults and parameter references intended for
+`v0.1.0` are recorded in [the release notes](docs/release-notes.md). aoMesh is
+pre-alpha and untagged; sibling git sources must match exactly.
+
 ---
 
 ## Where this crate sits
@@ -438,7 +444,7 @@ cargo test --release --all-features --test sim_baseline
 ```
 
 The first command prints the CSV; the second writes it to a file. The third
-enforces the published thresholds and fails on a regression; the nightly
+enforces the published thresholds and fails on a regression; the daily
 workflow in `.github/workflows/sim.yml` runs both. Bounds are directional:
 higher delivery and lower overhead, latency, duplicates, radio bytes and peak
 queue occupancy pass. `tests/sim_baseline.rs` records the exact gate values.
@@ -456,7 +462,7 @@ Published baseline (Rust stable, release profile, fixed seeds):
 
 | Scenario | Nodes | Seed | Delivered / submitted | Delivery ratio | Overhead | Mean / max latency (ms) | Radio bytes | Peak queued bytes |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| `line-20` | 20 | 1297303584 | 20 / 20 | 1.0000 | 9.6500 | 730 / 1200 | 102065 | 550 |
+| `line-20` | 20 | 1297303584 | 20 / 20 | 1.0000 | 9.6500 | 727 / 1200 | 102065 | 550 |
 | `waypoint-50` | 50 | 1297303632 | 31 / 50 | 0.6200 | 125.7742 | 551 / 1200 | 2080893 | 12375 |
 | `community-100` | 100 | 1297303652 | 75 / 80 | 0.9375 | 328.7067 | 676 / 1200 | 13031341 | 33290 |
 | `scripted-200` | 200 | 1297303752 | 100 / 100 | 1.0000 | 34.5500 | 561 / 1200 | 1850727 | 6600 |
@@ -488,7 +494,7 @@ Performance claims are measured in the simulator harness (MSH-27), never asserte
 - Reverse-path hints: fresh-path mean latency drops from 356 ms to 337 ms on the seeded random-20 case with transmissions unchanged at 230; the additive alternative used 231 (see above).
 - Sync v2: bytes per contact drop measurably against v1 for stores of 1000+ messages.
 
-Metrics: delivery ratio, latency, overhead (transmissions per delivery), duplicate ratio, buffer occupancy. Reports are CSV (see the [MSH-27 baseline](#simulator-harness-and-baseline-msh-27)); nightly CI enforces thresholds and fails on regression.
+Metrics: delivery ratio, latency, overhead (transmissions per delivery), duplicate ratio, buffer occupancy. Reports are CSV (see the [MSH-27 baseline](#simulator-harness-and-baseline-msh-27)); the daily simulator workflow enforces thresholds and fails on regression.
 
 ## Features
 
