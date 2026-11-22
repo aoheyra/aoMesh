@@ -89,7 +89,7 @@ Lifetimes, TTLs, copy counts and budgets are **defaults with documented reasons*
    aoNetwork  (NetworkEvent in, actions out)      aoIdents (sign, open, replay)
 ```
 
-**Engine inputs:** `LinkUp`, `LinkDown`, `Data`, `Tick`, `Submit`, `SubmitTelemetry`, `KnownCards`, `ObserveNode`, `StoreSummary`, `SyncItems`, `ChannelSubscribe`, `ChannelUnsubscribe`, `HopControl`, `HopReady`. **Outputs:** `Send`, `Broadcast`, `TelemetrySend`, `TelemetryBroadcast`, `Release`, `Deliver`, `ChannelDeliver`, `SetHello`, `SetBeacon`, `SyncNeed`, `SyncItem`, `ReleaseOpportunistic`, `Purge`, `Delivered`, `CardFetch`, `DirectoryChanged`.
+**Engine inputs:** `LinkUp`, `LinkDown`, `Data`, `Tick`, `Submit`, `SubmitTelemetry`, `SetRelayWilling`, `KnownCards`, `ObserveNode`, `StoreSummary`, `SyncItems`, `ChannelSubscribe`, `ChannelUnsubscribe`, `HopControl`, `HopReady`. **Outputs:** `Send`, `Broadcast`, `TelemetrySend`, `TelemetryBroadcast`, `Release`, `Deliver`, `ChannelDeliver`, `SetHello`, `SetBeacon`, `SyncNeed`, `SyncItem`, `ReleaseOpportunistic`, `Purge`, `Delivered`, `CardFetch`, `DirectoryChanged`.
 
 ### Engine and adapter (MSH-06)
 
@@ -124,6 +124,13 @@ longer matches its `msg_id`) is dropped. A candidate only becomes
 seal's sender matches `origin`, the origin signature verifies and the replay
 guard accepts. Refusals and forged content addresses are counted against the
 sending neighbour.
+
+`MeshInput::SetRelayWilling { willing }` is the APP-11 policy seam and defaults
+to `true`. While it is `false`, the engine still parses, delivers and receipts
+neighbour traffic, but withholds `Send`, `Broadcast`, telemetry forwards and
+`SyncItem` outputs for packets this node did not originate. Local `Submit` and
+`SubmitTelemetry` are unaffected, and toggling refreshes `SetBeacon` so
+`BeaconFlags::relay_willing` matches the enforced policy.
 
 With feature `adapter`, `NetworkAdapter` owns the facade and engine in one
 caller task. Every output variant maps to a network command or host event;

@@ -1598,3 +1598,110 @@ fn the_origin_never_rerelays_a_copy_of_its_own_submission() {
         1
     );
 }
+
+#[test]
+fn non_relay_still_delivers_neighbour_traffic_without_forwarding_it() {
+    let mut e = engine(3);
+    for id in 1..=3u64 {
+        e.handle(
+            id,
+            MeshInput::LinkUp {
+                link: LinkId::new(id),
+                remote_hello: hello(),
+            },
+        )
+        .unwrap();
+    }
+    e.handle(10, MeshInput::SetRelayWilling { willing: false })
+        .unwrap();
+    assert!(!e.relay_willing());
+
+    let wire = sealed_with(
+        PacketClass::Direct,
+        |h| h.dst = Some(*LOCAL.node_id().as_bytes()),
+        b"hello",
+    );
+    let outputs = e
+        .handle(
+            20,
+            MeshInput::Data {
+                link: LinkId::new(1),
+                channel: Channel::Message,
+                payload: &wire,
+                identity: &LOCAL,
+            },
+        )
+        .unwrap();
+    assert_eq!(outputs.len(), 1, "{outputs:?}");
+    assert!(matches!(outputs[0], MeshOutput::Deliver { .. }));
+
+    // The same policy is reversible without rebuilding the engine.
+    e.handle(30, MeshInput::SetRelayWilling { willing: true })
+        .unwrap();
+    assert!(e.relay_willing());
+}
+
+#[test]
+fn non_relay_still_originates_local_submissions() {
+    let mut e = engine(3);
+    for id in 1..=2u64 {
+        e.handle(
+            id,
+            MeshInput::LinkUp {
+                link: LinkId::new(id),
+                remote_hello: hello(),
+            },
+        )
+        .unwrap();
+    }
+    e.handle(10, MeshInput::SetRelayWilling { willing: false })
+        .unwrap();
+
+    let outputs = e
+        .handle(
+            20,
+            MeshInput::Submit {
+                identity: &LOCAL,
+                header: header(PacketClass::Direct, 4),
+                payload: b"ping",
+                via: None,
+            },
+        )
+        .unwrap();
+    assert!(
+        outputs.iter().any(|output| matches!(
+            output,
+            MeshOutput::Send { .. } | MeshOutput::Broadcast { .. }
+        )),
+        "own submissions must still leave the node: {outputs:?}"
+    );
+}
+
+#[test]
+fn relay_toggle_updates_the_advertised_beacon_flag() {
+    let mut e = engine(1);
+    assert!(
+        e.handle(0, MeshInput::StoreSummary { ids: &[] })
+            .unwrap()
+            .is_empty()
+    );
+    let published = e.handle(200, MeshInput::StoreSummary { ids: &[] }).unwrap();
+    let MeshOutput::SetBeacon { digest, flags, .. } = &published[0] else {
+        panic!("expected a published beacon, {published:?}");
+    };
+    assert!(flags.relay_willing);
+
+    let updated = e
+        .handle(201, MeshInput::SetRelayWilling { willing: false })
+        .unwrap();
+    let MeshOutput::SetBeacon {
+        digest: updated_digest,
+        flags: updated_flags,
+        ..
+    } = &updated[0]
+    else {
+        panic!("expected a refreshed beacon, {updated:?}");
+    };
+    assert_eq!(digest, updated_digest);
+    assert!(!updated_flags.relay_willing);
+}

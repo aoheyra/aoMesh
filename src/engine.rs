@@ -172,6 +172,14 @@ pub enum MeshInput<'a> {
         /// A selected neighbour, or all current neighbours.
         via: Option<LinkId>,
     },
+    /// Sets whether this node forwards packets received from other nodes
+    /// (APP-11). Local [`Self::Submit`] and [`Self::SubmitTelemetry`] traffic
+    /// is unaffected. The next beacon advertisement carries the new flag.
+    SetRelayWilling {
+        /// `true` restores normal relaying; `false` withholds onward copies
+        /// of neighbour traffic while local delivery and receipts continue.
+        willing: bool,
+    },
     /// Declares a local public-channel subscription by name.
     ///
     /// Subscription is a host/UI concern: relays forward channel packets
@@ -413,6 +421,9 @@ pub struct MeshEngine<R: RngCore> {
     clock_restore_ready: bool,
     rng: R,
     config: MeshConfig,
+    /// Whether received packets may be forwarded (APP-11). Local submissions
+    /// are never withheld by this policy.
+    relay_willing: bool,
     neighbors: NeighborTable,
     seen: SeenCache,
     replay: ReplayGuard,
@@ -451,6 +462,7 @@ impl<R: RngCore> MeshEngine<R> {
             clock_restore_ready: true,
             rng,
             config,
+            relay_willing: true,
             neighbors: NeighborTable::new(config.max_neighbors),
             seen: SeenCache::new(config.seen),
             replay: ReplayGuard::new(config.replay),
@@ -542,6 +554,10 @@ impl<R: RngCore> MeshEngine<R> {
     /// Digest currently advertised in the beacon, if one was published.
     pub fn published_store_digest(&self) -> Option<[u8; 4]> {
         self.beacon.published_digest()
+    }
+    /// Whether this node currently forwards received packets (APP-11).
+    pub const fn relay_willing(&self) -> bool {
+        self.relay_willing
     }
     /// Read-only anti-entropy state (MSH-14).
     pub fn sync(&self) -> &SyncTracker {
@@ -666,8 +682,23 @@ impl<R: RngCore> MeshEngine<R> {
     /// (MSH-13). Submission errors are typed and the caller still owns
     /// the input bytes.
     pub fn handle(&mut self, now: u64, input: MeshInput<'_>) -> Result<Vec<MeshOutput>, MeshError> {
+        // Timer-driven sends and sync responses carry traffic this node
+        // accepted earlier. A relay-off node must withhold them too, not just
+        // the direct response to the current neighbour packet.
+        let relay_scope = match &input {
+            MeshInput::Data { identity, .. } | MeshInput::Tick { identity, .. } => {
+                Some(identity.node_id())
+            }
+            MeshInput::SyncItems { .. } => None,
+            _ => None,
+        };
+        let filter_relays = !self.relay_willing
+            && matches!(
+                &input,
+                MeshInput::Data { .. } | MeshInput::Tick { .. } | MeshInput::SyncItems { .. }
+            );
         self.clock_restore_ready = false;
-        match input {
+        let outputs = match input {
             MeshInput::ObserveLinkHint { observation } => {
                 let mut outputs = Vec::new();
                 for (peer, change) in self.link_hints.observe(
@@ -700,21 +731,22 @@ impl<R: RngCore> MeshEngine<R> {
                 }
                 Ok(self.take_directory_changes())
             }
+            MeshInput::SetRelayWilling { willing } => {
+                self.relay_willing = willing;
+                Ok(self
+                    .beacon
+                    .published_digest()
+                    .map(|digest| self.beacon_output(digest))
+                    .into_iter()
+                    .collect())
+            }
             MeshInput::StoreSummary { ids } => {
                 let digest = StoreSummary::from_ids(ids).digest();
                 self.sync.set_local(ids);
                 Ok(self
                     .beacon
                     .observe(now, digest)
-                    .map(|digest| MeshOutput::SetBeacon {
-                        hint: self.config.summary.beacon_hint,
-                        digest,
-                        flags: BeaconFlags {
-                            accepting: true,
-                            relay_willing: true,
-                            low_battery: false,
-                        },
-                    })
+                    .map(|digest| self.beacon_output(digest))
                     .into_iter()
                     .collect())
             }
@@ -1588,6 +1620,50 @@ impl<R: RngCore> MeshEngine<R> {
                     .map_err(MeshError::Channel)?;
                 Ok(Vec::new())
             }
+        }?;
+        Ok(if filter_relays {
+            outputs
+                .into_iter()
+                .filter(|output| !Self::is_foreign_relay_output(output, relay_scope))
+                .collect()
+        } else {
+            outputs
+        })
+    }
+
+    fn beacon_output(&self, digest: [u8; 4]) -> MeshOutput {
+        MeshOutput::SetBeacon {
+            hint: self.config.summary.beacon_hint,
+            digest,
+            flags: BeaconFlags {
+                accepting: true,
+                relay_willing: self.relay_willing,
+                low_battery: false,
+            },
+        }
+    }
+
+    /// True for an output that carries another node's packet onward while
+    /// this node is configured as a non-relay. Receipts and local submissions
+    /// are not relays; both keep their origin in the encoded packet.
+    fn is_foreign_relay_output(output: &MeshOutput, local: Option<NodeId>) -> bool {
+        if matches!(output, MeshOutput::SyncItem { .. }) {
+            return true;
+        }
+        let payload = match output {
+            MeshOutput::Send { payload, .. }
+            | MeshOutput::Broadcast { payload, .. }
+            | MeshOutput::TelemetrySend { payload, .. }
+            | MeshOutput::TelemetryBroadcast { payload, .. } => payload,
+            _ => return false,
+        };
+        if payload.first() == Some(&crate::receipt::RECEIPT_MAGIC) {
+            return false;
+        }
+        match local {
+            None => true,
+            Some(local) => Packet::decode(payload)
+                .map_or(true, |packet| packet.header.origin != *local.as_bytes()),
         }
     }
 
