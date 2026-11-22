@@ -42,6 +42,21 @@ exported conformance suite checks that a fetched value survives store mutation
 and is also run against a row-backed test store. A new tag is still required
 before aoheyra APP-05 can consume this seam.
 
+MSH-25 adds bounded advisory neighbour link hints. `MeshInput::ObserveLinkHint`
+carries an opaque `PeerKey`, its associated `NodeId` and a contact flag; the
+engine emits `MeshOutput::SetLinkHint` / `ClearLinkHint`, which the adapter maps
+to aoNetwork's real `set_link_hint` / `clear_link_hint`. Contacts and directory
+diversity are preferred, penalties deprioritise, and eviction matches
+aoNetwork's deterministic rule. aoNetwork alone forms links and enforces the
+degree cap; no wire format changes. `MeshConfig` gains a `link_hints:
+LinkHintConfig` field and `MeshEngine::link_hints()` exposes read-only state.
+New host seams are `MeshInput::ObserveLinkHint`, `MeshOutput::SetLinkHint` and
+`MeshOutput::ClearLinkHint`. Four paired fixed-seed runs (1297303701 through
+1297303704) link 12 of 12 recognised contacts within one second against 0 of 12
+with hints off, with identical delivery, latency, transmissions and overhead.
+`tests/linkhint.rs`, `tests/adapter.rs` and `tests/sim_linkhint.rs` cover the
+policy, the real facade and the measured rows.
+
 MSH-19 adds bounded presence announcements. An ordinary signed `Presence`
 packet carries a fixed 150-byte body with the origin's card hash, capabilities,
 sequence and existing public identity, so every relay can verify the binding

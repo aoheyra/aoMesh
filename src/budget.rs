@@ -241,6 +241,24 @@ impl NeighborBudget {
         }
     }
 
+    /// Penalty after elapsed decay, without mutating this neighbour. The
+    /// advisory link policy reads it on a Tick, while enforcement only decays
+    /// when another packet actually arrives.
+    fn decayed_penalty(&self, now: u64, config: &BudgetConfig) -> (u32, u64) {
+        if config.penalty_decay_ms == 0 || now <= self.penalty_at_ms {
+            return (self.penalty, self.penalty_at_ms);
+        }
+        let steps = (now - self.penalty_at_ms) / config.penalty_decay_ms;
+        let decay = steps
+            .saturating_mul(config.penalty_decay as u64)
+            .min(u32::MAX as u64) as u32;
+        (
+            self.penalty.saturating_sub(decay),
+            self.penalty_at_ms
+                .saturating_add(steps.saturating_mul(config.penalty_decay_ms)),
+        )
+    }
+
     fn buckets(
         &mut self,
         now: u64,
@@ -496,16 +514,9 @@ impl BudgetTracker {
             .neighbors
             .entry(link)
             .or_insert_with(|| NeighborBudget::new(now));
-        if self.config.penalty_decay_ms > 0 && now > neighbor.penalty_at_ms {
-            let steps = (now - neighbor.penalty_at_ms) / self.config.penalty_decay_ms;
-            let decay = steps
-                .saturating_mul(self.config.penalty_decay as u64)
-                .min(u32::MAX as u64) as u32;
-            neighbor.penalty = neighbor.penalty.saturating_sub(decay);
-            neighbor.penalty_at_ms = neighbor
-                .penalty_at_ms
-                .saturating_add(steps.saturating_mul(self.config.penalty_decay_ms));
-        }
+        let (decayed, decayed_at) = neighbor.decayed_penalty(now, &self.config);
+        neighbor.penalty = decayed;
+        neighbor.penalty_at_ms = decayed_at;
         neighbor.penalty = neighbor.penalty.saturating_add(amount);
         if amount > 0 {
             self.penalty_events.add(1);
@@ -532,6 +543,14 @@ impl BudgetTracker {
         self.neighbors
             .get(&link)
             .map_or(0, |neighbor| neighbor.penalty)
+    }
+
+    /// Penalty after elapsed decay, for advisory policy that must recover
+    /// without waiting for another packet from the neighbour.
+    pub(crate) fn penalty_at(&self, now: u64, link: LinkId) -> u32 {
+        self.neighbors
+            .get(&link)
+            .map_or(0, |neighbor| neighbor.decayed_penalty(now, &self.config).0)
     }
 
     /// Saturating number of penalty applications (MSH-30). Zero-amount calls

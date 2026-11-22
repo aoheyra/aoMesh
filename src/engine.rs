@@ -8,6 +8,7 @@ use crate::channel::{
 use crate::deliver;
 use crate::directory::{DirectoryChange, DirectoryError, NodeDirectory, NodeObservation};
 use crate::forward::{self, Action};
+use crate::linkhint::{HintChange, LinkHintObservation, LinkHintTable};
 use crate::neighbor::{MeshConfig, NeighborTable};
 use crate::observability::{MESH_SNAPSHOT_VERSION, MeshSnapshot, saturating_u32};
 use crate::presence::{self, PresenceError, PresenceTracker};
@@ -24,7 +25,10 @@ use crate::{
     Header, MessageId, Packet, PacketClass, PacketError, sign_packet, verify_origin_with_signing_pk,
 };
 use ao_idents::{IdentError, Identity, NodeId, ReplayGuard, Signature};
-use ao_network::{AppHello, BeaconFlags, Channel, DisconnectReason, Hello, LinkId, LocalTag};
+use ao_network::{
+    AppHello, BeaconFlags, Channel, DisconnectReason, Hello, LinkHintPreference, LinkId, LocalTag,
+    PeerKey,
+};
 use rand_core::RngCore;
 use std::collections::BTreeSet;
 
@@ -95,6 +99,18 @@ pub enum MeshInput<'a> {
         /// The host's complete known-hash set, bounded by
         /// [`crate::PresenceConfig::max_known_cards`].
         hashes: &'a [[u8; 8]],
+    },
+    /// Record one advisory link fact for an unlinked radio peer (MSH-25).
+    ///
+    /// The host maps a recognised contact tag (or another peer it wants the
+    /// mesh to reach) to aoNetwork's opaque `PeerKey` and supplies the mesh
+    /// identity it associates with that peer. The engine combines it with
+    /// directory diversity and MSH-10 penalties and emits at most one
+    /// [`MeshOutput::SetLinkHint`] or [`MeshOutput::ClearLinkHint`].
+    /// aoNetwork alone decides whether to form a link and enforces its cap.
+    ObserveLinkHint {
+        /// The fact to record.
+        observation: LinkHintObservation,
     },
     /// Record one typed presence fact in the node directory (MSH-20).
     ///
@@ -236,6 +252,22 @@ pub enum MeshOutput {
         /// Opaque mesh introduction.
         app_hello: AppHello,
     },
+    /// Advise aoNetwork to dial `peer` sooner (MSH-25).
+    ///
+    /// This is advisory only: it changes candidate ordering and skips
+    /// aoNetwork's initiation delay, never its admission floor or degree cap.
+    SetLinkHint {
+        /// Opaque radio peer the advice refers to.
+        peer: PeerKey,
+        /// Preference to install.
+        preference: LinkHintPreference,
+    },
+    /// Withdraw advice for `peer` (MSH-25), restoring aoNetwork's ordinary
+    /// candidate ordering.
+    ClearLinkHint {
+        /// Opaque radio peer whose advice is withdrawn.
+        peer: PeerKey,
+    },
     /// Replace mesh-owned beacon fields.
     SetBeacon {
         /// Discovery hint.
@@ -369,6 +401,7 @@ pub struct MeshEngine<R: RngCore> {
     presence: PresenceTracker,
     directory: NodeDirectory,
     hints: RouteHintTable,
+    link_hints: LinkHintTable,
     telemetry: TelemetryTracker,
     channels: ChannelRules,
 }
@@ -405,6 +438,7 @@ impl<R: RngCore> MeshEngine<R> {
             presence: PresenceTracker::new(config.presence),
             directory: NodeDirectory::new(config.directory),
             hints: RouteHintTable::new(config.route_hint),
+            link_hints: LinkHintTable::new(config.link_hints),
             telemetry: TelemetryTracker::new(config.telemetry),
             channels: ChannelRules::new(config.channels),
         }
@@ -447,6 +481,15 @@ impl<R: RngCore> MeshEngine<R> {
     /// path; hosts may inspect it for diagnostics. No hint is a wire field.
     pub fn route_hints(&self) -> &RouteHintTable {
         &self.hints
+    }
+    /// Read-only advisory link-hint state (MSH-25).
+    ///
+    /// The simulator and hosts use this to verify that advice stayed within
+    /// its configured bound. Advice is never a radio command: aoNetwork owns
+    /// link formation and the degree cap.
+    #[must_use]
+    pub fn link_hints(&self) -> &LinkHintTable {
+        &self.link_hints
     }
     /// The Telemetry policy a host must mirror in NET-21 (MSH-22).
     ///
@@ -537,6 +580,19 @@ impl<R: RngCore> MeshEngine<R> {
     pub fn handle(&mut self, now: u64, input: MeshInput<'_>) -> Result<Vec<MeshOutput>, MeshError> {
         self.clock_restore_ready = false;
         match input {
+            MeshInput::ObserveLinkHint { observation } => {
+                let mut outputs = Vec::new();
+                for (peer, change) in self.link_hints.observe(
+                    now,
+                    observation,
+                    &self.directory,
+                    &self.neighbors,
+                    &self.budgets,
+                ) {
+                    outputs.extend(Self::link_hint_outputs(peer, change));
+                }
+                Ok(outputs)
+            }
             MeshInput::ObserveNode { observation } => {
                 let node = observation.node;
                 let via = observation.via;
@@ -589,6 +645,14 @@ impl<R: RngCore> MeshEngine<R> {
                 self.receipt.expire(now);
                 self.hints.expire(now);
                 self.telemetry.expire(now);
+                // Penalties decay and directory facts expire on ticks; both
+                // can change the advisory preference of an existing peer.
+                for (peer, advice) in
+                    self.link_hints
+                        .refresh(now, &self.directory, &self.neighbors, &self.budgets)
+                {
+                    outputs.extend(Self::link_hint_outputs(peer, advice));
+                }
                 let actions = self.sync.expire(now);
                 outputs.extend(self.apply_sync_actions(now, actions));
                 outputs.extend(self.presence_tick(now, identity, card_hash)?);
@@ -1992,6 +2056,16 @@ impl<R: RngCore> MeshEngine<R> {
             }]
         } else {
             Vec::new()
+        }
+    }
+
+    /// Translates one advisory change into an output. `Clear` means the peer
+    /// lost its advice and aoNetwork must fall back to its own rules.
+    fn link_hint_outputs(peer: PeerKey, change: HintChange) -> Vec<MeshOutput> {
+        match change {
+            HintChange::Set(preference) => vec![MeshOutput::SetLinkHint { peer, preference }],
+            HintChange::Clear => vec![MeshOutput::ClearLinkHint { peer }],
+            HintChange::Unchanged => Vec::new(),
         }
     }
 }

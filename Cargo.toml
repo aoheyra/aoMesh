@@ -96,3 +96,7 @@ required-features = ["sim"]
 [[example]]
 name = "observability_report"
 required-features = ["sim"]
+
+[[example]]
+name = "linkhint_report"
+required-features = ["sim"]
