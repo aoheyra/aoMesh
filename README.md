@@ -340,14 +340,14 @@ keep their existing paths and no wire field changes.
 The fixed mixed case in `tests/sim_suppression.rs` submits 100 messages on a
 seeded 50-node random graph (seed `1297304013`), every tenth one a sealed
 Direct canary and the rest Broadcast from one origin. With suppression,
-transmissions fall from 5801 to 3316 (42.84%) while the Direct delivery ratio
+transmissions fall from 5801 to 3277 (43.51%) while the Direct delivery ratio
 stays at 0.2000 (2/10) in both runs. Unique Broadcast receptions fall from
-2197 to 1456, which is reported as a diagnostic: cancelling relays does
+2197 to 1479, which is reported as a diagnostic: cancelling relays does
 shorten a flood's reach, and that cost is not counted as a delivery-ratio
 improvement. MSH-10 admission gates suppression, so a denied packet starts no
 timer. The four published MSH-27 baselines are unchanged because they carry no
-flooded classes. The two-copy floor applies to every flooded class and is
-covered by a unit regression; CI rechecks the suppression scenario without
+flooded classes. The two-copy floor on chain relays and Presence is covered by
+unit and pipeline regressions; CI rechecks the suppression scenario without
 lowering its thresholds.
 
 ### Presence announcements (MSH-19)
@@ -480,7 +480,7 @@ release runs produced identical metrics. No aoMesh routing code changed.
 
 Performance claims are measured in the simulator harness (MSH-27), never asserted:
 
-- Counter-based suppression: 45.20% fewer transmissions than naive flooding on the seeded 50-node graph, Direct delivery ratio unchanged at 0.2000 (see above).
+- Counter-based suppression: 43.51% fewer transmissions than naive flooding on the seeded 50-node graph, Direct delivery ratio unchanged at 0.2000 (see above).
 - Presence: all 49 peers learned within 50 ms on the seeded 50-node circulant, with a 15,480 B/h per-source steady refresh against a 64 KiB/h budget (see above).
 - Spray-and-wait: delivery close to epidemic routing at a fraction of the transmissions under mobility.
 - Reverse-path hints: fresh-path mean latency drops from 356 ms to 337 ms on the seeded random-20 case with transmissions unchanged at 230; the additive alternative used 231 (see above).
@@ -952,7 +952,7 @@ within_broadcast_budget`. Its exact row is:
 Both in-range subscribers receive the message; no other node does. Twelve
 one-link transmissions carry 3,048 bytes against the 43,690-byte Broadcast
 burst allowance from ADR-0001. This row was remeasured after rebasing onto
-MSH-22: MSH-19's two-link suppression floor makes each line relay forward once,
+MSH-22: the two-link suppression floor kept for chain relays makes each line relay forward once,
 replacing the old two-transmission expectation from the pre-MSH-19 tree.
 Reachability and the budget gate are unchanged, and no published MSH-27
 threshold was lowered. The four published MSH-27 baselines are unchanged.
@@ -1036,11 +1036,12 @@ are injected from node 0 after traffic starts. The measured report row is:
 
 | Scenario | Seed | Submitted / delivered | Duplicates | Suppressed | Store ids | Sync bytes sent / received | Penalty events | Seen / pending |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| `observability-mixed-20` | 1297304021 | 40 / 6 | 323 | 120 | 88 | 820 / 820 | 4 | 552 / 0 |
+| `observability-mixed-20` | 1297304021 | 40 / 6 | 321 | 166 | 88 | 820 / 820 | 4 | 547 / 0 |
 
-The row was remeasured on the accumulated MSH-19 stack: the two-distinct-link
-suppression floor changed which relays cancel a flood, so it is not comparable
-to the original 367/193/89/512/7 measurement. No MSH-27 threshold was lowered.
+The row was remeasured after FIX 38 scoped the two-link suppression floor to
+chain relays and Presence, so it is comparable neither to the original
+367/193/89/512/7 measurement nor to the intermediate 323/120/88/512/7 row.
+No MSH-27 threshold was lowered.
 Current penalties are zero at the end because scores decay after the four
 events; `neighbour_penalty_events` is the durable evidence that the hostile
 neighbour was accounted for. `tests/sim_observability.rs` locks every value,

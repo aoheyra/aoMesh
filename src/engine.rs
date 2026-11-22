@@ -1190,10 +1190,11 @@ impl<R: RngCore> MeshEngine<R> {
                             .iter()
                             .filter(|neighbor| neighbor.node_id.is_some() && neighbor.link != link)
                             .count();
-                        let threshold = self
-                            .config
-                            .suppression
-                            .copy_threshold_for(class, degree, &mut self.rng);
+                        let threshold = self.config.suppression.copy_threshold_for(
+                            class,
+                            degree,
+                            &mut self.rng,
+                        );
                         let deadline_ms = now.saturating_add(
                             self.config
                                 .suppression
