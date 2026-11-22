@@ -628,7 +628,9 @@ encoded packet with `MeshInput::SyncItems`.
 Incoming `SyncItem` events carry complete encoded packets for the host to
 insert; the engine verifies bounds, the content address and the storable class,
 while final signature verification and insertion policy stay with the store
-owner. Telemetry is never synced.
+owner. Telemetry is never synced. Host backends report locking, I/O and row
+failures through `StoreError::Backend`, which carries a typed operation and an
+optional numeric code without leaking a backend error type.
 
 | Setting | Default | Why |
 |---|---|---|
