@@ -1,8 +1,12 @@
 # Local development with sibling crates
 
-`ao_mesh` consumes `ao_network` and `ao_idents` from git. Until the `v0.1.0`
-tags exist (MSH-31 / NET-27) the dependency points at `master`; after that
-Cargo.toml pins `tag = "v0.1.0"`.
+`ao_mesh` consumes `ao_network` and `ao_idents` as untagged git sources on
+their default branches. There are no release tags yet; the first release tags
+start at `v0.1.0` (MSH-31 / NET-27), and all crates will adopt them together
+when they are cut. Cargo treats a tagged source as a different identity from
+an untagged one, so a downstream crate that depends on these siblings directly
+must use the same untagged URLs as aoMesh. Otherwise the seam gets duplicate
+`Identity`, `LinkId` and `NodeId` Rust types.
 
 To work on the siblings together, override them locally — **never commit the
 override** (§8):
