@@ -26,7 +26,11 @@ rand08 = { package = "rand", version = "0.8", optional = true }
 # The engine is on rand_core 0.9; rand 0.9 supplies its seeded StdRng.
 # The dev-dependency below uses the same package and version.
 rand = { version = "0.9", optional = true }
-# Siblings are consumed by git (master until v0.1.0 tags exist, then tags).
+# Pre-release siblings are untagged git sources on their default branches.
+# Downstream crates that depend on them directly must use the same untagged
+# URLs (no tag, branch or rev), otherwise Cargo builds duplicate Identity,
+# LinkId and NodeId types across the mesh seam. Release tags start at v0.1.0
+# and will be adopted by every crate together when they are cut.
 # Local overrides: docs/local-development.md — never commit a [patch].
 ao_network = { version = "0.1.0", git = "https://github.com/aoheyra/aoNetwork" }
 ao_idents = { version = "0.1.0", git = "https://github.com/aoheyra/aoIdents" }

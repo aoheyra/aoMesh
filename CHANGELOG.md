@@ -2,10 +2,17 @@
 
 Notable changes to `ao_mesh` are recorded here. The crate is
 pre-alpha: there are no tagged releases yet, the public API may
-change without notice until v0.1.0, and consumers pin by git tag
-(AGENTS.md, section 8).
+change without notice until v0.1.0, and sibling git sources must
+match exactly (AGENTS.md, section 8).
 
 ## Unreleased
+
+Document the pre-release sibling seam. `ao_mesh` stays at version `0.1.0` and
+consumes `ao_network` and `ao_idents` as untagged git sources. A consumer that
+depends on those siblings directly must use the same untagged URLs (no tag,
+`branch` or `rev`) until release tags start at `v0.1.0`; mixing a tagged source
+with aoMesh's untagged source duplicates `Identity`, `LinkId` and `NodeId`
+types across the seam. No routing, packet, sync or store behaviour changes.
 
 FIX 38 scopes the two-link suppression floor to where it proves coverage:
 chain relays with at most one other link and every Presence announcement.

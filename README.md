@@ -541,7 +541,7 @@ fuzz campaign runs in [aoheyra-fuzz](https://github.com/aoheyra/aoheyra-fuzz).
 
 ### Sibling crates
 
-`ao_network` and `ao_idents` are consumed **by git** (master until the `v0.1.0` tags exist, then tags). For local co-development use a `[patch]` override in your own, uncommitted Cargo config; the exact procedure is documented in `docs/local-development.md` (MSH-01) and in aoheyra's APP-01. `ao_network` with feature `sim` is a `dev-dependency` so the whole mesh can be built and tested before the BLE shim works.
+`ao_network` and `ao_idents` are consumed **as untagged git sources on their default branches**. There are no release tags yet; the first release tags start at `v0.1.0` and all crates will move to them together when they are cut. Cargo treats a tagged source as a different identity from an untagged one, so a downstream crate that depends on these siblings directly must use the same untagged git URLs as aoMesh. Otherwise `Identity`, `LinkId` and `NodeId` become duplicate Rust types across the seam. For local co-development use a `[patch]` override in your own, uncommitted Cargo config; the exact procedure is documented in `docs/local-development.md` (MSH-01) and in aoheyra's APP-01. `ao_network` with feature `sim` is a `dev-dependency` so the whole mesh can be built and tested before the BLE shim works.
 
 ## Roadmap
 
