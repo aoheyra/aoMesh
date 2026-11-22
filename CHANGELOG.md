@@ -30,6 +30,11 @@ The simulator now clamps Direct destination spans to the line edges before
 reflecting them. Two-node and eight-node Balanced runs submit all messages
 instead of panicking on `usize` underflow; no engine or wire behaviour changes.
 
+MSH-35 adds `StoreError::Backend`, `StoreBackendError` and
+`StoreBackendOperation` so disk-backed stores can report I/O, locking and row
+decode failures without strings or a sibling error type. No wire or routing
+behaviour changes.
+
 FIX 38 scopes the two-link suppression floor to where it proves coverage:
 chain relays with at most one other link and every Presence announcement.
 Dense Broadcast and channel floods use the calibrated degree-scaled threshold

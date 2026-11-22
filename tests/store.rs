@@ -352,3 +352,19 @@ fn maximum_clock_values_and_signature_envelope_remain_bounded() {
         Err(StoreError::InvalidTime)
     );
 }
+
+#[test]
+fn backend_errors_keep_operation_and_code_without_a_string() {
+    let error = StoreError::Backend(StoreBackendError::new(
+        StoreBackendOperation::Query,
+        Some(5),
+    ));
+    assert_eq!(
+        error,
+        StoreError::Backend(StoreBackendError {
+            operation: StoreBackendOperation::Query,
+            code: Some(5),
+        })
+    );
+    assert!(error.to_string().contains("query failed with code 5"));
+}
