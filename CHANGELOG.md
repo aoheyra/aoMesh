@@ -56,6 +56,24 @@ New host seams are `MeshInput::ObserveLinkHint`, `MeshOutput::SetLinkHint` and
 with hints off, with identical delivery, latency, transmissions and overhead.
 `tests/linkhint.rs`, `tests/adapter.rs` and `tests/sim_linkhint.rs` cover the
 policy, the real facade and the measured rows.
+MSH-26 adds opt-in per-link hop encryption over the real aoIdents pinned-hash
+handshake. A host sets `MeshConfig::hop_enabled` and signs its hello with
+`MeshHello::sign_with_hop`; `CAP_HOP_V1` is deliberately absent from the default
+`CAPS`, so hosts that do not drive handshakes keep cleartext links. The signed
+hello's card hash and bounded negotiation state stay in the engine; cards,
+handshakes and `HopSessions` remain host-owned and are borrowed only through
+`NetworkAdapter::*_with_hop`. Control frames carry a one-byte Noise tag;
+Data frames on an active link seal the whole encoded packet per neighbour, so
+a passive observer sees no mesh header. Post-link-up sync and receipts are
+deferred until `MeshInput::HopReady` to avoid cleartext leakage and preserve
+frame order. Failed seal/open emits typed `HopFailed` events and no cleartext
+retry. The SimWorld capture test with seed `0x2601` verifies `1 / 1` parsed
+packets with no header visible on the radio when both sides opt in, and `1 / 1`
+cleartext packets when only one side does. Breaking unreleased API additions:
+`MeshConfig::hop_enabled`, `MeshInput::{HopControl, HopReady}`,
+`MeshError::Hop`, `AdapterEvent::{HopStart, HopControl, HopFrameInvalid,
+HopFailed, HopEnded}`, the `*_with_hop` adapter methods, and the `hop` and
+`SUPPORTED_CAPS` exports. `MeshHello::sign` is unchanged and remains cleartext.
 
 MSH-19 adds bounded presence announcements. An ordinary signed `Presence`
 packet carries a fixed 150-byte body with the origin's card hash, capabilities,

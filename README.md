@@ -2,7 +2,7 @@
 
 **The routing and store-and-forward engine of the aoheyra mesh.** A sans-IO Rust crate that decides what happens to a packet: forward it, hold it, suppress it, deliver it, or drop it, across a phone-to-phone mesh where links come and go.
 
-> **Status: pre-alpha, through MSH-30.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest, bounded anti-entropy sync, range-based reconciliation on meeting links, binary spray-and-wait for Direct traffic, signed delivery receipts with bounded store purging, relative-age lifetime ceilings, bounded presence announcements with trickle timing, a bounded ephemeral NodeDirectory with coalesced UI events, bounded reverse-path route hints derived from directory observations, bounded advisory neighbour link hints for aoNetwork, bounded latest-wins telemetry with typed advisory coalescing, local public-channel subscriptions over signed Broadcast envelopes, resource-bounded decoders with fuzz targets in [aoheyra-fuzz](https://github.com/aoheyra/aoheyra-fuzz), versioned restart snapshots for seen-cache, immunity and spray state, and a versioned content-free diagnostics snapshot are implemented.
+> **Status: pre-alpha, through MSH-30.** Packet encoding, origin signatures, seen-cache bookkeeping, signed submissions, bounded neighbours, the signed MeshHello introduction with verified neighbour identities, the optional network adapter, baseline Direct forwarding (dedupe, TTL, relay to verified neighbours), authenticated local delivery (seal, origin binding, signature and replay guard), per-origin/per-neighbour relay budgets with neighbour penalties, counter-based Broadcast/Presence suppression with seeded assessment delays, bounded store summaries, the debounced beacon digest, bounded anti-entropy sync, range-based reconciliation on meeting links, binary spray-and-wait for Direct traffic, signed delivery receipts with bounded store purging, relative-age lifetime ceilings, bounded presence announcements with trickle timing, a bounded ephemeral NodeDirectory with coalesced UI events, bounded reverse-path route hints derived from directory observations, bounded advisory neighbour link hints for aoNetwork, bounded latest-wins telemetry with typed advisory coalescing, local public-channel subscriptions over signed Broadcast envelopes, resource-bounded decoders with fuzz targets in [aoheyra-fuzz](https://github.com/aoheyra/aoheyra-fuzz), versioned restart snapshots for seen-cache, immunity and spray state, a versioned content-free diagnostics snapshot, and host-driven per-link hop encryption with cleartext fallback are implemented.
 
 Cargo package name: `ao_mesh`.
 
@@ -36,6 +36,7 @@ aoMesh consumes **aoNetwork** (links and frames) and **aoIdents** (signatures, s
 - Emits bounded **advisory link hints** from contact, diversity and penalty facts. aoNetwork alone forms links and enforces the degree cap.
 - Publishes **Telemetry** as latest-wins ambient state with NET-21 coalescing, and carries **public channels** as bounded envelopes inside signed Broadcast packets with local-only subscriptions.
 - Exposes **bounded diagnostics counters** as a versioned, content-free snapshot for the host.
+- Negotiates **per-link hop encryption** over Control frames with signed capability bits; the host owns cards, handshakes and keys, and links without the capability stay cleartext.
 - Ships a **simulator harness** with mobility models and metrics, so every routing parameter can be swept and every claim measured.
 
 ## What it deliberately does not do
@@ -82,7 +83,7 @@ Lifetimes, TTLs, copy counts and budgets are **defaults with documented reasons*
    aoNetwork  (NetworkEvent in, actions out)      aoIdents (sign, open, replay)
 ```
 
-**Engine inputs:** `LinkUp`, `LinkDown`, `Data`, `Tick`, `Submit`, `SubmitTelemetry`, `KnownCards`, `ObserveNode`, `StoreSummary`, `SyncItems`, `ChannelSubscribe`, `ChannelUnsubscribe`. **Outputs:** `Send`, `Broadcast`, `TelemetrySend`, `TelemetryBroadcast`, `Release`, `Deliver`, `ChannelDeliver`, `SetHello`, `SetBeacon`, `SyncNeed`, `SyncItem`, `ReleaseOpportunistic`, `Purge`, `Delivered`, `CardFetch`, `DirectoryChanged`.
+**Engine inputs:** `LinkUp`, `LinkDown`, `Data`, `Tick`, `Submit`, `SubmitTelemetry`, `KnownCards`, `ObserveNode`, `StoreSummary`, `SyncItems`, `ChannelSubscribe`, `ChannelUnsubscribe`, `HopControl`, `HopReady`. **Outputs:** `Send`, `Broadcast`, `TelemetrySend`, `TelemetryBroadcast`, `Release`, `Deliver`, `ChannelDeliver`, `SetHello`, `SetBeacon`, `SyncNeed`, `SyncItem`, `ReleaseOpportunistic`, `Purge`, `Delivered`, `CardFetch`, `DirectoryChanged`.
 
 ### Engine and adapter (MSH-06)
 
@@ -1119,3 +1120,47 @@ call `snapshot_at(now, owner)` and restore a fresh engine using
 remaining lifetimes and discards old transport LinkIds. Legacy `Snapshot` bytes
 require the original clock epoch and link namespace. See
 [the clock-safe restart contract](docs/adr/clock-safe-restart.md).
+## Hop encryption (MSH-26)
+
+Hop encryption is an **opt-in link layer**. The engine owns only the signed
+capability bit, the 8-byte card hash from `MeshHello`, bounded per-link
+negotiation state and a one-byte Control tag. Cards, `HopHandshake` states and
+`HopSessions` stay in the host and are borrowed only by the `*_with_hop`
+adapter calls. No key is ever passed to `MeshEngine`.
+
+To enable it the host sets `MeshConfig::hop_enabled = true`, advertises the
+same bit with `MeshHello::sign_with_hop`, and drives the handshake from these
+adapter events:
+
+| Event / input | Host action |
+|---|---|
+| `AdapterEvent::HopStart` | Look up the full card by `card_hash`; create a pinned-by-hash `HopHandshake` as initiator or responder. Initiator writes message 1 into `MeshInput::HopControl`. |
+| `AdapterEvent::HopControl` | Feed the Noise message into that link's handshake. Write the reply as `HopControl`, or install the finished transport into the host's `HopSessions` and send `MeshInput::HopReady`. |
+| `AdapterEvent::HopEnded` | Close or forget the host's session and drop any in-flight handshake. |
+| `AdapterEvent::HopFrameInvalid` / `HopFailed` | Surface the typed failure; never retry in cleartext on a negotiated link. |
+
+`Control` frames carry only `0x01` plus the opaque Noise message (32/96/64
+bytes for XX v1). Every Data frame on an active link is sealed over the whole
+encoded packet, so a passive observer sees no mesh header; the receiver opens
+it before the engine parses it. Per-neighbour sealing means a Broadcast becomes
+one sealed `Send` per link. An active link without a supplied session, or a
+seal/open failure, emits `HopFailed` and sends or delivers nothing.
+
+Post-link-up sync and receipt frames are deferred until `HopReady` on a hop
+link. Sending them at link-up would leak their encoded headers before the
+session existed; aoNetwork's per-link frame order then keeps the final
+handshake message ahead of the first sealed Data frame.
+
+A link where either side lacks the capability never starts a handshake:
+`MeshHello::sign` keeps `CAP_HOP_V1` out of the default `CAPS`, so existing
+hosts stay cleartext. Neither sealing nor opening is attempted on those links.
+
+`tests/hop.rs` uses the real aoIdents pinned-by-hash handshakes and the real
+SimWorld transport with seed `0x2601` and a capture wrapper standing in for a
+passive observer. With both sides opted in, the encoded packet header is absent
+from every captured radio frame and the peer parses `1 / 1` packets. With only
+one side opted in, no hop event fires and the peer still parses `1 / 1`
+cleartext packets. The framing unit tests cover empty, unknown-kind and
+oversized Control bodies; the capability test proves the bit is signed,
+negotiated only by opted-in engines, and absent from the default hello. No
+MSH-27 threshold or CSV baseline was changed.

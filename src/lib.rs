@@ -37,7 +37,10 @@
 //! tickets so a restart cannot re-relay traffic the node already handled.
 //! MSH-30 adds saturating counters and a versioned, content-free
 //! [`MeshSnapshot`] that the host can map into its diagnostics bundle without
-//! any extra I/O.
+//! any extra I/O. MSH-26 adds opt-in per-link hop encryption: the engine owns
+//! the signed capability bit, card-hash pin and bounded link state, while the
+//! host owns cards, handshakes and `HopSessions` and drives them through the
+//! `*_with_hop` adapter APIs. Links without the capability stay cleartext.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -53,6 +56,7 @@ pub mod expiry;
 mod forward;
 pub mod hello;
 pub mod linkhint;
+pub mod hop;
 pub mod neighbor;
 pub mod observability;
 pub mod packet;
@@ -71,7 +75,7 @@ pub mod sync;
 pub mod telemetry;
 
 #[cfg(feature = "adapter")]
-pub use adapter::{AdapterEvent, NetworkAdapter};
+pub use adapter::{AdapterEvent, HopAdapterError, NetworkAdapter};
 pub use budget::{BudgetConfig, BudgetOutcome, BudgetTracker, ClassRate};
 pub use channel::{
     CHANNEL_HEADER_LEN, CHANNEL_ID_LEN, CHANNEL_MAGIC, CHANNEL_VERSION, ChannelBudgetScope,
@@ -84,8 +88,12 @@ pub use directory::{
 };
 pub use engine::{MeshEngine, MeshError, MeshInput, MeshOutput};
 pub use hello::{
-    CAP_PRESENCE_V1, CAP_RECEIPT_V1, CAP_SPRAY_V1, CAP_SYNC_V1, CAP_SYNC_V2, CAPS, HelloError,
-    MeshHello,
+    CAP_HOP_V1, CAP_PRESENCE_V1, CAP_RECEIPT_V1, CAP_SPRAY_V1, CAP_SYNC_V1, CAP_SYNC_V2, CAPS,
+    HelloError, MeshHello, SUPPORTED_CAPS,
+};
+pub use hop::{
+    HOP_KIND_NOISE_XX_V1, HopFrameError, HopTracker, MAX_HOP_CONTROL_MSG, decode_control,
+    encode_control,
 };
 pub use linkhint::{
     DEFAULT_MAX_PEERS, DEFAULT_MIN_DIVERSE_NODES, DEFAULT_PENALTY_THRESHOLD, LinkHintConfig,

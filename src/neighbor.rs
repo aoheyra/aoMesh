@@ -56,6 +56,11 @@ pub struct MeshConfig {
     pub telemetry: TelemetryConfig,
     /// Bounds for local public-channel subscriptions (MSH-23).
     pub channels: ChannelConfig,
+    /// Whether this host drives MSH-26 hop handshakes and owns a
+    /// `HopSessions` table. Default `false` keeps every link cleartext;
+    /// setting it also requires [`crate::MeshHello::sign_with_hop`] so both
+    /// ends see the same signed capability.
+    pub hop_enabled: bool,
 }
 
 impl Default for MeshConfig {
@@ -91,6 +96,7 @@ impl Default for MeshConfig {
             link_hints: LinkHintConfig::default(),
             telemetry: TelemetryConfig::default(),
             channels: ChannelConfig::default(),
+            hop_enabled: false,
         }
     }
 }

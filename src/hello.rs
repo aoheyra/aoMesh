@@ -44,14 +44,19 @@ pub const PROTO: u8 = 1;
 /// common language and the introduction fails.
 pub const MIN_PROTO: u8 = 1;
 
-/// Feature bits this build sets.
+/// Feature bits this build advertises by default (ADR-0001).
+///
+/// Hop encryption is deliberately absent: only the host can drive the
+/// handshake, so a host opts in with [`crate::MeshConfig::hop_enabled`]
+/// and [`MeshHello::sign_with_hop`]. A link that does not opt in stays
+/// cleartext even when both peers run this build.
 ///
 /// Bit 0 advertises MSH-14's anti-entropy sync frames. Bit 1 advertises
 /// MSH-15's range reconciliation. Bit 2 advertises MSH-16's bounded spray
 /// envelope. Bit 3 advertises MSH-17's signed receipt envelope. Bit 4
-/// advertises MSH-19's signed presence announcements. A peer that lacks a bit
-/// keeps the earlier forwarding path; a peer with only bit 0 gets the MSH-14
-/// summary exchange. Every bit needs an ADR entry.
+/// advertises MSH-19's signed presence announcements. A peer that lacks a
+/// bit keeps the earlier forwarding path; a peer with only bit 0 gets the
+/// MSH-14 summary exchange. Every bit needs an ADR entry.
 pub const CAP_SYNC_V1: u32 = 1 << 0;
 /// Capability bit for MSH-15 range-based set reconciliation.
 pub const CAP_SYNC_V2: u32 = 1 << 1;
@@ -61,8 +66,20 @@ pub const CAP_SPRAY_V1: u32 = 1 << 2;
 pub const CAP_RECEIPT_V1: u32 = 1 << 3;
 /// Capability bit for MSH-19 signed presence announcements.
 pub const CAP_PRESENCE_V1: u32 = 1 << 4;
-/// Feature bits this build sets (ADR-0001).
+/// Capability bit for MSH-26 per-link hop encryption (IDN-13/14).
+///
+/// The bit is signed inside `MeshHello`, so a relay cannot strip it. It only
+/// enables the Control-frame handshake; the host still owns the cards,
+/// handshake and session keys, and links without the bit stay cleartext.
+pub const CAP_HOP_V1: u32 = 1 << 5;
+/// Feature bits this build advertises by default (ADR-0001).
 pub const CAPS: u32 = CAP_SYNC_V1 | CAP_SYNC_V2 | CAP_SPRAY_V1 | CAP_RECEIPT_V1 | CAP_PRESENCE_V1;
+
+/// Every capability bit this build understands, including host-opted-in
+/// hop encryption (MSH-26). [`MeshHello::sign_with_caps`] masks with this,
+/// not with [`CAPS`], so a host that owns a `HopSessions` table can advertise
+/// the extra bit without forging an unknown capability.
+pub const SUPPORTED_CAPS: u32 = CAPS | CAP_HOP_V1;
 
 /// Encoded length of a v1 hello: fixed, so a wrong length is rejected
 /// before anything is read (ADR-0004).
@@ -178,6 +195,19 @@ impl MeshHello {
         Ok(hello)
     }
 
+    /// Builds and signs a hello that opts into MSH-26 hop encryption.
+    ///
+    /// The host must also set [`crate::MeshConfig::hop_enabled`] so the
+    /// engine negotiates the same bit. Cards, handshakes and keys stay with
+    /// the host; this only publishes the signed capability and card pin.
+    pub fn sign_with_hop(
+        identity: &Identity,
+        card_hash: [u8; 8],
+        store_digest: [u8; 4],
+    ) -> Result<Self, IdentError> {
+        Self::sign_with_caps(identity, card_hash, store_digest, SUPPORTED_CAPS)
+    }
+
     /// Builds and signs a hello with an explicit capability set.
     ///
     /// Hosts normally use [`Self::sign`]. This seam lets simulators and
@@ -194,7 +224,7 @@ impl MeshHello {
             node_id: identity.node_id(),
             card_hash,
             proto: PROTO,
-            caps: caps & CAPS,
+            caps: caps & SUPPORTED_CAPS,
             store_digest,
             signing_pk: *public.signing_pk(),
             agreement_pk: *public.agreement_pk(),
@@ -361,6 +391,30 @@ mod tests {
         let verified = decoded.verify().unwrap();
         assert_eq!(verified, identity.node_id());
         assert_eq!(verified_node_id(&hello.encode()).unwrap(), verified);
+    }
+
+    /// Hop is opt-in because only the host can drive its handshake. The
+    /// default hello must stay cleartext for hosts that have not opted in;
+    /// an opted-in engine must see the bit survive both signing and
+    /// negotiation (MSH-26).
+    #[test]
+    fn hop_capability_is_signed_and_only_negotiated_when_both_sides_opt_in() {
+        let identity = Identity::from_seed([43; 32]);
+        let clear = MeshHello::sign(&identity, [7; 8], [9; 4]).unwrap();
+        assert_eq!(clear.caps & CAP_HOP_V1, 0);
+        assert_eq!(clear.negotiate(PROTO, CAPS).unwrap().1 & CAP_HOP_V1, 0);
+
+        let hop = MeshHello::sign_with_hop(&identity, [7; 8], [9; 4]).unwrap();
+        assert_eq!(hop.caps, SUPPORTED_CAPS);
+        assert_eq!(
+            hop.negotiate(PROTO, CAPS).unwrap().1 & CAP_HOP_V1,
+            0,
+            "a cleartext engine must not negotiate hop from a remote advertisement"
+        );
+        assert_ne!(
+            hop.negotiate(PROTO, SUPPORTED_CAPS).unwrap().1 & CAP_HOP_V1,
+            0
+        );
     }
 
     /// Done when: a cut-off hello fails with a typed error, at every
