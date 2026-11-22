@@ -734,3 +734,47 @@ zero at the end by design because scores decay; the cumulative event counter
 is the durable evidence. These metrics are additive and outside the MSH-27 CSV
 schema, so no baseline threshold was weakened. The host maps this plain snapshot into APP-15; aoMesh
 does not implement that bundle.
+## Hop encryption capability (MSH-26)
+
+This decision adds signed capability bit `1 << 5` (`CAP_HOP_V1`) and per-link
+Control/Data framing. No class rate, TTL, copy count, lifetime, packet header
+field or MSH-27 threshold changes, so the tables above stand.
+
+Two advertisement policies were compared.
+
+| Option | Delivery / latency / overhead | Memory / CPU / battery | Determinism, tests, maintenance |
+|---|---|---|---|
+| Default-on in `MeshHello::sign` | Same routing; every peer would expect a handshake even when its host has no card store or session table, causing hung links or accidental cleartext after one side gave up | Small extra handshake state on every link, even for hosts that never opted in | One constant, but the library would advertise a behavior it cannot perform without host code; fallback tests would need to opt out everywhere |
+| Host opt-in via `MeshConfig::hop_enabled` + `sign_with_hop` (chosen) | Same routing and no handshake on links without both bits; one three-message XX exchange and a 16-byte tag per sealed Data frame on opted-in links | Two bounded `BTreeSet`/`BTreeMap`s keyed by link id; no key bytes in the engine; Noise crypto runs only on opted-in links | Explicit config makes tests deterministic, and a cleartext host needs no change; one extra config field and helper API to maintain |
+
+The host owns the cards, handshake and `HopSessions`; aoMesh sees only the
+signed card hash from `MeshHello`, the negotiated bit, link ids and opaque
+bytes. Reusing aoIdents' pinned-by-hash constructors keeps first-contact trust
+out of band and fails an impostor static key before any transport exists. A
+library-owned handshake was rejected because it would put keys in the engine
+and contradict the crate boundary.
+
+Two Data scopes were compared. Sealing only the opaque payload would be
+cheaper by the header length, but a passive observer would still read origin,
+destination, class, TTL and message id. Sealing the whole encoded packet
+(chosen) costs the same one ChaCha20-Poly1305 pass over a few dozen extra bytes
+and removes that metadata from the radio frame. Relay latency and delivery
+ratio are unchanged because a relay opens and reseals the same opaque packet;
+overhead is one 16-byte tag per link hop. Per-neighbour sealing turns one
+Broadcast into one sealed `Send` per link, which is required because sessions
+are keyed by peer identity.
+
+Two timing policies were compared for post-link-up sync. Sending immediately
+and sealing only when active leaks encoded sync headers during the handshake.
+Dropping those frames would be safe but would delay store reconciliation until
+a later tick. Deferring them to `HopReady` (chosen) preserves delivery, keeps
+aoNetwork's per-link frame order so message 3 precedes the first sealed Data
+frame, and holds at most the engine's existing bounded sync actions in the
+tracker. No new externally controlled queue is introduced.
+
+`tests/hop.rs` uses SimWorld seed `0x2601` with a capture transport standing in
+for a passive observer: with both sides opted in, no captured frame contains
+the encoded packet header and the peer parses `1 / 1` packets; with one side on
+the default cleartext hello, no hop event fires and the peer parses `1 / 1`
+packets. These are link-layer correctness checks rather than routing
+metrics, so no published MSH-27 row or threshold was changed.

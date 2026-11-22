@@ -217,6 +217,7 @@ fn assert_delivered_once(events: &[(usize, AdapterEvent)], dst: usize) {
             AdapterEvent::ChannelDeliver { .. } => {
                 panic!("unexpected channel event in a forwarding test: {event:?}")
             }
+            _ => panic!("unexpected hop event in a cleartext forwarding test: {event:?}"),
         }
     }
     assert_eq!(delivered, [(dst, PAYLOAD)], "one delivery, at dst");

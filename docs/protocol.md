@@ -112,6 +112,48 @@ forward, deliver or budget on its behalf. Every field is fixed-width,
 so hostile bit patterns decode identically and
 `decode(encode(h)) == h` holds with no normalisation.
 
+## Hop encryption frames (MSH-26)
+
+Capability bit `1 << 5` (`CAP_HOP_V1`) is signed in `MeshHello.caps`. It is
+**opt-in**: the default `MeshHello::sign` omits it because only the host can
+drive the Noise handshake. A host sets `MeshConfig::hop_enabled` and signs with
+`MeshHello::sign_with_hop`; the engine negotiates the bit only when both sides
+advertise it. The hello layout and packet header are unchanged, so older peers
+simply lack the bit and keep the cleartext path.
+
+Handshake bytes travel in aoNetwork's `Channel::Control` with a one-byte mesh
+tag before aoIdents' opaque Noise message:
+
+```text
+offset 0  1 byte   kind = 0x01 (Noise_XX_25519_ChaChaPoly_SHA256 v1)
+offset 1  ..       Noise message: 32, 96 or 64 bytes for XX v1
+```
+
+The tag is a demultiplexer, not authenticated: the Noise state machine rejects
+out-of-order, duplicate or payload-bearing messages. Empty bodies, unknown
+kinds and messages over 128 bytes are dropped as `HopFrameInvalid`. A new Noise
+suite needs a new kind byte, ADR entry and version bump.
+
+On an active link every Data-channel body is the raw
+`HopTransport::encrypt_msg` ciphertext of the **whole encoded mesh packet**:
+
+```text
+plaintext = Header || signature || opaque payload
+wire body = plaintext || 16-byte ChaCha20-Poly1305 tag
+```
+
+Data frames carry no aoIdents header. The receiver opens with the host's
+session before `Header::decode`, so a passive observer sees neither routing
+metadata nor the original packet header. Sealing is per neighbour, so a
+Broadcast is emitted as one sealed `Send` per verified link. Control frames are
+never sealed because they establish the session.
+
+A link that negotiated the capability but has no installed session emits
+`HopFailed` and transmits nothing; a failed open emits `HopFailed` and passes
+no plaintext to the engine. There is no automatic cleartext retry. Sync and
+receipt frames that would normally start at link-up are deferred until
+`HopReady`, preventing pre-session cleartext sends and preserving frame order.
+
 ## Versioning
 
 `ver` selects the packet layout. Mesh format versions travel in

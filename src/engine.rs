@@ -8,6 +8,7 @@ use crate::channel::{
 use crate::deliver;
 use crate::directory::{DirectoryChange, DirectoryError, NodeDirectory, NodeObservation};
 use crate::forward::{self, Action};
+use crate::hop::{HopFrameError, HopTracker, encode_control};
 use crate::linkhint::{HintChange, LinkHintObservation, LinkHintTable};
 use crate::neighbor::{MeshConfig, NeighborTable};
 use crate::observability::{MESH_SNAPSHOT_VERSION, MeshSnapshot, saturating_u32};
@@ -121,6 +122,26 @@ pub enum MeshInput<'a> {
     ObserveNode {
         /// The opaque observation to record.
         observation: NodeObservation<'a>,
+    },
+    /// Host-produced Noise XX handshake bytes for one link (MSH-26).
+    ///
+    /// The engine adds the one-byte Control tag and emits a Control-frame
+    /// send. It never sees a card, a handshake state or a key; the host
+    /// drives `HopHandshake` and passes each `write_message` result here.
+    HopControl {
+        /// Link whose peer should receive the handshake message.
+        link: LinkId,
+        /// Opaque Noise message, bounded by framing.
+        message: &'a [u8],
+    },
+    /// The host installed a verified `HopTransport` for this link (MSH-26).
+    ///
+    /// Until this input arrives the adapter must not seal Data frames, even
+    /// when both hellos advertised the cap. Only a negotiated link can be
+    /// activated, so a host cannot turn encryption on for an unaware peer.
+    HopReady {
+        /// Link whose session is ready.
+        link: LinkId,
     },
     /// Originate a packet. This does not encrypt or deliver its payload.
     Submit {
@@ -358,6 +379,8 @@ pub enum MeshError {
     Telemetry(crate::telemetry::TelemetryError),
     /// A channel name, envelope or budget limit was rejected (MSH-23).
     Channel(ChannelError),
+    /// A hop Control frame exceeded the bounded framing rules (MSH-26).
+    Hop(HopFrameError),
 }
 impl core::fmt::Display for MeshError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -370,6 +393,7 @@ impl core::fmt::Display for MeshError {
             Self::Directory(error) => write!(f, "directory observation failed: {error}"),
             Self::Telemetry(error) => write!(f, "telemetry rejected: {error}"),
             Self::Channel(error) => write!(f, "channel rejected: {error}"),
+            Self::Hop(error) => write!(f, "hop framing rejected: {error}"),
         }
     }
 }
@@ -402,6 +426,7 @@ pub struct MeshEngine<R: RngCore> {
     directory: NodeDirectory,
     hints: RouteHintTable,
     link_hints: LinkHintTable,
+    hop: HopTracker,
     telemetry: TelemetryTracker,
     channels: ChannelRules,
 }
@@ -439,6 +464,7 @@ impl<R: RngCore> MeshEngine<R> {
             directory: NodeDirectory::new(config.directory),
             hints: RouteHintTable::new(config.route_hint),
             link_hints: LinkHintTable::new(config.link_hints),
+            hop: HopTracker::new(config.max_neighbors),
             telemetry: TelemetryTracker::new(config.telemetry),
             channels: ChannelRules::new(config.channels),
         }
@@ -450,6 +476,68 @@ impl<R: RngCore> MeshEngine<R> {
     /// Read-only relay budget and penalty state (MSH-10).
     pub fn budgets(&self) -> &BudgetTracker {
         &self.budgets
+    }
+    /// Read-only hop negotiation state (MSH-26). It holds link ids only;
+    /// the host owns the handshake and all session keys.
+    #[must_use]
+    pub fn hop(&self) -> &HopTracker {
+        &self.hop
+    }
+    /// Whether both ends advertised hop encryption on `link` (MSH-26).
+    #[must_use]
+    pub fn hop_negotiated(&self, link: LinkId) -> bool {
+        self.hop.is_negotiated(link)
+    }
+    /// Whether the host installed a session and Data must be sealed (MSH-26).
+    #[must_use]
+    pub fn hop_active(&self, link: LinkId) -> bool {
+        self.hop.is_active(link)
+    }
+    /// Verified neighbour and signed card-hash pin for a negotiated hop link
+    /// (MSH-26). The host uses this to select its out-of-band card; no key
+    /// material is exposed.
+    #[must_use]
+    pub fn hop_peer(&self, link: LinkId) -> Option<(ao_idents::NodeId, [u8; 8])> {
+        self.hop.peer(link)
+    }
+    /// Capabilities this engine negotiates. Hop is included only when the
+    /// host opted in and signed its hello with the same bit (MSH-26).
+    fn local_caps(&self) -> u32 {
+        if self.config.hop_enabled {
+            crate::hello::SUPPORTED_CAPS
+        } else {
+            crate::hello::CAPS
+        }
+    }
+
+    /// The Data outputs a fresh link normally starts with (MSH-14/17). On a
+    /// hop link these are deferred to `HopReady` so none can leave in
+    /// cleartext before the host installs its session (MSH-26).
+    fn post_link_outputs(
+        &mut self,
+        now: u64,
+        link: LinkId,
+        caps: u32,
+        remote_digest: [u8; 4],
+    ) -> Vec<MeshOutput> {
+        let mut outputs = Vec::new();
+        for payload in self.receipt.pending_for(link) {
+            outputs.push(MeshOutput::Send {
+                link,
+                channel: Channel::Message,
+                payload,
+            });
+        }
+        let spray = self.config.spray.enabled && caps & crate::hello::CAP_SPRAY_V1 != 0;
+        let actions = if caps & crate::hello::CAP_SYNC_V2 != 0 {
+            self.sync.start_v2(now, link, remote_digest, spray)
+        } else if caps & crate::hello::CAP_SYNC_V1 != 0 {
+            self.sync.start(now, link, remote_digest, spray)
+        } else {
+            Vec::new()
+        };
+        outputs.extend(self.apply_sync_actions(now, actions));
+        outputs
     }
     /// Digest currently advertised in the beacon, if one was published.
     pub fn published_store_digest(&self) -> Option<[u8; 4]> {
@@ -637,6 +725,27 @@ impl<R: RngCore> MeshEngine<R> {
                 let actions = self.sync.on_offers(link, items);
                 Ok(self.apply_sync_actions(now, actions))
             }
+            MeshInput::HopControl { link, message } => {
+                if !self.hop.is_negotiated(link) {
+                    return Ok(Vec::new());
+                }
+                let payload = encode_control(message).map_err(MeshError::Hop)?;
+                Ok(vec![MeshOutput::Send {
+                    link,
+                    channel: Channel::Control,
+                    payload,
+                }])
+            }
+            MeshInput::HopReady { link } => {
+                // A host cannot activate a link whose signed hello did not
+                // advertise the cap, so it cannot encrypt for an unaware peer.
+                Ok(match self.hop.activate(link) {
+                    Some((caps, remote_digest)) => {
+                        self.post_link_outputs(now, link, caps, remote_digest)
+                    }
+                    None => Vec::new(),
+                })
+            }
             MeshInput::Tick {
                 identity,
                 card_hash,
@@ -694,35 +803,33 @@ impl<R: RngCore> MeshEngine<R> {
                     .insert(now, link, remote_hello, node_id, signing_pk);
                 let caps = hello.and_then(|hello| {
                     hello
-                        .negotiate(crate::hello::PROTO, crate::hello::CAPS)
+                        .negotiate(crate::hello::PROTO, self.local_caps())
                         .ok()
                         .map(|(_, caps)| caps)
                 });
                 let Some(caps) = caps else {
                     return Ok(Vec::new());
                 };
-                let spray = self.config.spray.enabled && caps & crate::hello::CAP_SPRAY_V1 != 0;
+                let hop = caps & crate::hello::CAP_HOP_V1 != 0;
+                let remote_digest = hello.map_or([0; 4], |hello| hello.store_digest);
+                if hop {
+                    if let (Some(peer), Some(hello)) = (node_id, hello) {
+                        self.hop
+                            .negotiate(link, peer, hello.card_hash, caps, hello.store_digest);
+                    }
+                }
                 self.spray.set_caps(link, caps);
                 self.receipt.set_caps(link, caps);
                 self.presence.set_caps(link, caps);
-                let mut outputs = Vec::new();
-                for payload in self.receipt.pending_for(link) {
-                    outputs.push(MeshOutput::Send {
-                        link,
-                        channel: Channel::Message,
-                        payload,
-                    });
-                }
-                let remote_digest = hello.map_or([0; 4], |hello| hello.store_digest);
-                let actions = if caps & crate::hello::CAP_SYNC_V2 != 0 {
-                    self.sync.start_v2(now, link, remote_digest, spray)
-                } else if caps & crate::hello::CAP_SYNC_V1 != 0 {
-                    self.sync.start(now, link, remote_digest, spray)
+                // On a hop link every Data frame must wait for the host's
+                // session. Sending sync or receipts at LinkUp would leak
+                // their encoded headers before the handshake completes;
+                // HopReady replays the same policy in link order.
+                if hop {
+                    Ok(Vec::new())
                 } else {
-                    Vec::new()
-                };
-                outputs.extend(self.apply_sync_actions(now, actions));
-                Ok(outputs)
+                    Ok(self.post_link_outputs(now, link, caps, remote_digest))
+                }
             }
             MeshInput::LinkDown { link, .. } => {
                 self.neighbors.remove(link);
@@ -732,6 +839,7 @@ impl<R: RngCore> MeshEngine<R> {
                 self.receipt.link_down(link);
                 self.presence.link_down(link);
                 self.hints.link_down(link);
+                self.hop.link_down(link);
                 Ok(Vec::new())
             }
             MeshInput::Data {
