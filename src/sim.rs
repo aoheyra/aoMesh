@@ -3904,6 +3904,7 @@ mod tests {
             spray: false,
             receipts: false,
             route_hint: RouteHintMode::Off,
+            link_hints: None,
             suppression: SuppressionConfig::default(),
             presence: false,
             presence_config: PresenceConfig::default(),
