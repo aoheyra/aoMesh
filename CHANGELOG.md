@@ -19,6 +19,10 @@ non-relay still parses, delivers and receipts neighbour traffic, but withholds
 onward sends and store items for packets it did not originate; local
 submissions are unchanged. The beacon flag now follows the enforced policy.
 
+The simulator now clamps Direct destination spans to the line edges before
+reflecting them. Two-node and eight-node Balanced runs submit all messages
+instead of panicking on `usize` underflow; no engine or wire behaviour changes.
+
 FIX 38 scopes the two-link suppression floor to where it proves coverage:
 chain relays with at most one other link and every Presence announcement.
 Dense Broadcast and channel floods use the calibrated degree-scaled threshold
