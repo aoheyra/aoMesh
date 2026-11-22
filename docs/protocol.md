@@ -248,6 +248,14 @@ or stale timestamp produces no delivery and increments
 delivery only after acceptance; relays are recorded before forwarding to
 keep their loop invariant.
 
+Relay willingness is a host policy seam (APP-11), not a wire field. It defaults
+to `true`. `MeshInput::SetRelayWilling { willing: false }` keeps neighbour
+parsing, delivery, receipts and budget accounting in place, but withholds all
+onward `Send`, `Broadcast`, telemetry and `SyncItem` outputs for traffic this
+node did not originate. `Submit` and `SubmitTelemetry` still leave the node.
+A toggle refreshes the published beacon so `BeaconFlags.relay_willing` reports
+the policy the engine enforces.
+
 ## Relay budgets and neighbour penalties (MSH-10)
 
 No wire field changes: budgets are a local forwarding decision. For every
