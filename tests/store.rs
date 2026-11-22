@@ -3,14 +3,204 @@ use ao_mesh::{
     packet::PacketClass,
     store::{conformance::entry, *},
 };
+use std::collections::BTreeMap;
 
 fn id(value: u8) -> MessageId {
     MessageId::from_bytes([value; 16])
 }
 
+// Mirrors an external SQLite backend: rows own encoded bytes and local metadata
+// only. `get` reconstructs an owned StoredMessage rather than lending a value
+// held in this process, so no second authoritative in-memory copy is needed.
+#[derive(Debug, Clone)]
+struct Row {
+    wire: Vec<u8>,
+    metadata: StoreMetadata,
+}
+
+impl Row {
+    fn message(&self) -> Option<StoredMessage> {
+        StoredMessage::new(&self.wire, self.metadata).ok()
+    }
+}
+
+#[derive(Debug)]
+struct RowBackedStore {
+    limits: StoreLimits,
+    rows: BTreeMap<MessageId, Row>,
+}
+
+impl RowBackedStore {
+    fn new(limits: StoreLimits) -> Self {
+        Self {
+            limits,
+            rows: BTreeMap::new(),
+        }
+    }
+
+    fn live(&self, now: u64, id: &MessageId) -> Option<StoredMessage> {
+        self.rows
+            .get(id)?
+            .message()
+            .filter(|message| !message.is_expired(now))
+    }
+}
+
+impl MessageStore for RowBackedStore {
+    fn put(&mut self, now: u64, entry: StoredMessage) -> Result<Vec<MessageId>, StoreError> {
+        if entry.metadata().received_at > now {
+            return Err(StoreError::InvalidTime);
+        }
+        if entry.is_expired(now) {
+            return Err(StoreError::Expired);
+        }
+        let id = entry.header().msg_id;
+        if self.live(now, &id).is_some() {
+            return Err(StoreError::Duplicate);
+        }
+        let class = entry.header().class as usize - 1;
+        if self.limits.entries == 0
+            || entry.size() > self.limits.total_bytes
+            || entry.size() > self.limits.per_origin_bytes
+            || entry.size() > self.limits.per_class_bytes[class]
+        {
+            return Err(StoreError::Quota);
+        }
+        let mut removed = self.expire(now);
+        loop {
+            let total: usize = self
+                .rows
+                .values()
+                .filter_map(|row| row.message())
+                .map(|message| message.size())
+                .sum();
+            let origin: usize = self
+                .rows
+                .values()
+                .filter_map(|row| row.message())
+                .filter(|message| message.header().origin == entry.header().origin)
+                .map(|message| message.size())
+                .sum();
+            let class_bytes: usize = self
+                .rows
+                .values()
+                .filter_map(|row| row.message())
+                .filter(|message| message.header().class == entry.header().class)
+                .map(|message| message.size())
+                .sum();
+            let origin_full = origin > self.limits.per_origin_bytes - entry.size();
+            let class_full = class_bytes > self.limits.per_class_bytes[class] - entry.size();
+            if !origin_full
+                && !class_full
+                && self.rows.len() < self.limits.entries
+                && total <= self.limits.total_bytes - entry.size()
+            {
+                break;
+            }
+            let victim = self
+                .rows
+                .iter()
+                .filter_map(|(id, row)| {
+                    let message = row.message()?;
+                    let relieves_scope = if origin_full {
+                        message.header().origin == entry.header().origin
+                    } else if class_full {
+                        message.header().class == entry.header().class
+                    } else {
+                        true
+                    };
+                    relieves_scope.then_some((*id, *message.metadata()))
+                })
+                .min_by_key(|(id, metadata)| {
+                    (
+                        metadata.copies_left,
+                        std::cmp::Reverse(metadata.priority),
+                        metadata.first_seen,
+                        *id,
+                    )
+                })
+                .map(|(id, _)| id);
+            if let Some(victim) = victim {
+                self.rows.remove(&victim);
+                removed.push(victim);
+            } else {
+                break;
+            }
+        }
+        self.rows.insert(
+            id,
+            Row {
+                wire: entry.wire().to_vec(),
+                metadata: *entry.metadata(),
+            },
+        );
+        Ok(removed)
+    }
+
+    fn get(&self, now: u64, id: &MessageId) -> Option<StoredMessage> {
+        self.live(now, id)
+    }
+
+    fn by_destination(&self, now: u64, dst: &NodeId) -> Vec<MessageId> {
+        self.rows
+            .iter()
+            .filter_map(|(id, row)| {
+                let message = row.message()?;
+                (message.header().dst.as_ref() == Some(dst) && !message.is_expired(now))
+                    .then_some(*id)
+            })
+            .collect()
+    }
+
+    fn summary(&self, now: u64) -> Vec<MessageId> {
+        self.rows
+            .iter()
+            .filter_map(|(id, row)| {
+                let message = row.message()?;
+                (!message.is_expired(now)).then_some(*id)
+            })
+            .collect()
+    }
+
+    fn expire(&mut self, now: u64) -> Vec<MessageId> {
+        let ids: Vec<_> = self
+            .rows
+            .iter()
+            .filter_map(|(id, row)| {
+                let message = row.message()?;
+                message.is_expired(now).then_some(*id)
+            })
+            .collect();
+        for id in &ids {
+            self.rows.remove(id);
+        }
+        ids
+    }
+
+    fn evict(&mut self, id: &MessageId) -> Option<StoredMessage> {
+        self.rows.remove(id).and_then(|row| row.message())
+    }
+}
+
 #[test]
 fn memory_backend_conformance() {
     conformance::check(MemoryStore::new);
+}
+
+#[test]
+fn row_backend_conformance_with_owned_get() {
+    conformance::check(RowBackedStore::new);
+}
+
+#[test]
+fn owned_get_is_detached_from_row_storage() {
+    let mut store = RowBackedStore::new(StoreLimits::default());
+    let sample = entry(1, 1, PacketClass::Direct, 6, 1, 0);
+    assert_eq!(store.put(0, sample.clone()), Ok(vec![]));
+    let fetched = store.get(0, &id(1)).expect("live row");
+    assert_eq!(fetched, sample);
+    assert_eq!(store.evict(&id(1)), Some(sample.clone()));
+    assert_eq!(fetched, sample, "owned value survives store mutation");
 }
 
 #[test]
@@ -54,7 +244,7 @@ fn relative_expiry_and_rejections_preserve_entries() {
         s.put(99, entry(2, 1, PacketClass::Direct, 6, 1, 100)),
         Err(StoreError::InvalidTime)
     );
-    assert_eq!(s.get(100, &id(1)), Some(&original));
+    assert_eq!(s.get(100, &id(1)), Some(original.clone()));
     assert!(matches!(
         StoredMessage::new(&vec![0; MAX_STORED_PACKET + 1], meta),
         Err(StoreError::TooLarge)

@@ -147,12 +147,18 @@ impl std::error::Error for StoreError {}
 /// first removes expired entries, then evicts within violated quota scopes by
 /// most replicated (fewest copies left), lowest priority, oldest first_seen,
 /// and finally message ID. Duplicate insertion never changes existing metadata.
-/// Backends must make insertion and its evictions atomic.
+/// Backends must make insertion and its evictions atomic. Lookups return owned
+/// entries: a disk-backed store can decode a row into `StoredMessage` without
+/// keeping a second, authoritative in-memory copy to satisfy a borrow.
 pub trait MessageStore {
     /// Insert and return removed message IDs in deterministic eviction order.
     fn put(&mut self, now: u64, entry: StoredMessage) -> Result<Vec<MessageId>, StoreError>;
-    /// Fetch a live entry; expired entries are not exposed.
-    fn get(&self, now: u64, id: &MessageId) -> Option<&StoredMessage>;
+    /// Fetch a live entry as an owned value; expired entries are not exposed.
+    ///
+    /// The caller owns the returned bytes and metadata, so it stays valid across
+    /// later store mutations. This lets SQLite and other row-backed stores build
+    /// the value from their own row without lending an internal reference.
+    fn get(&self, now: u64, id: &MessageId) -> Option<StoredMessage>;
     /// Live message IDs addressed to a destination.
     fn by_destination(&self, now: u64, dst: &NodeId) -> Vec<MessageId>;
     /// Live message IDs in canonical order.
@@ -201,7 +207,11 @@ impl MessageStore for MemoryStore {
             return Err(StoreError::Expired);
         }
         let id = entry.header.msg_id;
-        if self.get(now, &id).is_some() {
+        let duplicate = self
+            .entries
+            .get(&id)
+            .is_some_and(|e| !e.is_expired_with(&self.lifetime_policy, now));
+        if duplicate {
             return Err(StoreError::Duplicate);
         }
         let class = class_index(entry.header.class);
@@ -271,10 +281,11 @@ impl MessageStore for MemoryStore {
         self.entries.insert(id, entry);
         Ok(removed)
     }
-    fn get(&self, now: u64, id: &MessageId) -> Option<&StoredMessage> {
+    fn get(&self, now: u64, id: &MessageId) -> Option<StoredMessage> {
         self.entries
             .get(id)
             .filter(|e| !e.is_expired_with(&self.lifetime_policy, now))
+            .cloned()
     }
     fn by_destination(&self, now: u64, dst: &NodeId) -> Vec<MessageId> {
         self.entries
@@ -348,7 +359,7 @@ pub mod conformance {
         )
         .unwrap_or_else(|e| panic!("conformance fixture: {e}"))
     }
-    /// Verify ordering, duplicate protection, expiry, quotas and eviction.
+    /// Verify ordering, duplicate protection, owned lookup, expiry, quotas and eviction.
     /// Panics only on a backend contract violation; this is a test helper.
     pub fn check<S: MessageStore>(mut factory: impl FnMut(StoreLimits) -> S) {
         let id = |value| MessageId::from_bytes([value; 16]);
@@ -362,12 +373,12 @@ pub mod conformance {
         };
         let mut store = factory(limits);
         assert_eq!(store.put(0, sample.clone()), Ok(vec![]));
-        assert_eq!(store.get(0, &id(1)), Some(&sample));
+        assert_eq!(store.get(0, &id(1)), Some(sample.clone()));
         assert_eq!(
             store.put(1, entry(1, 1, PacketClass::Direct, 6, 1, 1)),
             Err(StoreError::Duplicate)
         );
-        assert_eq!(store.get(1, &id(1)), Some(&sample));
+        assert_eq!(store.get(1, &id(1)), Some(sample.clone()));
         assert_eq!(
             store.put(0, entry(2, 2, PacketClass::Direct, 1, 1, 0)),
             Ok(vec![])
@@ -428,5 +439,16 @@ pub mod conformance {
             Err(StoreError::Quota)
         );
         assert!(store.summary(0).is_empty());
+
+        let mut store = factory(limits);
+        let owned = entry(1, 1, PacketClass::Direct, 6, 1, 0);
+        assert_eq!(store.put(0, owned.clone()), Ok(vec![]));
+        let fetched = store.get(0, &id(1)).expect("live conformance entry");
+        assert_eq!(fetched, owned);
+        assert_eq!(store.evict(&id(1)), Some(owned.clone()));
+        assert_eq!(
+            fetched, owned,
+            "get returns an owned value that survives store mutation"
+        );
     }
 }

@@ -87,18 +87,22 @@ fn service(
             MeshOutput::ReleaseOpportunistic { .. } => result.releases += 1,
             MeshOutput::SyncNeed { link, prefixes } => {
                 let ids = store.summary(now);
-                let offers: Vec<SyncOffer<'_>> = prefixes
+                let resolved: Vec<([u8; SHORT_ID_BYTES], StoredMessage)> = prefixes
                     .iter()
                     .filter_map(|prefix| {
                         let id = ids
                             .iter()
                             .find(|id| id.as_bytes()[..SHORT_ID_BYTES] == prefix[..])?;
                         let message = store.get(now, id)?;
-                        Some(SyncOffer {
-                            prefix: *prefix,
-                            wire: message.wire(),
-                            copies_left: 1,
-                        })
+                        Some((*prefix, message))
+                    })
+                    .collect();
+                let offers: Vec<SyncOffer<'_>> = resolved
+                    .iter()
+                    .map(|(prefix, message)| SyncOffer {
+                        prefix: *prefix,
+                        wire: message.wire(),
+                        copies_left: 1,
                     })
                     .collect();
                 let extra = engine

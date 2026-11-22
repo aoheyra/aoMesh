@@ -279,7 +279,7 @@ fn a_snapshot_leaves_the_host_store_untouched() {
     engine.restore(&bytes).expect("snapshot restores");
 
     assert_eq!(store.summary(0), before);
-    assert_eq!(store.get(0, &before[0]), Some(&item));
+    assert_eq!(store.get(0, &before[0]), Some(item.clone()));
     assert!(
         !bytes
             .windows(item.wire().len())
