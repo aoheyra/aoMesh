@@ -14,6 +14,11 @@ depends on those siblings directly must use the same untagged URLs (no tag,
 with aoMesh's untagged source duplicates `Identity`, `LinkId` and `NodeId`
 types across the seam. No routing, packet, sync or store behaviour changes.
 
+APP-11 adds `MeshInput::SetRelayWilling` and `MeshEngine::relay_willing`. A
+non-relay still parses, delivers and receipts neighbour traffic, but withholds
+onward sends and store items for packets it did not originate; local
+submissions are unchanged. The beacon flag now follows the enforced policy.
+
 FIX 38 scopes the two-link suppression floor to where it proves coverage:
 chain relays with at most one other link and every Presence announcement.
 Dense Broadcast and channel floods use the calibrated degree-scaled threshold
