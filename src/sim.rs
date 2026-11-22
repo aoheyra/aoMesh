@@ -2807,13 +2807,23 @@ impl Simulation {
         // Destinations stay inside the packet's eight-hop TTL so the
         // baseline measures forwarding, not expiry at an impossible
         // graph distance. Reflect at the ends because a line has no
-        // wrap-around edge; two hops or more still exercises relaying.
-        let span = 2 + m % 7;
-        let dst = if origin + span < n {
+        // wrap-around edge. Clamp before subtracting: the forward side of
+        // an eight-node line can be shorter than the span, and a bare
+        // `origin - span` underflows there (origin 3, span 5).
+        let span = (2 + m % 7).min(n.saturating_sub(1));
+        let forward = n.saturating_sub(1).saturating_sub(origin);
+        let mut dst = if span <= forward {
             origin + span
         } else {
-            origin - span
+            origin.saturating_sub(span)
         };
+        if n > 1 && dst == origin {
+            dst = if origin + 1 < n {
+                origin + 1
+            } else {
+                origin - 1
+            };
+        }
         let now_ms = self.world.now().as_millis() as u64;
         let mut rng = SealRng::seed_from_u64(self.scenario.seed ^ (m as u64 + 1));
         let plaintext = vec![(m % 251) as u8; self.scenario.payload_len];
@@ -3875,5 +3885,40 @@ mod tests {
             v2.total_bytes,
             v1.total_bytes
         );
+    }
+
+    fn short_line_metrics(nodes: usize) -> Metrics {
+        run(Scenario {
+            name: "direct-short-line",
+            seed: 0x5f0d,
+            nodes,
+            topology: Topology::Line,
+            mobility: Mobility::Static,
+            settle: Duration::from_secs(1),
+            run: Duration::from_secs(5),
+            messages: 8,
+            payload_len: 32,
+            traffic: Traffic::Balanced,
+            enforce_budgets: true,
+            enforce_suppression: true,
+            spray: false,
+            receipts: false,
+            route_hint: RouteHintMode::Off,
+            suppression: SuppressionConfig::default(),
+            presence: false,
+            presence_config: PresenceConfig::default(),
+            directory: None,
+            telemetry: TelemetryConfig::default(),
+            restart: None,
+        })
+    }
+
+    #[test]
+    fn direct_destination_never_underflows_on_short_lines() {
+        for nodes in [2, 8] {
+            let metrics = short_line_metrics(nodes);
+            assert_eq!(metrics.submitted, 8, "nodes={nodes}");
+            assert_eq!(metrics.direct_submitted, 8, "nodes={nodes}");
+        }
     }
 }
