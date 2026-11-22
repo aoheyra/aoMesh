@@ -45,6 +45,21 @@ the caller can explicitly evict and insert an updated entry, retaining original
 first_seen, received_at and age. Such multi-call changes are caller-owned and
 are not an atomic metadata update API.
 
+## Owned lookups (MSH-34)
+
+`get` returns `Option<StoredMessage>` rather than `Option<&StoredMessage>`. A
+SQLite backend has to decode a row into an owned value before it can be
+returned; a borrowed signature would force it to keep a second authoritative
+in-memory copy, which violates aoheyra ADR 0001's single-source-of-truth rule.
+An owned return is consistent with `put` and `evict`, keeps `SyncOffer` borrowing
+only for the duration of a host call, and costs one bounded clone per lookup in
+`MemoryStore`. Rejected options were: a borrowed reference (impossible for
+row-backed stores without a cache), `Cow<'_, StoredMessage>` (still needs an
+owned `StoredMessage` to borrow from), and a fallible
+`Result<Option<StoredMessage>, StoreError>` (adds no failure mode and complicates
+all call sites). No routing behaviour, quota, eviction order or wire format
+changes; no simulator measurement is applicable.
+
 MSH-17 uses the existing `evict` method as the purge seam. A `MeshOutput::Purge`
 tells the host which content address is immune; the host calls `evict` and
 refreshes its summary so anti-entropy does not re-offer the id. No new store
@@ -65,8 +80,11 @@ the open engine adapter stack. Packet authentication remains upstream.
 
 ## Evidence
 
-`cargo test --test store` runs backend conformance, deterministic replication /
-priority / age / ID ordering, relative expiry with a remote timestamp of
-u64::MAX, malformed envelopes, no-mutation rejection and a 100-insertion stress
-case with byte and entry caps asserted after every insertion. APP-05 must run
-the same exported conformance suite against its SQLite backend.
+`cargo test --test store` runs backend conformance against both `MemoryStore`
+and a row-backed test store whose `get` reconstructs an owned value from wire
+bytes and metadata, then checks that the value survives eviction. It also runs
+deterministic replication / priority / age / ID ordering, relative expiry with a
+remote timestamp of u64::MAX, malformed envelopes, no-mutation rejection and a
+100-insertion stress case with byte and entry caps asserted after every
+insertion. APP-05 must run the same exported conformance suite against its
+SQLite backend.

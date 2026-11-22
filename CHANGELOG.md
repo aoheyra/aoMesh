@@ -25,6 +25,15 @@ Restore is atomic and fresh-engine-only. Duplicate observations cannot refill
 spent spray tickets or extend their expiry; zero-capacity spray stores no state.
 Legacy Snapshot format and tests remain supported for same-epoch restoration.
 
+MSH-34 changes `MessageStore::get` from `Option<&StoredMessage>` to
+`Option<StoredMessage>`. This is a breaking unreleased host-seam API change:
+disk-backed stores can decode a row into an owned value without keeping a second
+authoritative in-memory copy, and hosts should keep the returned value alive
+while building borrowed `SyncOffer`s. In-memory lookup now clones one bounded
+entry; routing, quotas, eviction order and all wire formats are unchanged. The
+exported conformance suite checks that a fetched value survives store mutation
+and is also run against a row-backed test store. A new tag is still required
+before aoheyra APP-05 can consume this seam.
 
 MSH-19 adds bounded presence announcements. An ordinary signed `Presence`
 packet carries a fixed 150-byte body with the origin's card hash, capabilities,

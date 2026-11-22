@@ -573,10 +573,13 @@ Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT l
 ## Message storage (MSH-12)
 
 `store::MessageStore` defines put/get, destination lookup, canonical summaries,
-expiry and explicit eviction. `store::MemoryStore` implements bounded total,
-per-origin and per-class storage with deterministic eviction. Telemetry is not
-stored. Callers verify packet authenticity before insertion; this module keeps
-opaque wire bytes and local metadata, never keys or application data models.
+expiry and explicit eviction. `get` returns an owned `StoredMessage`, so a
+disk-backed store can decode a row without keeping a second authoritative
+in-memory copy; the value stays valid after later store mutations.
+`store::MemoryStore` implements bounded total, per-origin and per-class storage
+with deterministic eviction. Telemetry is not stored. Callers verify packet
+authenticity before insertion; this module keeps opaque wire bytes and local
+metadata, never keys or application data models.
 See [the storage decision](docs/adr/message-store.md) for limits and ordering.
 The app's SQLite backend must run `store::conformance::check` against a fresh
 backend factory. SQLite itself and engine integration are separate tasks.
@@ -613,7 +616,8 @@ bounded anti-entropy exchange on aoNetwork's Bulk channel. The engine never
 opens the host's store: it compares the peer's four-byte beacon digest with its
 cached summary, exchanges sorted eight-byte id prefixes, and emits `SyncNeed`
 for the missing prefixes. The host resolves each prefix through
-`MessageStore::get` and submits the encoded packet with `MeshInput::SyncItems`.
+`MessageStore::get`, which returns an owned `StoredMessage`, and submits the
+encoded packet with `MeshInput::SyncItems`.
 Incoming `SyncItem` events carry complete encoded packets for the host to
 insert; the engine verifies bounds, the content address and the storable class,
 while final signature verification and insertion policy stay with the store

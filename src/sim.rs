@@ -1901,18 +1901,22 @@ impl Simulation {
             for (link, prefixes) in needs {
                 let store = &self.stores[node];
                 let ids = store.summary(now_ms);
-                let offers: Vec<SyncOffer<'_>> = prefixes
+                let resolved: Vec<([u8; SHORT_ID_BYTES], StoredMessage)> = prefixes
                     .iter()
                     .filter_map(|prefix| {
                         let id = ids
                             .iter()
                             .find(|id| id.as_bytes()[..SHORT_ID_BYTES] == prefix[..])?;
                         let message = store.get(now_ms, id)?;
-                        Some(SyncOffer {
-                            prefix: *prefix,
-                            wire: message.wire(),
-                            copies_left: message.metadata().copies_left,
-                        })
+                        Some((*prefix, message))
+                    })
+                    .collect();
+                let offers: Vec<SyncOffer<'_>> = resolved
+                    .iter()
+                    .map(|(prefix, message)| SyncOffer {
+                        prefix: *prefix,
+                        wire: message.wire(),
+                        copies_left: message.metadata().copies_left,
                     })
                     .collect();
                 if offers.is_empty() {
@@ -3297,18 +3301,22 @@ fn bench_service(
             MeshOutput::ReleaseOpportunistic { .. } => result.releases += 1,
             MeshOutput::SyncNeed { link, prefixes } => {
                 let ids = store.summary(now);
-                let offers: Vec<SyncOffer<'_>> = prefixes
+                let resolved: Vec<([u8; SHORT_ID_BYTES], StoredMessage)> = prefixes
                     .iter()
                     .filter_map(|prefix| {
                         let id = ids
                             .iter()
                             .find(|id| id.as_bytes()[..SHORT_ID_BYTES] == prefix[..])?;
                         let message = store.get(now, id)?;
-                        Some(SyncOffer {
-                            prefix: *prefix,
-                            wire: message.wire(),
-                            copies_left: message.metadata().copies_left,
-                        })
+                        Some((*prefix, message))
+                    })
+                    .collect();
+                let offers: Vec<SyncOffer<'_>> = resolved
+                    .iter()
+                    .map(|(prefix, message)| SyncOffer {
+                        prefix: *prefix,
+                        wire: message.wire(),
+                        copies_left: message.metadata().copies_left,
                     })
                     .collect();
                 let extra = engine
