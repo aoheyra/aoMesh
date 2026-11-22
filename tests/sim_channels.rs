@@ -36,12 +36,10 @@ fn signed_channel_message_reaches_every_in_range_subscriber_within_budget() {
     assert_eq!(metrics.channel_deliveries, 2);
     assert_eq!(metrics.channel_delivered_ids[9].len(), 1);
     assert_eq!(metrics.channel_delivered_ids[11].len(), 1);
-    for node in 0..metrics.nodes {
+    assert_eq!(metrics.channel_delivered_ids.len(), metrics.nodes);
+    for (node, delivered_ids) in metrics.channel_delivered_ids.iter().enumerate() {
         if node != 9 && node != 11 {
-            assert!(
-                metrics.channel_delivered_ids[node].is_empty(),
-                "node {node} is not a subscriber"
-            );
+            assert!(delivered_ids.is_empty(), "node {node} is not a subscriber");
         }
     }
 
