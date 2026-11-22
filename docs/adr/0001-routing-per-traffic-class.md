@@ -106,8 +106,8 @@ suppression table. No wire field changes.
 | Setting | Default | Reason |
 |---|---|---|
 | Pending entries | 1024 | Bounds memory while covering a contact's worth of distinct content |
-| Reference degree / copies | 4 / 3 | Calibrated by the 50-node sweep: 45.20% fewer transmissions, Direct ratio unchanged |
-| Copy bounds | 1 to 6 configured, 2 effective | Sparse graphs still forward; hostile or extreme degrees cannot mint unbounded work |
+| Reference degree / copies | 4 / 3 | Calibrated by the 50-node sweep (seed `1297304013`): 43.51% fewer transmissions, Direct ratio unchanged |
+| Copy bounds | 1 to 6 configured; 2 on chains and Presence | Sparse paths still forward; hostile or extreme degrees cannot mint unbounded work |
 | Base delay | 60-140 ms, seeded | Long enough for neighbour copies, short enough for a contact |
 | Final delay | 20-600 ms, shrinking with degree | Dense groups decide sooner without letting sparse groups relay blind |
 | Class TTLs | 8, 6, 3, 3 | Same table as above; submission and relay both clamp |
@@ -119,13 +119,16 @@ the MSH-19 convergence work reproduced that failure on degree-one paths, where
 one arrival cancelled the only relay and extinguished the flood at the first
 hop. A degree-scaled `k` with fractional seeded rounding is the chosen option:
 it spends relays where neighbours are scarce and cancels them where the mesh
-already offered several chances. The effective threshold is now floored at two
-distinct sending links for every flooded class, so `min_k = 1` can no longer
-produce that isolation. This is a routing fix, not a scenario special case.
-The delay shrinks with degree for the same reason. The reference degree is
-four, calibrated by the 50-node sweep; bounds keep `k` and the delay finite
-for hostile degree claims. State is bounded at 1024 pending messages and
-evicted by earliest deadline. CI rechecks the fixed suppression scenario
+already offered several chances. The two-link floor is kept only where it
+proves something: a chain relay with at most one other link, and every Presence
+announcement on a capability-gated link. Applying the floor to every flooded
+class also disabled the calibrated `min_k = 1` cancellations on dense Broadcast
+nodes: on seed `1297304013` the best parameter sweep reached only a 33.72%
+reduction against the required 40%. Scoping the floor by topology and class
+restores a measured 43.51% reduction without reopening the degree-one failure. The delay shrinks with degree for the same reason. The reference
+degree is four, calibrated by the 50-node sweep; bounds keep `k` and the delay
+finite for hostile degree claims. State is bounded at 1024 pending messages
+and evicted by earliest deadline. CI rechecks the fixed suppression scenario
 without lowering its thresholds; the published Direct-only baselines carry no
 flooded classes and are unaffected.
 
@@ -133,9 +136,9 @@ The simulator ablation sets `SuppressionConfig::enabled = false`, restoring
 immediate flooding without changing topology, identities or traffic. Suppression
 only observes packets that MSH-10 admitted, so a budget denial cannot start a
 timer or blame the neighbour that carried it. On the fixed 50-node mixed case
-(seed `1297304013`), transmissions fall from 5801 to 3316 (42.84%) and the
+(seed `1297304013`), transmissions fall from 5801 to 3277 (43.51%) and the
 Direct delivery ratio stays at 0.2000. Unique Broadcast receptions fall from
-2197 to 1456: cancelling relays is expected to reduce how far a flood travels,
+2197 to 1479: cancelling relays is expected to reduce how far a flood travels,
 so that diagnostic is reported alongside the acceptance numbers rather than
 hidden. The four published MSH-27 baselines are unchanged because they carry no
 flooded classes.
@@ -565,8 +568,8 @@ The fixed 20-node line case (seed `1297304023`) submits one 128-byte envelope
 from node 10 with subscribers at 9 and 11. Both in-range subscribers receive it
 and no other node does. Twelve one-link transmissions carry 3,048 envelope
 bytes, inside the 43,690-byte Broadcast burst (256 KiB/hour with the ten-minute
-burst). This is a remeasurement after rebasing onto MSH-22: MSH-19's two-link
-suppression floor makes each line relay forward once, replacing the old
+burst). This is a remeasurement after rebasing onto MSH-22: the two-link floor kept
+for chain relays makes each line relay forward once, replacing the old
 two-transmission expectation from the pre-MSH-19 tree. Reachability and the
 budget gate are unchanged; no published MSH-27 threshold was lowered. The exact
 CSV row and command are in the README; `tests/sim_channels.rs` locks the row, so
@@ -672,12 +675,13 @@ links. Store occupancy is the live id count from the latest host summary, not
 a byte count. Manifest data and content are excluded from the snapshot.
 
 The fixed mixed scenario has seed `1297304021`, 20 nodes and four malformed
-frames injected from node 0. It reports 40 submitted / 6 delivered, 323
-duplicate packets, 120 suppressed relays, 88 store ids, 820 sync bytes sent
-and received, four penalty events, 552 seen records and no pending suppression
-windows. The original 367/193/89/512/7 row was measured before MSH-19 raised
-the suppression floor to two distinct sending links; the row was remeasured on
-the accumulated stack rather than weakening any gate. Current penalties are
+frames injected from node 0. It reports 40 submitted / 6 delivered, 321
+duplicate packets, 166 suppressed relays, 88 store ids, 820 sync bytes sent
+and received, four penalty events, 547 seen records and no pending suppression
+windows. The original 367/193/89/512/7 row was measured before the two-link
+floor, the intermediate 323/120/88/512/7 row after MSH-19 applied it to every
+class, and this row after FIX 38 scoped it to chains and Presence. Each row was
+remeasured rather than weakening any gate. Current penalties are
 zero at the end by design because scores decay; the cumulative event counter
 is the durable evidence. These metrics are additive and outside the MSH-27 CSV
 schema, so no baseline threshold was weakened. The host maps this plain snapshot into APP-15; aoMesh

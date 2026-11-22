@@ -354,6 +354,7 @@ impl std::error::Error for MeshError {}
 /// `MeshConfig::directory.capacity` nodes plus
 /// `MeshConfig::directory.max_change_events` UI events (MSH-20).
 pub struct MeshEngine<R: RngCore> {
+    clock_restore_ready: bool,
     rng: R,
     config: MeshConfig,
     neighbors: NeighborTable,
@@ -389,6 +390,7 @@ impl<R: RngCore> MeshEngine<R> {
             .min(config.suppression.telemetry_ttl);
         let budgets = BudgetTracker::new(config.budgets);
         Self {
+            clock_restore_ready: true,
             rng,
             config,
             neighbors: NeighborTable::new(config.max_neighbors),
@@ -533,6 +535,7 @@ impl<R: RngCore> MeshEngine<R> {
     /// (MSH-13). Submission errors are typed and the caller still owns
     /// the input bytes.
     pub fn handle(&mut self, now: u64, input: MeshInput<'_>) -> Result<Vec<MeshOutput>, MeshError> {
+        self.clock_restore_ready = false;
         match input {
             MeshInput::ObserveNode { observation } => {
                 let node = observation.node;
@@ -1187,10 +1190,11 @@ impl<R: RngCore> MeshEngine<R> {
                             .iter()
                             .filter(|neighbor| neighbor.node_id.is_some() && neighbor.link != link)
                             .count();
-                        let threshold = self
-                            .config
-                            .suppression
-                            .copy_threshold(degree, &mut self.rng);
+                        let threshold = self.config.suppression.copy_threshold_for(
+                            class,
+                            degree,
+                            &mut self.rng,
+                        );
                         let deadline_ms = now.saturating_add(
                             self.config
                                 .suppression
@@ -1544,7 +1548,7 @@ impl<R: RngCore> MeshEngine<R> {
         let threshold = self
             .config
             .suppression
-            .copy_threshold(degree, &mut self.rng);
+            .copy_threshold_for(class, degree, &mut self.rng);
         let deadline_ms = now.saturating_add(
             self.config
                 .suppression
@@ -2029,6 +2033,52 @@ impl<R: RngCore> crate::snapshot::Snapshot for MeshEngine<R> {
         self.seen.import_state(seen);
         self.receipt.import_state(immunity);
         self.spray.import_state(spray);
+        self.clock_restore_ready = false;
+        Ok(())
+    }
+}
+
+impl<R: RngCore> crate::snapshot::TimedSnapshot for MeshEngine<R> {
+    fn snapshot_at(
+        &self,
+        now: u64,
+        owner: NodeId,
+    ) -> Result<Vec<u8>, crate::snapshot::SnapshotError> {
+        crate::snapshot::encode_timed_snapshot(
+            now,
+            owner,
+            self.seen.export_state(),
+            self.receipt.export_state(),
+            self.spray.export_state(),
+        )
+    }
+    fn restore_at(
+        &mut self,
+        now: u64,
+        owner: NodeId,
+        elapsed_ms: u64,
+        bytes: &[u8],
+    ) -> Result<(), crate::snapshot::SnapshotError> {
+        if !self.clock_restore_ready {
+            return Err(crate::snapshot::SnapshotError::AlreadyStarted);
+        }
+        let (seen, immunity, spray) = crate::snapshot::decode_timed_snapshot(
+            bytes,
+            now,
+            owner,
+            elapsed_ms,
+            crate::snapshot::TimedRestoreLimits {
+                seen: self.seen.capacity(),
+                immunity: self.config.receipt.max_entries,
+                spray: self.config.spray.max_entries,
+                links: self.config.max_neighbors,
+                immunity_ms: self.config.receipt.lifetime_s.saturating_mul(1000),
+            },
+        )?;
+        self.seen.import_state(seen);
+        self.receipt.import_state(immunity);
+        self.spray.import_state(spray);
+        self.clock_restore_ready = false;
         Ok(())
     }
 }

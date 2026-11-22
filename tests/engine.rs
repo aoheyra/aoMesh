@@ -1290,6 +1290,102 @@ fn distinct_neighbour_copies_cancel_a_broadcast_relay() {
 }
 
 #[test]
+fn two_link_floor_keeps_chains_alive_without_taxing_dense_floods() {
+    fn engine_with(links: u64) -> MeshEngine<StdRng> {
+        let mut e = MeshEngine::with_config(
+            StdRng::seed_from_u64(0xB11D),
+            MeshConfig {
+                max_neighbors: links as usize,
+                suppression: SuppressionConfig {
+                    min_k: 1,
+                    k_at_degree_ref: 4,
+                    degree_ref: 8,
+                    max_k: 8,
+                    min_base_delay_ms: 10,
+                    max_base_delay_ms: 10,
+                    min_delay_ms: 10,
+                    max_delay_ms: 10,
+                    ..SuppressionConfig::default()
+                },
+                ..no_spray_config()
+            },
+        );
+        for link in 1..=links {
+            e.handle(
+                link,
+                MeshInput::LinkUp {
+                    link: LinkId::new(link),
+                    remote_hello: hello(),
+                },
+            )
+            .unwrap();
+        }
+        e
+    }
+    fn tick(engine: &mut MeshEngine<StdRng>, at: u64) -> Vec<MeshOutput> {
+        engine
+            .handle(
+                at,
+                MeshInput::Tick {
+                    identity: &LOCAL,
+                    card_hash: [0; 8],
+                },
+            )
+            .unwrap()
+    }
+    fn receive(
+        engine: &mut MeshEngine<StdRng>,
+        at: u64,
+        class: PacketClass,
+        payload: &'static [u8],
+    ) -> Vec<MeshOutput> {
+        let wire = signed(class, payload);
+        engine
+            .handle(
+                at,
+                MeshInput::Data {
+                    link: LinkId::new(1),
+                    channel: Channel::Message,
+                    payload: &wire,
+                    identity: &LOCAL,
+                },
+            )
+            .unwrap()
+    }
+
+    // A chain relay sees one other link. MSH-19's floor must keep it
+    // forwarding, otherwise the flood dies at the first hop.
+    let mut chain = engine_with(2);
+    assert!(receive(&mut chain, 100, PacketClass::Broadcast, b"chain").is_empty());
+    let due = tick(&mut chain, 120);
+    let [MeshOutput::Send { link, .. }] = due.as_slice() else {
+        panic!("a chain relay must forward, got {due:?}")
+    };
+    assert_eq!(*link, LinkId::new(2));
+
+    // With two other links, the calibrated one-copy cancellation is back.
+    let mut dense = engine_with(3);
+    assert!(receive(&mut dense, 100, PacketClass::Broadcast, b"dense").is_empty());
+    assert!(
+        tick(&mut dense, 120).is_empty(),
+        "one copy cancels a dense Broadcast relay"
+    );
+
+    // Presence keeps the floor at every degree: one announcement copy does
+    // not prove the announcing peer's other links learned it.
+    assert!(receive(&mut dense, 200, PacketClass::Presence, b"announce").is_empty());
+    let due = tick(&mut dense, 220);
+    let links: Vec<LinkId> = due
+        .iter()
+        .map(|output| match output {
+            MeshOutput::Send { link, .. } => *link,
+            other => panic!("only relays expected, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(links, vec![LinkId::new(2), LinkId::new(3)]);
+}
+
+#[test]
 fn disabled_suppression_restores_immediate_flooding() {
     let mut e = fast_suppression_engine(2, false);
     for id in 1..=2u64 {

@@ -7,6 +7,25 @@ change without notice until v0.1.0, and consumers pin by git tag
 
 ## Unreleased
 
+FIX 38 scopes the two-link suppression floor to where it proves coverage:
+chain relays with at most one other link and every Presence announcement.
+Dense Broadcast and channel floods use the calibrated degree-scaled threshold
+again. The seeded 50-node mixed case (seed `1297304013`) drops from 5801 to
+3277 transmissions (43.51%) with Direct delivery unchanged at 0.2000; the
+line-20 channel row and the MSH-19 presence report are unchanged. The
+suppression threshold now comes from `SuppressionConfig::copy_threshold_for`,
+which is covered by unit, engine-pipeline and simulator regressions. The
+mixed observability counters move to 321 duplicates, 166 suppressed relays and
+547 seen records because different relays cancel; no MSH-27 threshold changed.
+
+MSH-29 gains an explicit TimedSnapshot wrapper for process/device restarts with
+changed clock epochs. It binds state to the local owner, stores remaining
+lifetimes, rebases with host-supplied elapsed time and clears transport LinkIds.
+Restore is atomic and fresh-engine-only. Duplicate observations cannot refill
+spent spray tickets or extend their expiry; zero-capacity spray stores no state.
+Legacy Snapshot format and tests remain supported for same-epoch restoration.
+
+
 MSH-19 adds bounded presence announcements. An ordinary signed `Presence`
 packet carries a fixed 150-byte body with the origin's card hash, capabilities,
 sequence and existing public identity, so every relay can verify the binding
@@ -17,8 +36,9 @@ one-shot `CardFetch` host events are implemented in the new `presence` module.
 The fixed 50-node report on seed `1297304021` learns 49 of 49 peers in 50 ms,
 emits no card fetches, and uses 15,480 B/h per source at steady state against
 the 64 KiB/h budget. The one-copy cancellation in MSH-11 suppression is also
-fixed at the algorithm level: the effective threshold is floored at two
-distinct sending links for every flooded class, with a unit regression. The
+fixed at the algorithm level: a degree-one path needs two distinct sending
+links, with a unit regression. FIX 38 later scopes that floor to chain relays
+and Presence so dense Broadcast floods keep their calibrated saving. The
 MSH-17 enabled 200-node report consequently sends 27,926 instead of 27,958
 packets on seed `1297303752`; delivery, receipts, purges and purge latency are
 unchanged.
@@ -208,7 +228,7 @@ field, the simulator gains `Traffic::MixedBroadcast`, per-node reception
 metrics, `suppression_scenarios` and an `enforce_suppression` ablation switch.
 No wire field changes. Suppression only sees packets admitted by MSH-10, so a
 budget denial cannot start a timer or blame its carrier. On the seeded 50-node
-mixed case transmissions fall from 5801 to 3316 (42.84%) with the Direct
+mixed case transmissions fall from 5801 to 3277 (43.51%) with the Direct
 delivery ratio unchanged at 0.2000; the Broadcast-reception diagnostic and
 seeds are in the README and ADR-0001.
 

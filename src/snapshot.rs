@@ -89,6 +89,14 @@ pub enum SnapshotSection {
 /// snapshots are host-supplied bytes and are treated as untrusted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotError {
+    /// Timed state belongs to a different local account.
+    OwnerMismatch,
+    /// Timed restore must precede all engine inputs and any earlier restore.
+    AlreadyStarted,
+    /// A remaining lifetime exceeds the configured policy ceiling.
+    InvalidLifetime,
+    /// The new local deadline cannot be represented.
+    ClockOverflow,
     /// The magic prefix is not [`SNAPSHOT_MAGIC`].
     BadMagic,
     /// The layout version is not [`SNAPSHOT_VERSION`].
@@ -132,6 +140,10 @@ pub enum SnapshotError {
 impl core::fmt::Display for SnapshotError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::OwnerMismatch => write!(f, "snapshot belongs to another identity"),
+            Self::AlreadyStarted => write!(f, "timed restore requires a fresh engine"),
+            Self::InvalidLifetime => write!(f, "invalid remaining snapshot lifetime"),
+            Self::ClockOverflow => write!(f, "snapshot deadline overflows local time"),
             Self::BadMagic => write!(f, "not an aoMesh engine snapshot"),
             Self::UnsupportedVersion(v) => write!(f, "unsupported snapshot version {v}"),
             Self::Truncated { need, have } => {
@@ -162,6 +174,9 @@ impl From<crate::receipt::ReceiptError> for SnapshotError {
 
 /// Serialisation of the volatile state that survives an engine restart.
 ///
+/// For a process/OS restart with a new local clock epoch, use [`TimedSnapshot`].
+/// This legacy format preserves absolute deadlines and session LinkIds; it is
+/// suitable only when that exact clock epoch and link namespace are preserved.
 /// The host calls [`Snapshot::snapshot`] before dropping an engine and
 /// [`Snapshot::restore`] on a freshly constructed engine with the same
 /// configuration and RNG seed. The engine owns no storage and no scheduler;
@@ -485,5 +500,131 @@ pub(crate) fn decode_snapshot(
         }
     }
     r.finish()?;
+    Ok((seen, immunity, spray))
+}
+
+/// Clock-epoch-safe storage format, separate from the legacy AMSH v1 bytes.
+pub const TIMED_SNAPSHOT_MAGIC: [u8; 4] = *b"AMST";
+/// Version of the identity-bound, relative-lifetime snapshot wrapper.
+pub const TIMED_SNAPSHOT_VERSION: u8 = 1;
+const TIMED_HEADER_LEN: usize = 4 + 1 + 16;
+const MAX_REMAINING_MS: u64 = 86_400_000;
+
+/// Android/process restart seam with explicit local time and account binding.
+///
+/// The host atomically commits bytes with MessageStore copy metadata and
+/// authenticates its local storage. Remaining lifetimes are rebased to `now`;
+/// `elapsed_ms` is host-measured time since capture, never subtraction of two
+/// different monotonic epochs. Zero conservatively retains guards when elapsed
+/// time is unknown. No keys, clocks, databases or message payloads are retained.
+pub trait TimedSnapshot {
+    /// Capture live metadata with relative remaining lifetimes and no LinkIds.
+    fn snapshot_at(&self, now: u64, owner: ao_idents::NodeId) -> Result<Vec<u8>, SnapshotError>;
+    /// Atomically restore before the fresh engine receives its first input.
+    fn restore_at(
+        &mut self,
+        now: u64,
+        owner: ao_idents::NodeId,
+        elapsed_ms: u64,
+        bytes: &[u8],
+    ) -> Result<(), SnapshotError>;
+}
+
+pub(crate) fn encode_timed_snapshot(
+    now: u64,
+    owner: ao_idents::NodeId,
+    mut seen: SeenState,
+    mut immunity: ImmunityState,
+    mut spray: SprayState,
+) -> Result<Vec<u8>, SnapshotError> {
+    seen.entries.retain(|_, at| {
+        *at = at.saturating_sub(now).min(MAX_REMAINING_MS);
+        *at > 0
+    });
+    seen.order.retain(|id| seen.entries.contains_key(id));
+    immunity.entries.retain(|_, e| {
+        e.expires_at_ms = e.expires_at_ms.saturating_sub(now).min(MAX_REMAINING_MS);
+        e.sent_to.clear();
+        e.expires_at_ms > 0
+    });
+    spray.entries.retain(|_, e| {
+        e.expires_at_ms = e.expires_at_ms.saturating_sub(now).min(MAX_REMAINING_MS);
+        e.handed_to.clear();
+        e.expires_at_ms > 0
+    });
+    let payload = encode_snapshot(seen, immunity, spray)?;
+    let mut writer = Writer::default();
+    writer.bytes(&TIMED_SNAPSHOT_MAGIC)?;
+    writer.u8(TIMED_SNAPSHOT_VERSION)?;
+    writer.bytes(owner.as_bytes())?;
+    writer.bytes(&payload)?;
+    Ok(writer.out)
+}
+
+pub(crate) struct TimedRestoreLimits {
+    pub(crate) seen: usize,
+    pub(crate) immunity: usize,
+    pub(crate) spray: usize,
+    pub(crate) links: usize,
+    pub(crate) immunity_ms: u64,
+}
+
+pub(crate) fn decode_timed_snapshot(
+    bytes: &[u8],
+    now: u64,
+    owner: ao_idents::NodeId,
+    elapsed: u64,
+    limits: TimedRestoreLimits,
+) -> Result<(SeenState, ImmunityState, SprayState), SnapshotError> {
+    if bytes.len() > MAX_SNAPSHOT_LEN {
+        return Err(SnapshotError::TooLarge {
+            len: bytes.len(),
+            max: MAX_SNAPSHOT_LEN,
+        });
+    }
+    let mut r = Reader::new(bytes);
+    if r.take(4)? != TIMED_SNAPSHOT_MAGIC {
+        return Err(SnapshotError::BadMagic);
+    }
+    let version = r.u8()?;
+    if version != TIMED_SNAPSHOT_VERSION {
+        return Err(SnapshotError::UnsupportedVersion(version));
+    }
+    if r.take(16)? != owner.as_bytes() {
+        return Err(SnapshotError::OwnerMismatch);
+    }
+    let (mut seen, mut immunity, mut spray) = decode_snapshot(
+        &bytes[TIMED_HEADER_LEN..],
+        limits.seen,
+        limits.immunity,
+        limits.spray,
+        limits.links,
+    )?;
+    let rebase = |remaining: u64, ceiling: u64| -> Result<u64, SnapshotError> {
+        if remaining > ceiling {
+            return Err(SnapshotError::InvalidLifetime);
+        }
+        let remaining = remaining.saturating_sub(elapsed);
+        if remaining == 0 {
+            return Ok(0);
+        }
+        now.checked_add(remaining)
+            .ok_or(SnapshotError::ClockOverflow)
+    };
+    for at in seen.entries.values_mut() {
+        *at = rebase(*at, MAX_REMAINING_MS)?;
+    }
+    seen.entries.retain(|_, at| *at > 0);
+    seen.order.retain(|id| seen.entries.contains_key(id));
+    for e in immunity.entries.values_mut() {
+        e.expires_at_ms = rebase(e.expires_at_ms, limits.immunity_ms.min(MAX_REMAINING_MS))?;
+        e.sent_to.clear();
+    }
+    immunity.entries.retain(|_, e| e.expires_at_ms > 0);
+    for e in spray.entries.values_mut() {
+        e.expires_at_ms = rebase(e.expires_at_ms, MAX_REMAINING_MS)?;
+        e.handed_to.clear();
+    }
+    spray.entries.retain(|_, e| e.expires_at_ms > 0);
     Ok((seen, immunity, spray))
 }

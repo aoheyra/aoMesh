@@ -4,7 +4,9 @@
 //! observability_report`. The scenario and seed are fixed in
 //! [`ao_mesh::sim::observability_scenarios`]. The extra metrics are outside
 //! the MSH-27 CSV schema: they aggregate engine snapshots rather than radio
-//! events, so no MSH-27 threshold is changed here.
+//! events, so no MSH-27 threshold is changed here. The counts were remeasured
+//! after FIX 38 scoped the two-link suppression floor to chain relays and
+//! Presence; delivery, store, sync and penalty counts are unchanged.
 
 #![cfg(all(feature = "sim", not(miri)))]
 
@@ -39,8 +41,8 @@ fn expected() -> Expected {
         nodes: 20,
         submitted: 40,
         delivered: 6,
-        duplicate_packets: 323,
-        suppressed_relays: 120,
+        duplicate_packets: 321,
+        suppressed_relays: 166,
         store_entries: 88,
         sync_bytes_sent: 820,
         sync_bytes_received: 820,
@@ -48,7 +50,7 @@ fn expected() -> Expected {
         neighbour_penalty_total: 0,
         neighbour_penalty_max: 0,
         penalised_neighbours: 0,
-        seen_records: 552,
+        seen_records: 547,
         suppression_pending: 0,
     }
 }

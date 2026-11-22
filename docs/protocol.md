@@ -237,9 +237,10 @@ one neighbour are only one copy.
 
 A seeded assessment delay shrinks as the verified neighbour degree grows.
 Before the deadline the node sends nothing. The effective threshold is the
-seeded degree-scaled value floored at two distinct links: one copy proves only
-that this node heard the packet, and cancelling on it extinguished floods on
-degree-one paths. If the effective threshold is reached from different links,
+seeded degree-scaled value, except on a chain relay (at most one other link)
+and on every Presence announcement, where it is floored at two distinct links:
+one copy does not prove that a sparse path or a capability-gated peer's other
+links learned the content. If the effective threshold is reached from different links,
 the pending entry is cancelled and the seen-cache records the id: the mesh has
 already given this node enough chances to hear the content, and this node adds
 no duplicate. If the timer
