@@ -114,6 +114,55 @@ impl StoredMessage {
     }
 }
 
+/// The backend operation that failed, without leaking a sibling error type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreBackendOperation {
+    /// Opening or keying a backend handle.
+    Open,
+    /// A read or write statement.
+    Query,
+    /// Beginning, applying or committing a transaction.
+    Transaction,
+    /// Decoding a backend row into a [`StoredMessage`].
+    Decode,
+}
+impl fmt::Display for StoreBackendOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Open => "open",
+            Self::Query => "query",
+            Self::Transaction => "transaction",
+            Self::Decode => "decode",
+        })
+    }
+}
+
+/// A typed backend failure with an optional numeric backend error code.
+///
+/// Row-backed stores can report I/O, locking and decode failures without
+/// embedding strings or making aoMesh depend on the backend's error type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreBackendError {
+    /// Operation that failed.
+    pub operation: StoreBackendOperation,
+    /// Backend-specific code, when the backend exposes one.
+    pub code: Option<i32>,
+}
+impl StoreBackendError {
+    /// Build a backend failure from an operation and optional code.
+    pub const fn new(operation: StoreBackendOperation, code: Option<i32>) -> Self {
+        Self { operation, code }
+    }
+}
+impl fmt::Display for StoreBackendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.code {
+            Some(code) => write!(f, "{} failed with code {code}", self.operation),
+            None => write!(f, "{} failed", self.operation),
+        }
+    }
+}
+
 /// Typed storage failure; unsuccessful insertion leaves the store unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreError {
@@ -133,10 +182,22 @@ pub enum StoreError {
     Duplicate,
     /// Entry cannot fit even in an otherwise empty store.
     Quota,
+    /// The host backend failed outside aoMesh's policy checks.
+    Backend(StoreBackendError),
 }
 impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::Packet(error) => write!(f, "invalid stored packet: {error}"),
+            Self::TooLarge => f.write_str("stored envelope is too large"),
+            Self::Truncated => f.write_str("stored envelope is truncated"),
+            Self::NotStorable => f.write_str("packet class is not storable"),
+            Self::InvalidTime => f.write_str("local timestamps are inconsistent"),
+            Self::Expired => f.write_str("message lifetime has elapsed"),
+            Self::Duplicate => f.write_str("message id already exists"),
+            Self::Quota => f.write_str("store quota would be exceeded"),
+            Self::Backend(error) => write!(f, "store backend error: {error}"),
+        }
     }
 }
 impl std::error::Error for StoreError {}

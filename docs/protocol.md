@@ -719,8 +719,9 @@ MSH-12 stores encoded packets unchanged. Local copies_left, priority,
 first_seen, received_at, consumed age, size and ingress node are not wire
 fields. Expiry compares relative age against lifetime, never remote wall time.
 `MessageStore::get` returns an owned `StoredMessage`; the host may build it from
-its own row without lending internal storage. This is a host API change only and
-does not alter packet or sync bytes.
+its own row without lending internal storage. `StoreError::Backend` reports a
+typed operation and optional code for host-side failures. These are host API
+changes only and do not alter packet or sync bytes.
 See [MessageStore](adr/message-store.md) for quotas and deterministic eviction.
 
 ## Lifetime ceilings and relative age
